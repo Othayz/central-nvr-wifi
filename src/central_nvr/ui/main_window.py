@@ -39,6 +39,8 @@ from central_nvr.ui.playback_view import PlaybackWidget
 from central_nvr.ui.ptz_controller import PTZControllerWidget
 from central_nvr.ui.settings_dialog import SettingsDialog
 from central_nvr.ui.styles import DARK_THEME_QSS, LIGHT_THEME_QSS, get_theme_qss
+from central_nvr.ui.update_dialog import UpdateDialog
+from central_nvr.core.updater import ReleaseInfo, UpdateCheckWorker
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +70,7 @@ class MainWindow(QMainWindow):
 
         self._setup_ui()
         self._setup_clock_timer()
+        self._setup_periodic_update_checker()
         self._populate_device_tree()
 
     def _load_cameras_from_config(self):
@@ -248,6 +251,13 @@ class MainWindow(QMainWindow):
         self.btn_theme_menu.setMenu(self.theme_menu)
         h_layout.addWidget(self.btn_theme_menu)
 
+        # Botão de Atualizações
+        btn_updates = QPushButton("🔄 Atualizações")
+        btn_updates.setProperty("class", "header-btn")
+        btn_updates.setToolTip("Verificar se há novas versões disponíveis no GitHub")
+        btn_updates.clicked.connect(self._open_update_dialog)
+        h_layout.addWidget(btn_updates)
+
         # Botão Configurações
         btn_settings = QPushButton("Configurações")
         btn_settings.setProperty("class", "header-btn")
@@ -360,6 +370,13 @@ class MainWindow(QMainWindow):
         self.lbl_sb_streams = QLabel(f"Câmeras Conectadas: {len(self.cameras)}")
         self.lbl_sb_streams.setStyleSheet("color: #4ADE80; font-weight: 600; padding: 0 8px;")
         status_bar.addWidget(self.lbl_sb_streams)
+
+        self.btn_sb_update = QPushButton("⚡ Atualização Disponível")
+        self.btn_sb_update.setStyleSheet("background-color: #16A34A; color: #FFFFFF; font-weight: 700; font-size: 11px; padding: 2px 8px; border-radius: 4px;")
+        self.btn_sb_update.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_sb_update.clicked.connect(self._open_update_dialog)
+        self.btn_sb_update.hide()
+        status_bar.addWidget(self.btn_sb_update)
 
         status_bar.addPermanentWidget(QLabel("Central NVR WiFi"))
 
@@ -675,6 +692,52 @@ class MainWindow(QMainWindow):
             self.camera_grid.hw_accel = hw_accel
             self.camera_grid.rtsp_transport = self.config_mgr.get("rtsp_transport", "auto")
             self.camera_grid.set_cameras(self.cameras)
+
+
+    def _setup_periodic_update_checker(self):
+        """Configura a verificação periódica em segundo plano (a cada 10 minutos)."""
+        self._notified_version: Optional[str] = None
+        self._periodic_worker: Optional[UpdateCheckWorker] = None
+        
+        enabled = self.config_mgr.get("periodic_update_check", True)
+        if not enabled:
+            return
+
+        interval_min = self.config_mgr.get("periodic_update_interval_min", 10)
+        interval_ms = max(1, interval_min) * 60 * 1000
+
+        self.update_periodic_timer = QTimer(self)
+        self.update_periodic_timer.timeout.connect(self._run_background_update_check)
+        self.update_periodic_timer.start(interval_ms)
+        logger.debug(f"Verificação periódica de atualizações ativa (intervalo: {interval_min} min).")
+
+    def _run_background_update_check(self):
+        """Dispara consulta assíncrona ao GitHub em segundo plano."""
+        repo = self.config_mgr.get("github_repo", "Othayz/central-nvr-wifi")
+        self._periodic_worker = UpdateCheckWorker(repo=repo, parent=self)
+        self._periodic_worker.update_available.connect(self._on_background_update_found)
+        self._periodic_worker.start()
+
+    def _on_background_update_found(self, release: ReleaseInfo):
+        """Abre o diálogo de atualização quando a checagem de 10 minutos encontra uma nova versão."""
+        if hasattr(self, "btn_sb_update"):
+            self.btn_sb_update.setText(f"⚡ Nova Versão v{release.version} Disponível!")
+            self.btn_sb_update.show()
+
+        self._log_event("Atualização", f"Nova versão v{release.version} encontrada no GitHub.")
+
+        # Notificar o usuário abrindo a janela de atualização (apenas uma vez por versão lançada)
+        if self._notified_version != release.version:
+            self._notified_version = release.version
+            repo = self.config_mgr.get("github_repo", "Othayz/central-nvr-wifi")
+            dialog = UpdateDialog(repo=repo, release_info=release, parent=self)
+            dialog.exec()
+
+    def _open_update_dialog(self):
+        """Abre a janela de verificação de atualização sob demanda do usuário."""
+        repo = self.config_mgr.get("github_repo", "Othayz/central-nvr-wifi")
+        dialog = UpdateDialog(repo=repo, parent=self)
+        dialog.exec()
 
     def closeEvent(self, event):
         """Encerra threads de forma graciosa ao fechar a janela."""

@@ -147,6 +147,10 @@ class ConfigManager:
         "show_osd_fps": True,
         "show_osd_bitrate": True,
         "show_osd_timestamp": True,
+        "check_updates_on_startup": True,
+        "periodic_update_check": True,
+        "periodic_update_interval_min": 10,
+        "github_repo": "Othayz/central-nvr-wifi",
     }
 
     def __init__(self):

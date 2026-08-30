@@ -1,6 +1,6 @@
 """
 Diálogo de Configurações Gerais da Central NVR WiFi.
-Permite configurar decodificação por hardware (VA-API), caminhos de gravação e rede.
+Permite configurar decodificação por hardware (VA-API), caminhos de gravação, rede e atualizações.
 """
 from typing import Optional
 
@@ -16,12 +16,15 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QSpinBox,
     QVBoxLayout,
     QWidget,
 )
 
+from central_nvr import __version__
 from central_nvr.core.config import ConfigManager
+from central_nvr.ui.update_dialog import UpdateDialog
 
 
 class SettingsDialog(QDialog):
@@ -33,14 +36,24 @@ class SettingsDialog(QDialog):
         super().__init__(parent)
         self.config_mgr = config_mgr
         self.setWindowTitle("Configurações do Sistema - Central NVR WiFi")
-        self.resize(550, 420)
+        self.resize(580, 520)
 
         self._setup_ui()
         self._load_values()
 
     def _setup_ui(self):
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(16, 16, 16, 16)
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(12, 12, 12, 12)
+        main_layout.setSpacing(10)
+
+        # Usar ScrollArea para garantir que caiba confortavelmente em qualquer resolução
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+
+        container = QWidget()
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(12)
 
         # 0. Grupo Aparência
@@ -117,7 +130,41 @@ class SettingsDialog(QDialog):
         conn_form.addRow("Intervalo de Reconexão:", self.spin_reconn)
 
         layout.addWidget(conn_group)
+
+        # 4. Grupo Atualizações do Aplicativo (GitHub)
+        up_group = QGroupBox("Atualizações do Aplicativo (GitHub Releases)")
+        up_form = QFormLayout(up_group)
+
+        self.chk_startup_update = QCheckBox("Verificar se há nova versão automaticamente ao abrir o app")
+        up_form.addRow(self.chk_startup_update)
+
+        self.chk_periodic_update = QCheckBox("Verificar atualizações periodicamente em segundo plano")
+        up_form.addRow(self.chk_periodic_update)
+
+        self.spin_update_interval = QSpinBox()
+        self.spin_update_interval.setRange(2, 1440)
+        self.spin_update_interval.setSuffix(" minutos")
+        self.spin_update_interval.setValue(10)
+        up_form.addRow("Intervalo de Checagem:", self.spin_update_interval)
+
+        self.txt_github_repo = QLineEdit("Othayz/central-nvr-wifi")
+        up_form.addRow("Repositório GitHub:", self.txt_github_repo)
+
+        check_now_layout = QHBoxLayout()
+        lbl_cur_v = QLabel(f"Versão Instalada: <b>v{__version__}</b>")
+        check_now_layout.addWidget(lbl_cur_v)
+        check_now_layout.addStretch()
+
+        btn_check_now = QPushButton("🔍 Verificar Agora no GitHub")
+        btn_check_now.clicked.connect(self._check_updates_now)
+        check_now_layout.addWidget(btn_check_now)
+        up_form.addRow(check_now_layout)
+
+        layout.addWidget(up_group)
         layout.addStretch()
+
+        scroll.setWidget(container)
+        main_layout.addWidget(scroll)
 
         # Botões de Ação Salvar / Cancelar
         btn_box = QHBoxLayout()
@@ -132,7 +179,7 @@ class SettingsDialog(QDialog):
         btn_save.clicked.connect(self._save_values)
         btn_box.addWidget(btn_save)
 
-        layout.addLayout(btn_box)
+        main_layout.addLayout(btn_box)
 
     def _load_values(self):
         theme = self.config_mgr.get("theme", "dark")
@@ -157,6 +204,12 @@ class SettingsDialog(QDialog):
         self.txt_default_user.setText(self.config_mgr.get("default_username", "admin"))
         self.spin_reconn.setValue(self.config_mgr.get("reconnect_interval_sec", 5))
 
+        # Valores de atualização
+        self.chk_startup_update.setChecked(self.config_mgr.get("check_updates_on_startup", True))
+        self.chk_periodic_update.setChecked(self.config_mgr.get("periodic_update_check", True))
+        self.spin_update_interval.setValue(self.config_mgr.get("periodic_update_interval_min", 10))
+        self.txt_github_repo.setText(self.config_mgr.get("github_repo", "Othayz/central-nvr-wifi"))
+
     def _save_values(self):
         self.config_mgr.set("theme", self.combo_theme.currentData())
         self.config_mgr.set("hw_accel", self.combo_hw.currentData())
@@ -167,6 +220,12 @@ class SettingsDialog(QDialog):
         self.config_mgr.set("recordings_dir", self.txt_rec_dir.text().strip())
         self.config_mgr.set("default_username", self.txt_default_user.text().strip())
         self.config_mgr.set("reconnect_interval_sec", self.spin_reconn.value())
+
+        # Salvar parâmetros de atualização
+        self.config_mgr.set("check_updates_on_startup", self.chk_startup_update.isChecked())
+        self.config_mgr.set("periodic_update_check", self.chk_periodic_update.isChecked())
+        self.config_mgr.set("periodic_update_interval_min", self.spin_update_interval.value())
+        self.config_mgr.set("github_repo", self.txt_github_repo.text().strip() or "Othayz/central-nvr-wifi")
 
         QMessageBox.information(self, "Configurações", "Configurações salvas com sucesso!")
         self.accept()
@@ -180,3 +239,8 @@ class SettingsDialog(QDialog):
         path = QFileDialog.getExistingDirectory(self, "Selecionar Pasta de Gravações", self.txt_rec_dir.text())
         if path:
             self.txt_rec_dir.setText(path)
+
+    def _check_updates_now(self):
+        repo = self.txt_github_repo.text().strip() or "Othayz/central-nvr-wifi"
+        dialog = UpdateDialog(repo=repo, parent=self)
+        dialog.exec()

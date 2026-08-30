@@ -27,6 +27,11 @@ def parse_arguments() -> argparse.Namespace:
         help="Ativa mensagens detalhadas de depuração no console",
     )
     parser.add_argument(
+        "--no-update-check",
+        action="store_true",
+        help="Desativa a verificação automática de atualizações na inicialização",
+    )
+    parser.add_argument(
         "--hw-accel",
         choices=["vaapi", "cpu", "cuda", "auto"],
         default=None,
@@ -60,6 +65,7 @@ def main() -> int:
         from PySide6.QtCore import Qt
         from PySide6.QtWidgets import QApplication
         from central_nvr.ui.main_window import MainWindow
+        from central_nvr.ui.update_dialog import StartupUpdateDialog
     except ImportError as e:
         print("\n" + "=" * 70)
         print(" [Central NVR WiFi] Dependência PySide6 (Qt6) não encontrada!")
@@ -103,7 +109,17 @@ def main() -> int:
     if args.transport:
         config_mgr.set("rtsp_transport", args.transport)
 
-    # Criar e exibir janela principal
+    # 1. Verificação de Atualização na Inicialização (Splash / Verificador)
+    should_check_updates = config_mgr.get("check_updates_on_startup", True) and not args.no_update_check
+    if should_check_updates:
+        repo = config_mgr.get("github_repo", "Othayz/central-nvr-wifi")
+        splash = StartupUpdateDialog(repo=repo)
+        splash.exec()
+        if not splash.should_open_main_window:
+            logger.info("Encerrando inicialização (instalador acionado).")
+            return 0
+
+    # 2. Criar e exibir janela principal
     window = MainWindow(config_mgr=config_mgr)
     window.show()
 
