@@ -1,0 +1,14 @@
+Package: central-nvr
+Version: 1.0.0
+Section: video
+Priority: optional
+Architecture: all
+Maintainer: Othay <developer@centralnvr.local>
+Depends: python3 (>= 3.10), python3-pyside6 | python3-pyqt6, python3-opencv | python3-cv2, python3-requests, python3-pil, python3-numpy, python3-keyring, ffmpeg, va-driver-all, mesa-va-drivers, libgl1, libegl1, libxcb-cursor0
+Recommends: gstreamer1.0-vaapi, intel-media-va-driver | mesa-va-drivers
+Description: Central NVR WiFi - Monitoramento, Descoberta ONVIF e Streaming RTSP
+ Aplicativo desktop moderno para Linux para gerenciamento de Câmeras IP e NVRs.
+ Possui suporte a descoberta automática via WS-Discovery (UDP Multicast 239.255.255.250:3702),
+ decodificação de vídeo RTSP de ultra baixa latência com aceleração por hardware (VA-API),
+ controle direcional PTZ via SOAP ONVIF, interface gráfica em Dark Mode e visualização
+ em grid multi-câmeras (1x1, 2x2, 3x3).

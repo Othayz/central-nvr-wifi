@@ -1,0 +1,13 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Central NVR WiFi
+GenericName=NVR IP Camera Viewer
+Comment=Sistema de Gerenciamento, Descoberta ONVIF e Streaming RTSP de Baixa Latência
+Exec=central-nvr %U
+Icon=central-nvr
+Terminal=false
+Categories=AudioVideo;Video;Network;Monitor;Security;
+Keywords=nvr;onvif;rtsp;cctv;camera;ptz;stream;video;security;
+StartupNotify=true
+StartupWMClass=central-nvr

@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <defs>
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#1E293B"/>
+      <stop offset="100%" stop-color="#0F172A"/>
+    </linearGradient>
+    <linearGradient id="accentGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#38BDF8"/>
+      <stop offset="100%" stop-color="#2563EB"/>
+    </linearGradient>
+  </defs>
+  
+  <!-- Base Background -->
+  <rect width="128" height="128" rx="28" fill="url(#bgGrad)" stroke="#334155" stroke-width="3"/>
+  
+  <!-- Câmera CCTV Stylized Body -->
+  <path d="M 28 44 L 84 44 L 84 76 L 28 76 Z" fill="#1E293B" stroke="url(#accentGrad)" stroke-width="4" stroke-linejoin="round"/>
+  
+  <!-- Lente da Câmera -->
+  <circle cx="56" cy="60" r="12" fill="#0F172A" stroke="url(#accentGrad)" stroke-width="3"/>
+  <circle cx="56" cy="60" r="5" fill="#38BDF8"/>
+  
+  <!-- Suporte e Base -->
+  <path d="M 84 52 L 104 40 L 104 80 L 84 68 Z" fill="url(#accentGrad)"/>
+  <path d="M 44 76 L 44 94 L 68 94" fill="none" stroke="#64748B" stroke-width="4" stroke-linecap="round"/>
+  <path d="M 68 88 L 68 100" fill="none" stroke="#64748B" stroke-width="4" stroke-linecap="round"/>
+  
+  <!-- Ondas WiFi -->
+  <path d="M 24 30 C 34 20, 52 20, 62 30" fill="none" stroke="#38BDF8" stroke-width="3" stroke-linecap="round"/>
+  <path d="M 30 36 C 36 30, 50 30, 56 36" fill="none" stroke="#38BDF8" stroke-width="3" stroke-linecap="round"/>
+  <circle cx="43" cy="40" r="2" fill="#38BDF8"/>
+
+  <!-- LED Indicador de Gravação -->
+  <circle cx="36" cy="52" r="3" fill="#EF4444"/>
+</svg>
