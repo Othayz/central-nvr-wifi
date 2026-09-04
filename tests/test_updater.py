@@ -15,6 +15,7 @@ if app is None:
     app = QApplication([])
 
 from central_nvr.core.updater import (
+    fetch_latest_release,
     AssetDownloadWorker,
     ReleaseAsset,
     ReleaseInfo,
@@ -158,6 +159,70 @@ class TestUpdaterWorkers(unittest.TestCase):
 
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0].version, "9.9.9")
+
+
+    def test_fetch_latest_release_private_repo_raises_clear_error(self):
+        """Garante que repositório privado retornando 404 lance erro explicativo."""
+        mock_404 = MagicMock()
+        mock_404.status_code = 404
+        mock_404.text = "Not Found"
+
+        with patch("requests.get", return_value=mock_404):
+            with self.assertRaises(RuntimeError) as ctx:
+                fetch_latest_release(repo="Othayz/central-nvr-wifi")
+            self.assertIn("PRIVADO", str(ctx.exception))
+
+    def test_fetch_latest_release_rate_limit_raises_clear_error(self):
+        """Garante que rate-limit do GitHub emita mensagem orientadora."""
+        mock_403 = MagicMock()
+        mock_403.status_code = 403
+        mock_403.text = "API rate limit exceeded"
+
+        with patch("requests.get", return_value=mock_403):
+            with self.assertRaises(RuntimeError) as ctx:
+                fetch_latest_release(repo="Othayz/central-nvr-wifi")
+            self.assertIn("Limite de requisições", str(ctx.exception))
+
+    def test_fetch_latest_release_empty_releases_returns_up_to_date(self):
+        """Quando o repositório é acessível mas não tem releases, reconhece como atualizado."""
+        mock_404 = MagicMock()
+        mock_404.status_code = 404
+
+        mock_empty_list = MagicMock()
+        mock_empty_list.status_code = 200
+        mock_empty_list.json.return_value = []
+
+        def side_effect(url, **kwargs):
+            if "releases/latest" in url:
+                return mock_404
+            if "releases" in url:
+                return mock_empty_list
+            return mock_empty_list
+
+        with patch("requests.get", side_effect=side_effect):
+            info = fetch_latest_release(repo="Othayz/central-nvr-wifi")
+            self.assertIsNotNone(info)
+            self.assertFalse(info.is_newer)
+            self.assertEqual(info.title, "Repositório Sincronizado")
+
+    def test_fetch_latest_release_passes_token_header(self):
+        """Garante que token seja enviado no header Authorization."""
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "tag_name": "v1.0.0",
+            "name": "v1.0.0",
+            "body": "",
+            "html_url": "",
+            "published_at": "",
+            "assets": []
+        }
+
+        with patch("requests.get", return_value=mock_resp) as mock_get:
+            fetch_latest_release(repo="Othayz/central-nvr-wifi", token="ghp_test_token_12345")
+            self.assertTrue(mock_get.called)
+            headers = mock_get.call_args[1].get("headers", {})
+            self.assertEqual(headers.get("Authorization"), "Bearer ghp_test_token_12345")
 
     def test_update_check_worker_signal_no_update(self):
         worker = UpdateCheckWorker(repo="Othayz/central-nvr-wifi")

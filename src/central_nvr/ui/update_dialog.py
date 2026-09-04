@@ -78,9 +78,10 @@ class StartupUpdateDialog(QDialog):
     - Se não encontrar (ou falhar/offline): fecha suavemente e inicia a aplicação normalmente.
     """
 
-    def __init__(self, repo: str = DEFAULT_GITHUB_REPO, parent: Optional[QWidget] = None):
+    def __init__(self, repo: str = DEFAULT_GITHUB_REPO, token: Optional[str] = None, parent: Optional[QWidget] = None):
         super().__init__(parent)
         self.repo = repo
+        self.token = token
         self.release_info: Optional[ReleaseInfo] = None
         self.best_asset: Optional[ReleaseAsset] = None
         self.download_worker: Optional[AssetDownloadWorker] = None
@@ -191,7 +192,7 @@ class StartupUpdateDialog(QDialog):
         layout.addLayout(self.btn_layout)
 
     def _start_check(self):
-        self.check_worker = UpdateCheckWorker(repo=self.repo, parent=self)
+        self.check_worker = UpdateCheckWorker(repo=self.repo, token=self.token, parent=self)
         self.check_worker.update_available.connect(self._on_update_found)
         self.check_worker.no_update_available.connect(self._on_no_update)
         self.check_worker.check_failed.connect(self._on_check_failed)
@@ -271,6 +272,7 @@ class StartupUpdateDialog(QDialog):
         self.download_worker = AssetDownloadWorker(
             download_url=self.best_asset.download_url,
             destination_path=dest_file,
+            token=self.token,
             parent=self,
         )
         self.download_worker.progress.connect(self._on_download_progress)
@@ -351,10 +353,12 @@ class UpdateDialog(QDialog):
         self,
         repo: str = DEFAULT_GITHUB_REPO,
         release_info: Optional[ReleaseInfo] = None,
+        token: Optional[str] = None,
         parent: Optional[QWidget] = None,
     ):
         super().__init__(parent)
         self.repo = repo
+        self.token = token
         self.release_info = release_info
         self.best_asset = find_best_asset_for_system(release_info.assets) if release_info else None
         self.download_worker: Optional[AssetDownloadWorker] = None
@@ -448,7 +452,7 @@ class UpdateDialog(QDialog):
         self.lbl_status.setText("Verificando se há novas versões no GitHub...")
         self.btn_action.setEnabled(False)
 
-        self.worker = UpdateCheckWorker(repo=self.repo, parent=self)
+        self.worker = UpdateCheckWorker(repo=self.repo, token=self.token, parent=self)
         self.worker.update_available.connect(self._display_release)
         self.worker.no_update_available.connect(self._on_up_to_date)
         self.worker.check_failed.connect(self._on_check_error)
@@ -484,9 +488,26 @@ class UpdateDialog(QDialog):
         self.status_box.show()
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
-        self.lbl_status.setText(f"Não foi possível verificar atualizações: {err}")
+        first_line = err.splitlines()[0] if err else "Erro desconhecido"
+        self.lbl_status.setText(f"Não foi possível verificar atualizações: {first_line}")
         self.lbl_status.setStyleSheet("font-size: 12px; font-weight: 600; color: #EF4444;")
         self.btn_action.setEnabled(False)
+
+        formatted_err = err.replace("\n", "<br>")
+        self.txt_changelog.setHtml(f"""
+        <div style='padding: 14px; font-family: sans-serif; color: #334155; line-height: 1.6;'>
+            <h3 style='color: #DC2626; margin-top: 0;'>⚠️ Falha ao verificar atualizações</h3>
+            <p style='background-color: #FEE2E2; border-left: 4px solid #EF4444; padding: 10px; border-radius: 4px; color: #991B1B;'>
+                <b>Diagnóstico:</b> {formatted_err}
+            </p>
+            <h4 style='margin-bottom: 6px; color: #0F172A;'>Como resolver:</h4>
+            <ul style='margin-top: 0; padding-left: 20px;'>
+                <li><b>Se o projeto for de código aberto:</b> No GitHub, vá em <i>Settings &gt; General &gt; Danger Zone &gt; Change visibility</i> e mude para <b>Public</b>.</li>
+                <li><b>Se desejar manter o repositório Privado:</b> Acesse o menu <i>Configurações &gt; Atualizações do Aplicativo</i> e insira um <b>GitHub Token (PAT)</b>.</li>
+                <li><b>Se nenhuma versão foi lançada ainda:</b> No GitHub, acesse a aba <i>Releases</i> e publique a primeira versão (ex: <code>v1.0.0</code>) anexando os instaladores.</li>
+            </ul>
+        </div>
+        """)
 
     def _open_github(self):
         url = self.release_info.html_url if self.release_info else f"https://github.com/{self.repo}/releases"

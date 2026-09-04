@@ -160,34 +160,67 @@ def fetch_latest_release(
     repo: str = DEFAULT_GITHUB_REPO,
     include_prereleases: bool = False,
     timeout: int = 8,
+    token: Optional[str] = None,
 ) -> Optional[ReleaseInfo]:
     """
     Consulta a API pública do GitHub para obter a última release disponível.
+    Suporta autenticação por token (PAT) para repositórios privados ou para contornar rate-limit.
     """
-    url = f"https://api.github.com/repos/{repo}/releases/latest"
+    if not token:
+        token = os.environ.get("GITHUB_TOKEN", "").strip() or None
+        if not token:
+            try:
+                from central_nvr.core.config import ConfigManager
+                token = ConfigManager().get("github_token", "").strip() or None
+            except Exception:
+                token = None
+
     headers = {
         "Accept": "application/vnd.github.v3+json",
         "User-Agent": f"CentralNVR-App/{__version__}",
     }
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    url = f"https://api.github.com/repos/{repo}/releases/latest"
 
     try:
         response = requests.get(url, headers=headers, timeout=timeout)
-        
+
+        # 401: Token inválido
+        if response.status_code == 401:
+            raise RuntimeError("Token de autenticação do GitHub inválido ou expirado. Verifique as configurações.")
+
+        # 403: Rate limit ou permissão negada
+        if response.status_code == 403:
+            resp_body = response.text.lower()
+            if "rate limit" in resp_body:
+                raise RuntimeError(
+                    "Limite de requisições da API pública do GitHub atingido para seu endereço IP.\n"
+                    "Configure um GitHub Personal Access Token em Configurações para continuar sem restrições."
+                )
+            raise RuntimeError(f"Acesso não autorizado ao repositório '{repo}' (HTTP 403).")
+
+        # 404: Endpoint /releases/latest pode dar 404 se não houver release publicada OU se o repo for privado/inexistente
         if response.status_code == 404:
+            # 1. Tentar listar todas as releases
             list_url = f"https://api.github.com/repos/{repo}/releases"
             list_resp = requests.get(list_url, headers=headers, timeout=timeout)
+
             if list_resp.status_code == 200:
                 releases = list_resp.json()
-                if releases and isinstance(releases, list):
+                if isinstance(releases, list) and len(releases) > 0:
                     candidates = [r for r in releases if include_prereleases or not r.get("prerelease", False)]
                     if candidates:
                         return _parse_github_release_dict(candidates[0])
-            
+
+            # 2. Se a lista de releases também deu 404, verificar se o repositório ou tags existem
             tags_url = f"https://api.github.com/repos/{repo}/tags"
             tags_resp = requests.get(tags_url, headers=headers, timeout=timeout)
+
             if tags_resp.status_code == 200:
                 tags = tags_resp.json()
-                if tags and isinstance(tags, list) and len(tags) > 0:
+                if isinstance(tags, list) and len(tags) > 0:
                     first_tag = tags[0]
                     tag_name = first_tag.get("name", "v1.0.0")
                     clean_v = re.sub(r"^[a-zA-Z_\-]+", "", tag_name)
@@ -195,28 +228,49 @@ def fetch_latest_release(
                         tag_name=tag_name,
                         version=clean_v,
                         title=f"Central NVR WiFi {tag_name}",
-                        body="Nova versão lançada no repositório GitHub.",
+                        body="Versão identificada via tag do repositório.",
                         html_url=f"https://github.com/{repo}/releases/tag/{tag_name}",
                         published_at=datetime.datetime.now(datetime.timezone.utc).isoformat(),
                         prerelease=False,
                         assets=[],
                         is_newer=is_version_newer(__version__, clean_v),
                     )
-            return None
+
+            # Se tanto releases quanto tags retornaram 404, o repositório é privado ou não existe
+            if list_resp.status_code == 404 and tags_resp.status_code == 404:
+                raise RuntimeError(
+                    f"O repositório '{repo}' não foi encontrado ou é PRIVADO no GitHub.\n\n"
+                    "• Se o repositório for seu: altere a visibilidade para Público no GitHub, ou\n"
+                    "• Informe um GitHub Personal Access Token (PAT) nas Configurações da Central NVR."
+                )
+
+            # Se o repositório existe e foi acessado (200), mas está sem nenhuma release ou tag cadastrada
+            return ReleaseInfo(
+                tag_name=f"v{__version__}",
+                version=__version__,
+                title="Repositório Sincronizado",
+                body="Nenhuma nova versão ou release foi publicada no repositório GitHub ainda. Você já está utilizando a versão mais recente.",
+                html_url=f"https://github.com/{repo}",
+                published_at="",
+                prerelease=False,
+                assets=[],
+                is_newer=False,
+            )
 
         if response.status_code != 200:
-            logger.warning(f"Consulta ao GitHub retornou status HTTP {response.status_code}")
-            return None
+            raise RuntimeError(f"Consulta ao GitHub retornou status HTTP {response.status_code}.")
 
         data = response.json()
         return _parse_github_release_dict(data)
 
     except requests.exceptions.RequestException as e:
         logger.warning(f"Falha de conexão ao verificar atualizações no GitHub: {e}")
-        return None
+        raise RuntimeError("Não foi possível conectar ao GitHub. Verifique sua conexão com a internet.") from e
+    except RuntimeError:
+        raise
     except Exception as e:
         logger.error(f"Erro inesperado ao processar dados de release do GitHub: {e}")
-        return None
+        raise RuntimeError(f"Erro ao processar dados da release: {e}") from e
 
 
 def _parse_github_release_dict(data: Dict[str, Any]) -> ReleaseInfo:
@@ -259,16 +313,21 @@ def _parse_github_release_dict(data: Dict[str, Any]) -> ReleaseInfo:
 def download_asset(
     url: str,
     dest_path: str,
+    token: Optional[str] = None,
     progress_callback: Optional[Callable[[int, int, float], None]] = None,
     cancel_event: Optional[threading.Event] = None,
 ) -> bool:
     """
     Baixa um asset via stream HTTP com notificação de progresso (downloaded_bytes, total_bytes, speed_kBps).
+    Suporta autenticação com token para repositórios privados.
     """
     try:
         os.makedirs(os.path.dirname(os.path.abspath(dest_path)), exist_ok=True)
         headers = {"User-Agent": f"CentralNVR-Updater/{__version__}"}
-        
+        if token and "api.github.com" in url:
+            headers["Authorization"] = f"Bearer {token}"
+            headers["Accept"] = "application/octet-stream"
+
         response = requests.get(url, stream=True, headers=headers, timeout=30)
         response.raise_for_status()
 
@@ -358,16 +417,24 @@ class UpdateCheckWorker(QThread):
     no_update_available = Signal(object)   # Emite ReleaseInfo ou None quando app estiver atualizado
     check_failed = Signal(str)             # Emite mensagem de erro em caso de falha de conexão
 
-    def __init__(self, repo: str = DEFAULT_GITHUB_REPO, include_prereleases: bool = False, parent: Optional[QObject] = None):
+    def __init__(
+        self,
+        repo: str = DEFAULT_GITHUB_REPO,
+        include_prereleases: bool = False,
+        token: Optional[str] = None,
+        parent: Optional[QObject] = None,
+    ):
         super().__init__(parent)
         self.repo = repo
         self.include_prereleases = include_prereleases
+        self.token = token
 
     def run(self):
         try:
             release_info = fetch_latest_release(
                 repo=self.repo,
                 include_prereleases=self.include_prereleases,
+                token=self.token,
                 timeout=8,
             )
 
@@ -395,10 +462,17 @@ class AssetDownloadWorker(QThread):
     download_finished = Signal(str)       # destination file path
     download_failed = Signal(str)         # error message
 
-    def __init__(self, download_url: str, destination_path: str, parent: Optional[QObject] = None):
+    def __init__(
+        self,
+        download_url: str,
+        destination_path: str,
+        token: Optional[str] = None,
+        parent: Optional[QObject] = None,
+    ):
         super().__init__(parent)
         self.download_url = download_url
         self.destination_path = destination_path
+        self.token = token
         self._cancel_event = threading.Event()
 
     def cancel(self):
@@ -412,6 +486,7 @@ class AssetDownloadWorker(QThread):
         success = download_asset(
             url=self.download_url,
             dest_path=self.destination_path,
+            token=self.token,
             progress_callback=_on_progress,
             cancel_event=self._cancel_event,
         )

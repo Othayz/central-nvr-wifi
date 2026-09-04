@@ -113,7 +113,8 @@ def main() -> int:
     should_check_updates = config_mgr.get("check_updates_on_startup", True) and not args.no_update_check
     if should_check_updates:
         repo = config_mgr.get("github_repo", "Othayz/central-nvr-wifi")
-        splash = StartupUpdateDialog(repo=repo)
+        token = config_mgr.get("github_token", "").strip() or None
+        splash = StartupUpdateDialog(repo=repo, token=token)
         splash.exec()
         if not splash.should_open_main_window:
             logger.info("Encerrando inicialização (instalador acionado).")

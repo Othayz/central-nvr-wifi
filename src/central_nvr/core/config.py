@@ -151,6 +151,7 @@ class ConfigManager:
         "periodic_update_check": True,
         "periodic_update_interval_min": 10,
         "github_repo": "Othayz/central-nvr-wifi",
+        "github_token": "",
     }
 
     def __init__(self):

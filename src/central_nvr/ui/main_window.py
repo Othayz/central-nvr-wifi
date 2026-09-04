@@ -714,7 +714,8 @@ class MainWindow(QMainWindow):
     def _run_background_update_check(self):
         """Dispara consulta assíncrona ao GitHub em segundo plano."""
         repo = self.config_mgr.get("github_repo", "Othayz/central-nvr-wifi")
-        self._periodic_worker = UpdateCheckWorker(repo=repo, parent=self)
+        token = self.config_mgr.get("github_token", "").strip() or None
+        self._periodic_worker = UpdateCheckWorker(repo=repo, token=token, parent=self)
         self._periodic_worker.update_available.connect(self._on_background_update_found)
         self._periodic_worker.start()
 
@@ -730,13 +731,15 @@ class MainWindow(QMainWindow):
         if self._notified_version != release.version:
             self._notified_version = release.version
             repo = self.config_mgr.get("github_repo", "Othayz/central-nvr-wifi")
-            dialog = UpdateDialog(repo=repo, release_info=release, parent=self)
+            token = self.config_mgr.get("github_token", "").strip() or None
+            dialog = UpdateDialog(repo=repo, release_info=release, token=token, parent=self)
             dialog.exec()
 
     def _open_update_dialog(self):
         """Abre a janela de verificação de atualização sob demanda do usuário."""
         repo = self.config_mgr.get("github_repo", "Othayz/central-nvr-wifi")
-        dialog = UpdateDialog(repo=repo, parent=self)
+        token = self.config_mgr.get("github_token", "").strip() or None
+        dialog = UpdateDialog(repo=repo, token=token, parent=self)
         dialog.exec()
 
     def closeEvent(self, event):

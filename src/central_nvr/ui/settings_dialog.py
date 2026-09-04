@@ -150,6 +150,11 @@ class SettingsDialog(QDialog):
         self.txt_github_repo = QLineEdit("Othayz/central-nvr-wifi")
         up_form.addRow("Repositório GitHub:", self.txt_github_repo)
 
+        self.txt_github_token = QLineEdit()
+        self.txt_github_token.setEchoMode(QLineEdit.EchoMode.Password)
+        self.txt_github_token.setPlaceholderText("ghp_... (opcional, para repositórios privados)")
+        up_form.addRow("GitHub Token (PAT):", self.txt_github_token)
+
         check_now_layout = QHBoxLayout()
         lbl_cur_v = QLabel(f"Versão Instalada: <b>v{__version__}</b>")
         check_now_layout.addWidget(lbl_cur_v)
@@ -209,6 +214,7 @@ class SettingsDialog(QDialog):
         self.chk_periodic_update.setChecked(self.config_mgr.get("periodic_update_check", True))
         self.spin_update_interval.setValue(self.config_mgr.get("periodic_update_interval_min", 10))
         self.txt_github_repo.setText(self.config_mgr.get("github_repo", "Othayz/central-nvr-wifi"))
+        self.txt_github_token.setText(self.config_mgr.get("github_token", ""))
 
     def _save_values(self):
         self.config_mgr.set("theme", self.combo_theme.currentData())
@@ -226,6 +232,7 @@ class SettingsDialog(QDialog):
         self.config_mgr.set("periodic_update_check", self.chk_periodic_update.isChecked())
         self.config_mgr.set("periodic_update_interval_min", self.spin_update_interval.value())
         self.config_mgr.set("github_repo", self.txt_github_repo.text().strip() or "Othayz/central-nvr-wifi")
+        self.config_mgr.set("github_token", self.txt_github_token.text().strip())
 
         QMessageBox.information(self, "Configurações", "Configurações salvas com sucesso!")
         self.accept()
@@ -242,5 +249,6 @@ class SettingsDialog(QDialog):
 
     def _check_updates_now(self):
         repo = self.txt_github_repo.text().strip() or "Othayz/central-nvr-wifi"
-        dialog = UpdateDialog(repo=repo, parent=self)
+        token = self.txt_github_token.text().strip() or None
+        dialog = UpdateDialog(repo=repo, token=token, parent=self)
         dialog.exec()
