@@ -260,5 +260,19 @@ class TestUpdaterWorkers(unittest.TestCase):
                     self.assertEqual(call_args[2], "install")
                     self.assertNotIn("bash", call_args)
 
+    def test_parse_release_version_title_tag_divergence(self):
+        from central_nvr.core.updater import _parse_github_release_dict
+        mock_data = {
+            "tag_name": "Central_NVR_WiFi_v1.0.0",
+            "name": "v1.1",
+            "body": "Notas de lançamento v1.1",
+            "html_url": "https://github.com/Othayz/central-nvr-wifi/releases/tag/Central_NVR_WiFi_v1.0.0",
+            "published_at": "2026-08-30T21:48:05Z",
+            "assets": [],
+        }
+        rel = _parse_github_release_dict(mock_data)
+        self.assertEqual(rel.version, "1.1")
+        self.assertTrue(rel.is_newer)
+
 if __name__ == "__main__":
     unittest.main()

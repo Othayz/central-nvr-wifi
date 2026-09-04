@@ -496,6 +496,7 @@ class UpdateDialog(QDialog):
         html_body += _format_markdown_to_html(release.body)
         self.txt_changelog.setHtml(html_body)
 
+        self.btn_action.show()
         self.btn_action.setEnabled(True)
         self.btn_action.setText("⬇️ Baixar e Instalar")
 
@@ -507,6 +508,7 @@ class UpdateDialog(QDialog):
         self.lbl_status.setStyleSheet("font-size: 12px; font-weight: 700; color: #16A34A;")
         self.txt_changelog.setHtml("<p style='text-align:center; color:#64748B; margin-top:30px;'>Você já está usando a versão mais recente do aplicativo.<br>Nenhuma ação necessária.</p>")
         self.btn_action.setEnabled(False)
+        self.btn_action.hide()
 
     def _on_check_error(self, err: str):
         self.status_box.show()

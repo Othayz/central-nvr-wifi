@@ -73,6 +73,32 @@ class ReleaseInfo:
             return self.published_at[:10]
 
 
+def parse_release_version(tag_name: str, title: str = "") -> str:
+    """
+    Extrai a melhor versão semântica considerando tanto o título da release quanto a tag git.
+    Isso resolve divergências quando uma release é nomeada no GitHub (ex: 'v1.1')
+    enquanto a tag subjacente possui outro formato (ex: 'Central_NVR_WiFi_v1.0.0').
+    """
+    candidates = []
+    for s in [title, tag_name]:
+        if not s:
+            continue
+        m = re.search(r"(?:v|ver|version)?\s*([0-9]+(?:\.[0-9]+)+[a-zA-Z0-9_\-]*)", str(s), re.IGNORECASE)
+        if m:
+            ver_str = m.group(1)
+            candidates.append((parse_version(ver_str), ver_str))
+        else:
+            clean = re.sub(r"^[a-zA-Z_\-]+", "", str(s).strip())
+            if clean and clean[0].isdigit():
+                candidates.append((parse_version(clean), clean))
+
+    if candidates:
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        return candidates[0][1]
+
+    return re.sub(r"^[a-zA-Z_\-]+", "", tag_name) or "1.0.0"
+
+
 def parse_version(ver_str: str) -> Tuple[int, ...]:
     """
     Converte uma string de versão (ex: 'v1.2.3', '1.0.0-beta', '2.1') em uma tupla comparável.
@@ -276,8 +302,8 @@ def fetch_latest_release(
 def _parse_github_release_dict(data: Dict[str, Any]) -> ReleaseInfo:
     """Extrai campos da estrutura de resposta JSON do GitHub."""
     tag_name = data.get("tag_name", "")
-    clean_v = re.sub(r"^[a-zA-Z_\-]+", "", tag_name)
     title = data.get("name") or f"Versão {tag_name}"
+    clean_v = parse_release_version(tag_name, title)
     body = data.get("body") or "Nenhuma nota de versão fornecida."
     html_url = data.get("html_url", "")
     published_at = data.get("published_at", "")

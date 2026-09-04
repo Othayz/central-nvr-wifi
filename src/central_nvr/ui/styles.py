@@ -119,6 +119,12 @@ QPushButton.primary-btn:pressed {
     background-color: #1E40AF;
 }
 
+QPushButton.primary-btn:disabled {
+    background-color: #334155;
+    border-color: #475569;
+    color: #64748B;
+}
+
 /* Botões de Cabeçalho */
 QPushButton.header-btn {
     background-color: #0B1120;
@@ -534,6 +540,12 @@ QPushButton.primary-btn:hover {
 QPushButton.primary-btn:pressed {
     background-color: #1E40AF;
     color: #FFFFFF;
+}
+
+QPushButton.primary-btn:disabled {
+    background-color: #E2E8F0;
+    border-color: #CBD5E1;
+    color: #94A3B8;
 }
 
 /* Botões de Cabeçalho */
