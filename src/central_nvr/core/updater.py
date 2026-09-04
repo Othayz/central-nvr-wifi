@@ -391,38 +391,155 @@ def download_asset(
         return False
 
 
+def _extract_tar_members_to_local(tar, target_base):
+    from pathlib import Path
+    for member in tar.getmembers():
+        rel_parts = Path(member.name).parts
+        if len(rel_parts) > 1 and rel_parts[0] in (".", "/"):
+            rel_parts = rel_parts[1:]
+        if len(rel_parts) > 0 and rel_parts[0] == "usr":
+            rel_parts = rel_parts[1:]
+        if not rel_parts:
+            continue
+        dest_path = target_base.joinpath(*rel_parts)
+        if member.isdir():
+            dest_path.mkdir(parents=True, exist_ok=True)
+        elif member.isfile():
+            dest_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(dest_path, "wb") as out_f:
+                shutil.copyfileobj(tar.extractfile(member), out_f)
+            if member.mode:
+                try:
+                    os.chmod(dest_path, member.mode)
+                except Exception:
+                    pass
+
+
+def install_package_to_user_local(file_path: str) -> Tuple[bool, str]:
+    """
+    Instala ou atualiza o pacote diretamente no espaço do usuário (~/.local/).
+    Funciona em qualquer distribuição Linux, inclusive sistemas imutáveis (Bazzite, Kinoite, SteamOS),
+    sem requerer privilégios de root nem abrir gerenciadores de arquivo (Ark/File Roller).
+    """
+    import io
+    import tarfile
+    from pathlib import Path
+
+    target_base = Path.home() / ".local"
+    target_base.mkdir(parents=True, exist_ok=True)
+
+    data_tar_bytes = None
+    ext = os.path.splitext(file_path)[1].lower()
+
+    if ext == ".deb":
+        try:
+            with open(file_path, "rb") as f:
+                magic = f.read(8)
+                if magic != b"!<arch>\n":
+                    return False, "O arquivo .deb baixado não possui formato ar válido."
+                while True:
+                    hdr = f.read(60)
+                    if len(hdr) < 60:
+                        break
+                    m_name = hdr[:16].decode("ascii", errors="ignore").strip()
+                    m_size = int(hdr[48:58].decode("ascii", errors="ignore").strip())
+                    content = f.read(m_size)
+                    if m_size % 2 != 0:
+                        f.read(1)
+                    if "data.tar" in m_name:
+                        data_tar_bytes = content
+                        break
+        except Exception as e:
+            return False, f"Falha ao processar pacote .deb: {e}"
+
+        if not data_tar_bytes:
+            return False, "Arquivo de dados (data.tar) não encontrado no pacote .deb."
+
+        try:
+            with tarfile.open(fileobj=io.BytesIO(data_tar_bytes)) as tar:
+                _extract_tar_members_to_local(tar, target_base)
+        except Exception as e:
+            return False, f"Erro ao extrair arquivos da aplicação: {e}"
+
+    elif file_path.endswith((".tar.gz", ".tgz")):
+        try:
+            with tarfile.open(file_path, "r:*") as tar:
+                _extract_tar_members_to_local(tar, target_base)
+        except Exception as e:
+            return False, f"Erro ao extrair tarball: {e}"
+
+    else:
+        return False, f"Formato '{ext}' não suporta instalação direta no usuário."
+
+    # Configurar executável launcher ~/.local/bin/central-nvr
+    bin_path = target_base / "bin" / "central-nvr"
+    bin_path.parent.mkdir(parents=True, exist_ok=True)
+    launcher_content = f"""#!/bin/sh
+export PYTHONPATH="{target_base / 'lib' / 'central-nvr'}:${{PYTHONPATH}}"
+exec /usr/bin/python3 -m central_nvr.app "$@"
+"""
+    try:
+        with open(bin_path, "w", encoding="utf-8") as f:
+            f.write(launcher_content)
+        os.chmod(bin_path, 0o755)
+    except Exception as e:
+        logger.warning(f"Erro criando launcher em {bin_path}: {e}")
+
+    # Atualizar lançador .desktop
+    desktop_path = target_base / "share" / "applications" / "central-nvr.desktop"
+    if desktop_path.exists():
+        try:
+            with open(desktop_path, "r", encoding="utf-8") as f:
+                d_content = f.read()
+            d_content = re.sub(r"^Exec=.*$", f"Exec={bin_path}", d_content, flags=re.MULTILINE)
+            icon_svg = target_base / "share" / "icons" / "hicolor" / "scalable" / "apps" / "central-nvr.svg"
+            icon_png = target_base / "share" / "icons" / "hicolor" / "512x512" / "apps" / "central-nvr.png"
+            icon_to_use = icon_svg if icon_svg.exists() else (icon_png if icon_png.exists() else "central-nvr")
+            d_content = re.sub(r"^Icon=.*$", f"Icon={icon_to_use}", d_content, flags=re.MULTILINE)
+            with open(desktop_path, "w", encoding="utf-8") as f:
+                f.write(d_content)
+        except Exception as e:
+            logger.warning(f"Erro atualizando .desktop: {e}")
+
+    if shutil.which("update-desktop-database"):
+        try:
+            subprocess.run(["update-desktop-database", str(target_base / "share" / "applications")], capture_output=True, timeout=4)
+        except Exception:
+            pass
+
+    return True, "Central NVR WiFi instalada e atualizada com sucesso em ~/.local (Menu de Aplicativos atualizado)."
+
+
 def install_downloaded_package(file_path: str) -> Tuple[bool, str]:
     """
-    Inicia a instalação do arquivo de atualização baixado (.deb ou .rpm).
-    Usa pkexec / apt / dnf ou xdg-open conforme a distribuição.
+    Inicia a instalação do arquivo de atualização baixado (.deb, .rpm ou .tar.gz).
+    Prioriza instalação nativa do sistema em distros compatíveis ou realiza a instalação
+    direta no espaço do usuário (~/.local), prevenindo abertura indevida em gerenciadores de arquivo (Ark).
     """
     if not os.path.exists(file_path):
         return False, "Arquivo de instalação não encontrado no disco."
 
     ext = os.path.splitext(file_path)[1].lower()
+    is_ostree = os.path.exists("/run/ostree-booted")
 
     try:
-        if ext == ".deb":
-            if shutil.which("pkexec") and shutil.which("apt"):
-                subprocess.Popen(["pkexec", "apt", "install", "-y", os.path.abspath(file_path)])
-                return True, "Assistente de instalação iniciado via apt/pkexec."
-            if shutil.which("xdg-open"):
-                subprocess.Popen(["xdg-open", os.path.abspath(file_path)])
-                return True, "Pacote .deb aberto na Central de Aplicativos."
+        # Se for Ubuntu/Debian padrão (com apt e sem sistema imutável)
+        if ext == ".deb" and not is_ostree and shutil.which("pkexec") and shutil.which("apt"):
+            subprocess.Popen(["pkexec", "apt", "install", "-y", os.path.abspath(file_path)])
+            return True, "Assistente de instalação iniciado via apt/pkexec."
 
-        elif ext == ".rpm":
-            if shutil.which("pkexec") and shutil.which("dnf"):
-                subprocess.Popen(["pkexec", "dnf", "install", "-y", os.path.abspath(file_path)])
-                return True, "Assistente de instalação iniciado via dnf/pkexec."
-            if shutil.which("xdg-open"):
-                subprocess.Popen(["xdg-open", os.path.abspath(file_path)])
-                return True, "Pacote .rpm aberto no Gerenciador de Programas."
+        # Se for Fedora/RHEL tradicional (com dnf e sem sistema imutável)
+        if ext == ".rpm" and not is_ostree and shutil.which("pkexec") and shutil.which("dnf"):
+            subprocess.Popen(["pkexec", "dnf", "install", "-y", os.path.abspath(file_path)])
+            return True, "Assistente de instalação iniciado via dnf/pkexec."
 
-        if shutil.which("xdg-open"):
-            subprocess.Popen(["xdg-open", os.path.dirname(os.path.abspath(file_path))])
-            return True, f"Pasta com o arquivo baixado aberta: {os.path.basename(file_path)}"
+        # Para sistemas imutáveis (Bazzite, Kinoite, SteamOS) ou quando apt/dnf não estiverem disponíveis:
+        # Instala diretamente no espaço do usuário (~/.local), sem root e sem abrir gerenciadores como o Ark.
+        success, msg = install_package_to_user_local(file_path)
+        if success:
+            return True, msg
 
-        return False, "Nenhum gerenciador de instalação compatível encontrado."
+        return False, f"Falha na instalação automática: {msg}"
 
     except Exception as e:
         logger.error(f"Erro ao acionar instalador: {e}")

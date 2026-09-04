@@ -247,7 +247,7 @@ class TestUpdaterWorkers(unittest.TestCase):
 
     def test_install_downloaded_package_safe_execution(self):
         from central_nvr.core.updater import install_downloaded_package
-        with patch("os.path.exists", return_value=True):
+        with patch("os.path.exists", side_effect=lambda p: False if "ostree" in str(p) else True):
             with patch("shutil.which") as mock_which:
                 mock_which.side_effect = lambda cmd: cmd in ("pkexec", "apt")
                 with patch("subprocess.Popen") as mock_popen:
@@ -259,6 +259,18 @@ class TestUpdaterWorkers(unittest.TestCase):
                     self.assertEqual(call_args[1], "apt")
                     self.assertEqual(call_args[2], "install")
                     self.assertNotIn("bash", call_args)
+
+    def test_install_downloaded_package_user_local(self):
+        from central_nvr.core.updater import install_downloaded_package
+        import tempfile
+        from pathlib import Path
+        deb_file = "dist/central-nvr_1.0.0_all.deb"
+        if os.path.exists(deb_file):
+            with tempfile.TemporaryDirectory() as tmpdir:
+                with patch("pathlib.Path.home", return_value=Path(tmpdir)):
+                    success, msg = install_downloaded_package(deb_file)
+                    self.assertTrue(success)
+                    self.assertTrue((Path(tmpdir) / ".local" / "bin" / "central-nvr").exists())
 
     def test_parse_release_version_title_tag_divergence(self):
         from central_nvr.core.updater import _parse_github_release_dict
