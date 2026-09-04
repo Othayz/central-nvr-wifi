@@ -100,9 +100,9 @@ def get_data_dir() -> Path:
 
 def _secure_write_json(filepath: Path, data: Any):
     """
-    Grava arquivo JSON com permissões estritas (0600) e diretório com permissão (0700).
-    Utiliza os.open com flags O_CREAT | O_WRONLY | O_TRUNC e modo 0o600 para evitar
-    janelas de exposição de permissão no sistema operacional.
+    Grava arquivo JSON atomicamente com permissões estritas (0600) e diretório com permissão (0700).
+    Grava primeiro em arquivo temporário (.tmp) no mesmo sistema de arquivos e executa
+    substituição atômica (os.replace) para garantir integridade caso o processo sofra encerramento abrupto.
     """
     filepath.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     try:
@@ -110,21 +110,30 @@ def _secure_write_json(filepath: Path, data: Any):
     except (OSError, PermissionError):
         pass
 
+    tmp_path = filepath.with_suffix(f".tmp.{os.getpid()}")
     flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
     mode = 0o600
-    fd = os.open(filepath, flags, mode)
+    fd = os.open(tmp_path, flags, mode)
     try:
         with open(fd, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
         try:
-            os.chmod(filepath, 0o600)
+            os.chmod(tmp_path, 0o600)
         except (OSError, PermissionError):
             pass
+        os.replace(tmp_path, filepath)
     except Exception:
         try:
             os.close(fd)
         except OSError:
             pass
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
         raise
 
 

@@ -378,8 +378,7 @@ def install_downloaded_package(file_path: str) -> Tuple[bool, str]:
     try:
         if ext == ".deb":
             if shutil.which("pkexec") and shutil.which("apt"):
-                cmd = f"pkexec apt install -y \"{os.path.abspath(file_path)}\""
-                subprocess.Popen(["bash", "-c", cmd])
+                subprocess.Popen(["pkexec", "apt", "install", "-y", os.path.abspath(file_path)])
                 return True, "Assistente de instalação iniciado via apt/pkexec."
             if shutil.which("xdg-open"):
                 subprocess.Popen(["xdg-open", os.path.abspath(file_path)])
@@ -387,8 +386,7 @@ def install_downloaded_package(file_path: str) -> Tuple[bool, str]:
 
         elif ext == ".rpm":
             if shutil.which("pkexec") and shutil.which("dnf"):
-                cmd = f"pkexec dnf install -y \"{os.path.abspath(file_path)}\""
-                subprocess.Popen(["bash", "-c", cmd])
+                subprocess.Popen(["pkexec", "dnf", "install", "-y", os.path.abspath(file_path)])
                 return True, "Assistente de instalação iniciado via dnf/pkexec."
             if shutil.which("xdg-open"):
                 subprocess.Popen(["xdg-open", os.path.abspath(file_path)])

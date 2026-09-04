@@ -713,6 +713,9 @@ class MainWindow(QMainWindow):
 
     def _run_background_update_check(self):
         """Dispara consulta assíncrona ao GitHub em segundo plano."""
+        if hasattr(self, "_periodic_worker") and self._periodic_worker and self._periodic_worker.isRunning():
+            logger.debug("Verificação de atualização anterior ainda ativa. Ignorando disparo.")
+            return
         repo = self.config_mgr.get("github_repo", "Othayz/central-nvr-wifi")
         token = self.config_mgr.get("github_token", "").strip() or None
         self._periodic_worker = UpdateCheckWorker(repo=repo, token=token, parent=self)
@@ -744,5 +747,15 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         """Encerra threads de forma graciosa ao fechar a janela."""
+        if hasattr(self, "update_periodic_timer") and self.update_periodic_timer.isActive():
+            self.update_periodic_timer.stop()
+
+        if hasattr(self, "_periodic_worker") and self._periodic_worker and self._periodic_worker.isRunning():
+            try:
+                self._periodic_worker.quit()
+                self._periodic_worker.wait(300)
+            except Exception:
+                pass
+
         self.camera_grid.stop_all()
         super().closeEvent(event)

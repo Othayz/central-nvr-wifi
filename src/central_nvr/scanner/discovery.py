@@ -137,6 +137,7 @@ class NetworkScanner:
         local_ips = get_local_ip_addresses()
 
         # Criar socket UDP para multicast
+        sock = None
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -179,10 +180,11 @@ class NetworkScanner:
         except Exception as e:
             logger.warning(f"Erro ao inicializar socket WS-Discovery: {e}")
         finally:
-            try:
-                sock.close()
-            except Exception:
-                pass
+            if sock is not None:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
 
     def _run_port_scan(
         self,

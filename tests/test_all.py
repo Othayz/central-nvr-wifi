@@ -582,5 +582,39 @@ class TestFullscreenView(unittest.TestCase):
         self.app.processEvents()
 
 
+    def test_onvif_soap_content_type_and_relative_xaddr(self):
+        from central_nvr.core.onvif_client import OnvifClient
+        client = OnvifClient("192.168.1.100", port=80)
+        
+        # Testar caminho relativo
+        rel_addr = client._validate_xaddr("/onvif/device_service")
+        self.assertEqual(rel_addr, "http://192.168.1.100:80/onvif/device_service")
+
+        # Testar Content-Type formatado sem strings literais corrompidas
+        with patch.object(client, "_session") as mock_sess:
+            mock_sess.post.return_value.status_code = 200
+            mock_sess.post.return_value.text = "<xml></xml>"
+            client._send_soap_request("http://192.168.1.100/onvif/device", "<test/>", action="http://test/action")
+            self.assertTrue(mock_sess.post.called)
+            sent_headers = mock_sess.post.call_args[1].get("headers", {})
+            ct = sent_headers.get("Content-Type", "")
+            self.assertIn('action="http://test/action"', ct)
+            self.assertNotIn("+ action +", ct)
+
+    def test_config_atomic_write(self):
+        import json
+        import tempfile
+        from central_nvr.core.config import _secure_write_json
+        with tempfile.TemporaryDirectory() as tmpdir:
+            test_file = Path(tmpdir) / "test_settings.json"
+            _secure_write_json(test_file, {"theme": "dark", "version": 1})
+            self.assertTrue(test_file.exists())
+            with open(test_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            self.assertEqual(data["theme"], "dark")
+            # Verificar permissões 0600
+            mode = oct(test_file.stat().st_mode)[-3:]
+            self.assertEqual(mode, "600")
+
 if __name__ == "__main__":
     unittest.main()

@@ -89,6 +89,8 @@ try:
 except ImportError:
     pass
 
+_opencv_lock = threading.Lock()
+
 
 class StreamWorker(QThread):
     """
@@ -243,11 +245,11 @@ class StreamWorker(QThread):
             "stimeout": "2500000",
         }
 
+        container = None
         try:
             container = av.open(stream_url, mode="r", options=container_options, timeout=2.5)
             video_stream = next((s for s in container.streams if s.type == "video"), None)
             if not video_stream:
-                container.close()
                 return False
 
             video_stream.thread_type = "AUTO"
@@ -280,18 +282,25 @@ class StreamWorker(QThread):
 
                     self._process_and_emit_frame(img_rgb, w, h, delta_ms)
 
-            container.close()
             return True
         except Exception as e:
             logger.debug(f"PyAV stream error for {self.camera.name} via {transport}: {e}")
             return False
+        finally:
+            if container is not None:
+                try:
+                    container.close()
+                except Exception:
+                    pass
 
     def _run_opencv_stream(self, stream_url: str, transport: str = "udp") -> bool:
         """Consome o fluxo utilizando OpenCV VideoCapture."""
+        cap = None
         try:
-            os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = f"rtsp_transport;{transport}|reorder_queue_size;0|buffer_size;1024|stimeout;2500000|fflags;+nobuffer+discardcorrupt"
-            cap = cv2.VideoCapture(stream_url, cv2.CAP_FFMPEG)
-            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            with _opencv_lock:
+                os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = f"rtsp_transport;{transport}|reorder_queue_size;0|buffer_size;1024|stimeout;2500000|fflags;+nobuffer+discardcorrupt"
+                cap = cv2.VideoCapture(stream_url, cv2.CAP_FFMPEG)
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
             if not cap.isOpened():
                 return False
@@ -318,11 +327,16 @@ class StreamWorker(QThread):
 
                 self._process_and_emit_frame(frame_rgb, w, h, delta_ms)
 
-            cap.release()
             return True
         except Exception as e:
             logger.debug(f"OpenCV stream error for {self.camera.name} via {transport}: {e}")
             return False
+        finally:
+            if cap is not None:
+                try:
+                    cap.release()
+                except Exception:
+                    pass
 
     def _run_test_pattern_stream(self):
         """
@@ -388,6 +402,10 @@ class StreamWorker(QThread):
                 logger.error(f"Erro salvando snapshot: {e}")
             finally:
                 self._request_snapshot = None
+
+        # Garantir array contíguo em memória para QImage estável
+        if HAS_NUMPY and isinstance(rgb_array, np.ndarray) and not rgb_array.flags["C_CONTIGUOUS"]:
+            rgb_array = np.ascontiguousarray(rgb_array)
 
         # Detecção de Movimento Leve (Edge-AI / Motion Tracking)
         self._evaluate_motion(rgb_array, width, height)

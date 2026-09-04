@@ -70,6 +70,8 @@ class OnvifClient:
         if not xaddr:
             return None
         try:
+            if xaddr.startswith("/"):
+                return f"http://{self.ip}:{self.port}{xaddr}"
             parsed = urllib.parse.urlparse(xaddr)
             if parsed.hostname and parsed.hostname == self.ip:
                 return xaddr
@@ -141,8 +143,9 @@ class OnvifClient:
     </soap:Body>
 </soap:Envelope>"""
 
+        content_type = f'application/soap+xml; charset=utf-8; action="{action}"' if action else "application/soap+xml; charset=utf-8"
         headers = {
-            "Content-Type": "application/soap+xml; charset=utf-8; action="" + action + """,
+            "Content-Type": content_type,
         }
 
         data_bytes = envelope.encode("utf-8")

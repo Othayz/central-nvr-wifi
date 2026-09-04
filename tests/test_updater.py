@@ -245,5 +245,20 @@ class TestUpdaterWorkers(unittest.TestCase):
         self.assertEqual(len(no_update_results), 1)
 
 
+    def test_install_downloaded_package_safe_execution(self):
+        from central_nvr.core.updater import install_downloaded_package
+        with patch("os.path.exists", return_value=True):
+            with patch("shutil.which") as mock_which:
+                mock_which.side_effect = lambda cmd: cmd in ("pkexec", "apt")
+                with patch("subprocess.Popen") as mock_popen:
+                    success, msg = install_downloaded_package("/tmp/central-nvr_1.0.0.deb")
+                    self.assertTrue(success)
+                    self.assertTrue(mock_popen.called)
+                    call_args = mock_popen.call_args[0][0]
+                    self.assertEqual(call_args[0], "pkexec")
+                    self.assertEqual(call_args[1], "apt")
+                    self.assertEqual(call_args[2], "install")
+                    self.assertNotIn("bash", call_args)
+
 if __name__ == "__main__":
     unittest.main()

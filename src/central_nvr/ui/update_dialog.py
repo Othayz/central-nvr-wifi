@@ -344,6 +344,30 @@ class StartupUpdateDialog(QDialog):
             QMessageBox.critical(self, "Falha na Instalação", f"Não foi possível iniciar o instalador:\n{msg}")
 
 
+
+    def closeEvent(self, event):
+        self._cleanup_workers()
+        super().closeEvent(event)
+
+    def reject(self):
+        self._cleanup_workers()
+        super().reject()
+
+    def _cleanup_workers(self):
+        if hasattr(self, "check_worker") and self.check_worker and self.check_worker.isRunning():
+            try:
+                self.check_worker.quit()
+                self.check_worker.wait(300)
+            except Exception:
+                pass
+        if hasattr(self, "download_worker") and self.download_worker and self.download_worker.isRunning():
+            try:
+                self.download_worker.cancel()
+                self.download_worker.wait(500)
+            except Exception:
+                pass
+
+
 class UpdateDialog(QDialog):
     """
     Diálogo para verificação manual ou notificação periódica (a cada 10 minutos).
@@ -574,3 +598,25 @@ class UpdateDialog(QDialog):
                 self.accept()
             else:
                 QMessageBox.critical(self, "Erro", f"Falha ao iniciar instalação: {msg}")
+
+    def closeEvent(self, event):
+        self._cleanup_workers()
+        super().closeEvent(event)
+
+    def reject(self):
+        self._cleanup_workers()
+        super().reject()
+
+    def _cleanup_workers(self):
+        if hasattr(self, "check_worker") and self.check_worker and self.check_worker.isRunning():
+            try:
+                self.check_worker.quit()
+                self.check_worker.wait(300)
+            except Exception:
+                pass
+        if hasattr(self, "download_worker") and self.download_worker and self.download_worker.isRunning():
+            try:
+                self.download_worker.cancel()
+                self.download_worker.wait(500)
+            except Exception:
+                pass
