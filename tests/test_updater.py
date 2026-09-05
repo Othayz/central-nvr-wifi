@@ -3,7 +3,13 @@
 Testes unitários para o módulo de atualizações via GitHub (central_nvr.core.updater).
 """
 import os
+import sys
 import tempfile
+from pathlib import Path
+
+root_src = Path(__file__).resolve().parent.parent / "src"
+if str(root_src) not in sys.path:
+    sys.path.insert(0, str(root_src))
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -246,19 +252,117 @@ class TestUpdaterWorkers(unittest.TestCase):
 
 
     def test_install_downloaded_package_safe_execution(self):
+        """Valida execução segura de pkexec quando SHA-256 é verificado com sucesso."""
         from central_nvr.core.updater import install_downloaded_package
         with patch("os.path.exists", side_effect=lambda p: False if "ostree" in str(p) else True):
             with patch("shutil.which") as mock_which:
                 mock_which.side_effect = lambda cmd: cmd in ("pkexec", "apt")
-                with patch("subprocess.Popen") as mock_popen:
-                    success, msg = install_downloaded_package("/tmp/central-nvr_1.0.0.deb")
+                with patch("central_nvr.core.updater.verify_file_sha256", return_value=True):
+                    with patch("subprocess.Popen") as mock_popen:
+                        success, msg = install_downloaded_package(
+                            "/cache/central-nvr_1.0.0.deb",
+                            expected_sha256="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                        )
+                        self.assertTrue(success)
+                        self.assertTrue(mock_popen.called)
+                        call_args = mock_popen.call_args[0][0]
+                        self.assertEqual(call_args[0], "pkexec")
+                        self.assertEqual(call_args[1], "apt")
+                        self.assertEqual(call_args[2], "install")
+                        self.assertNotIn("bash", call_args)
+
+    def test_install_downloaded_package_blocks_unverified_pkexec(self):
+        """Valida que pkexec é bloqueado sem verificação prévia de SHA-256 (SEC-02 / SEC-07)."""
+        from central_nvr.core.updater import install_downloaded_package
+        with patch("os.path.exists", side_effect=lambda p: False if "ostree" in str(p) else True):
+            with patch("shutil.which") as mock_which:
+                mock_which.side_effect = lambda cmd: cmd in ("pkexec", "apt")
+                with patch("central_nvr.core.updater.install_package_to_user_local", return_value=(True, "Instalado no usuário")):
+                    # Sem expected_sha256, deve bloquear pkexec
+                    success, msg = install_downloaded_package("/cache/central-nvr_1.0.0.deb", expected_sha256=None)
                     self.assertTrue(success)
-                    self.assertTrue(mock_popen.called)
-                    call_args = mock_popen.call_args[0][0]
-                    self.assertEqual(call_args[0], "pkexec")
-                    self.assertEqual(call_args[1], "apt")
-                    self.assertEqual(call_args[2], "install")
-                    self.assertNotIn("bash", call_args)
+                    self.assertIn("requer validação de hash SHA-256", msg)
+
+    def test_install_downloaded_package_sha256_mismatch(self):
+        """Valida rejeição de pacote corrompido ou adulterado (SEC-07)."""
+        from central_nvr.core.updater import install_downloaded_package
+        with patch("os.path.exists", return_value=True):
+            with patch("central_nvr.core.updater.verify_file_sha256", return_value=False):
+                with patch("central_nvr.core.updater.compute_file_sha256", return_value="badhash"):
+                    success, msg = install_downloaded_package("/cache/pkg.deb", expected_sha256="expectedhash")
+                    self.assertFalse(success)
+                    self.assertIn("Falha de integridade SHA-256", msg)
+
+    def test_tar_slip_and_symlink_prevention(self):
+        """Valida que _extract_tar_members_to_local bloqueia Tar Slip e links maliciosos (SEC-03)."""
+        import io
+        import tarfile
+        from pathlib import Path
+        from central_nvr.core.updater import _extract_tar_members_to_local
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_dir = Path(tmpdir) / "user_home"
+            base_dir.mkdir()
+
+            # Criar tarball contendo caminhos maliciosos com Tar Slip e links externos
+            tar_buf = io.BytesIO()
+            with tarfile.open(fileobj=tar_buf, mode="w") as tar:
+                # 1. Arquivo benigno
+                info_valid = tarfile.TarInfo(name="usr/bin/safe_app")
+                data_valid = b"safe code"
+                info_valid.size = len(data_valid)
+                tar.addfile(info_valid, io.BytesIO(data_valid))
+
+                # 2. Arquivo com Tar Slip
+                info_slip = tarfile.TarInfo(name="usr/../../.test_slip")
+                data_slip = b"malicious content"
+                info_slip.size = len(data_slip)
+                tar.addfile(info_slip, io.BytesIO(data_slip))
+
+                # 3. Symlink apontando para fora do target
+                info_sym = tarfile.TarInfo(name="usr/evil_link")
+                info_sym.type = tarfile.SYMTYPE
+                info_sym.linkname = "/etc/passwd"
+                tar.addfile(info_sym)
+
+            tar_buf.seek(0)
+            with tarfile.open(fileobj=tar_buf, mode="r") as tar:
+                _extract_tar_members_to_local(tar, base_dir)
+
+            # O arquivo benigno deve ter sido extraído
+            self.assertTrue((base_dir / "bin" / "safe_app").exists())
+            # O arquivo malicioso com Tar Slip NÃO deve existir fora de base_dir nem em .test_slip
+            self.assertFalse((Path(tmpdir) / ".test_slip").exists())
+            self.assertFalse((base_dir / ".test_slip").exists())
+            # O link simbólico para fora NÃO deve ter sido criado
+            self.assertFalse((base_dir / "evil_link").exists())
+
+    def test_get_updates_dir_and_file_permissions(self):
+        """Valida diretório privado 0700 e permissões 0600 em atualizações (SEC-02)."""
+        from central_nvr.core.updater import get_updates_dir
+        updates_dir = get_updates_dir()
+        self.assertTrue(updates_dir.exists())
+        mode = oct(updates_dir.stat().st_mode)[-3:]
+        self.assertEqual(mode, "700")
+
+    def test_get_expected_sha256_for_asset(self):
+        """Valida extração de hash SHA-256 das releases do GitHub (SEC-07)."""
+        from central_nvr.core.updater import get_expected_sha256_for_asset, ReleaseInfo, ReleaseAsset
+        
+        rel = ReleaseInfo(
+            tag_name="v1.2.0",
+            version="1.2.0",
+            title="Release 1.2.0",
+            body="Notas:\nSHA256 (central-nvr_1.2.0_all.deb) = a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+            html_url="",
+            published_at="",
+            assets=[
+                ReleaseAsset(name="central-nvr_1.2.0_all.deb", size=1000, download_url="http://fake/deb")
+            ],
+        )
+
+        h = get_expected_sha256_for_asset(rel, "central-nvr_1.2.0_all.deb")
+        self.assertEqual(h, "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2")
 
     def test_install_downloaded_package_user_local(self):
         from central_nvr.core.updater import install_downloaded_package

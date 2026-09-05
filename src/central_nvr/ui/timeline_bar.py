@@ -1,3 +1,4 @@
+import html
 """
 Barra de Linha do Tempo (Timeline) para visualização de gravações e eventos de detecção de movimento.
 Inspirado na interface de referência da Central NVR.
@@ -43,7 +44,8 @@ class TimelineBarWidget(QFrame):
 
         # Header da Timeline com controles
         top_layout = QHBoxLayout()
-        self.lbl_cam = QLabel(f"<b>Timeline:</b> {self.camera_name}")
+        self.lbl_cam = QLabel(f"<b>Timeline:</b> {html.escape(self.camera_name)}")
+        self.lbl_cam.setTextFormat(Qt.TextFormat.RichText)
         self.lbl_cam.setObjectName("cardAccentTitle")
         top_layout.addWidget(self.lbl_cam)
 
@@ -62,7 +64,7 @@ class TimelineBarWidget(QFrame):
 
     def set_camera_name(self, name: str):
         self.camera_name = name
-        self.lbl_cam.setText(f"<b>Timeline:</b> {name}")
+        self.lbl_cam.setText(f"<b>Timeline:</b> {html.escape(name)}")
         self.canvas.update()
 
     def _on_motion_toggled(self, state: int):

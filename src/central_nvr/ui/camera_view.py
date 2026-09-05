@@ -1,3 +1,4 @@
+import html
 """
 Widget de Viewport de Câmera Individual com OSD, Controles em Tempo Real e Renomeação Rápida.
 """
@@ -81,7 +82,8 @@ class CameraViewWidget(QFrame):
         # Top Bar do OSD
         top_bar = QHBoxLayout()
         
-        self.lbl_title = QLabel(f"<b>{self.camera.name}</b>")
+        self.lbl_title = QLabel(f"<b>{html.escape(self.camera.name)}</b>")
+        self.lbl_title.setTextFormat(Qt.TextFormat.RichText)
         self.lbl_title.setCursor(Qt.CursorShape.PointingHandCursor)
         self.lbl_title.setToolTip("Clique com o botão direito para Renomear esta câmera")
         self.lbl_title.setStyleSheet("""
@@ -295,7 +297,7 @@ class CameraViewWidget(QFrame):
     def update_camera_name(self, new_name: str):
         """Atualiza dinamicamente o nome da câmera no viewport e na tela cheia ativa."""
         self.camera.name = new_name
-        self.lbl_title.setText(f"<b>{new_name}</b>")
+        self.lbl_title.setText(f"<b>{html.escape(new_name)}</b>")
         if hasattr(self, "_fullscreen_win") and self._fullscreen_win:
             self._fullscreen_win.update_camera_name(new_name)
 

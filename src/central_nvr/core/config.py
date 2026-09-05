@@ -57,6 +57,52 @@ def delete_keyring_password(camera_id: str) -> bool:
     except Exception:
         return False
 
+def is_keyring_available() -> bool:
+    """Verifica se o subsistema de keyring do sistema operacional está operacional."""
+    if not HAS_KEYRING:
+        return False
+    try:
+        kr = keyring.get_keyring()
+        priority = getattr(kr, "priority", 1)
+        if priority <= 0:
+            return False
+        kr_name = kr.__class__.__name__.lower()
+        if "fail" in kr_name or "null" in kr_name:
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def get_keyring_pat() -> Optional[str]:
+    """Recupera o GitHub Personal Access Token (PAT) do cofre do sistema."""
+    if not HAS_KEYRING:
+        return None
+    try:
+        return keyring.get_password(KEYRING_SERVICE_NAME, "github_token")
+    except Exception as e:
+        logger.debug(f"Falha ao obter github_token do keyring: {e}")
+        return None
+
+
+def set_keyring_pat(token: str) -> bool:
+    """Armazena ou remove o GitHub Personal Access Token (PAT) no cofre do sistema."""
+    if not HAS_KEYRING:
+        return False
+    try:
+        if token:
+            keyring.set_password(KEYRING_SERVICE_NAME, "github_token", token)
+        else:
+            try:
+                keyring.delete_password(KEYRING_SERVICE_NAME, "github_token")
+            except Exception:
+                pass
+        return True
+    except Exception as e:
+        logger.debug(f"Falha ao salvar github_token no keyring: {e}")
+        return False
+
+
 
 def get_config_dir() -> Path:
     """Retorna o diretório de configurações do usuário de acordo com a especificação XDG com permissão 0700."""
@@ -171,12 +217,20 @@ class ConfigManager:
         self.load()
 
     def load(self):
-        """Carrega configurações e lista de dispositivos do disco."""
+        """Carrega configurações e lista de dispositivos do disco com migração segura de credenciais."""
         if self.config_path.exists():
             try:
                 with open(self.config_path, "r", encoding="utf-8") as f:
                     saved_settings = json.load(f)
                     self.settings.update(saved_settings)
+
+                # SEC-04: Migração de token legado de settings.json para o Keyring
+                raw_pat = self.settings.get("github_token", "").strip()
+                if raw_pat and is_keyring_available():
+                    if set_keyring_pat(raw_pat):
+                        logger.info("GitHub PAT migrado com sucesso de settings.json para o Keyring.")
+                        self.settings["github_token"] = ""
+                        self.save_settings()
             except Exception as e:
                 logger.error(f"Erro ao ler {self.config_path}: {e}")
 
@@ -193,43 +247,76 @@ class ConfigManager:
                         and "Garagem" not in d.get("name", "")
                         and "Quintal" not in d.get("name", "")
                     ]
-                    # Carregar senhas do keyring se disponíveis
+                    # SEC-01: Carregar senhas do keyring e migrar senhas legadas em texto puro
+                    need_resave = False
+                    keyring_active = is_keyring_available()
                     for d in self.devices:
-                        dev_id = d.get("id")
+                        dev_id = d.get("id") or d.get("ip")
                         if dev_id:
+                            plaintext_pass = d.get("password")
+                            if plaintext_pass and keyring_active:
+                                set_keyring_password(dev_id, plaintext_pass)
+                                need_resave = True
                             kr_pass = get_keyring_password(dev_id)
                             if kr_pass is not None:
                                 d["password"] = kr_pass
 
-                    if len(self.devices) != len(raw_devices):
+                    if len(self.devices) != len(raw_devices) or need_resave:
                         self.save_devices()
             except Exception as e:
                 logger.error(f"Erro ao ler {self.devices_path}: {e}")
 
     def save_settings(self):
-        """Salva as configurações no disco com permissões estritas 0600."""
+        """Salva as configurações no disco com permissões estritas 0600, omitindo PAT se no keyring."""
         try:
-            _secure_write_json(self.config_path, self.settings)
+            settings_to_save = self.settings.copy()
+            # SEC-04: Omitir token em texto puro de settings.json caso o keyring esteja ativo
+            if is_keyring_available():
+                settings_to_save["github_token"] = ""
+            _secure_write_json(self.config_path, settings_to_save)
         except (OSError, PermissionError) as e:
             logger.debug(f"Não foi possível salvar configurações: {e}")
 
     def save_devices(self):
-        """Salva a lista de câmeras/dispositivos cadastrados com permissões estritas 0600."""
+        """Salva a lista de câmeras/dispositivos cadastrados sanitizando senhas se keyring ativo (SEC-01)."""
         try:
-            # Sincronizar senhas com keyring se disponível
-            for d in self.devices:
-                dev_id = d.get("id")
-                if dev_id and "password" in d:
-                    set_keyring_password(dev_id, d.get("password", ""))
+            import copy
+            devices_to_save = []
+            keyring_active = is_keyring_available()
 
-            _secure_write_json(self.devices_path, self.devices)
+            for d in self.devices:
+                dev_id = d.get("id") or d.get("ip")
+                d_copy = copy.deepcopy(d)
+                raw_pwd = d.get("password", "")
+
+                if dev_id and raw_pwd:
+                    saved = set_keyring_password(dev_id, raw_pwd)
+                    if keyring_active and saved:
+                        d_copy.pop("password", None)
+                elif dev_id and not raw_pwd and keyring_active:
+                    d_copy.pop("password", None)
+
+                devices_to_save.append(d_copy)
+
+            _secure_write_json(self.devices_path, devices_to_save)
         except (OSError, PermissionError) as e:
             logger.debug(f"Não foi possível salvar dispositivos: {e}")
 
     def get(self, key: str, default: Any = None) -> Any:
+        if key == "github_token":
+            kr_pat = get_keyring_pat()
+            if kr_pat:
+                return kr_pat
         return self.settings.get(key, default)
 
     def set(self, key: str, value: Any):
+        if key == "github_token":
+            val_str = str(value or "").strip()
+            if is_keyring_available():
+                set_keyring_pat(val_str)
+                self.settings["github_token"] = ""
+                self.save_settings()
+                return
         self.settings[key] = value
         self.save_settings()
 

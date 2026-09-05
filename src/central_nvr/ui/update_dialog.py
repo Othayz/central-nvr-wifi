@@ -265,9 +265,9 @@ class StartupUpdateDialog(QDialog):
         self.btn_update.setEnabled(False)
         self.btn_update.setText("Baixando...")
 
-        dest_dir = os.path.join(tempfile.gettempdir(), "central_nvr_updates")
-        os.makedirs(dest_dir, exist_ok=True)
-        dest_file = os.path.join(dest_dir, self.best_asset.name)
+        from central_nvr.core.updater import get_updates_dir
+        dest_dir = get_updates_dir()
+        dest_file = os.path.join(str(dest_dir), self.best_asset.name)
 
         self.download_worker = AssetDownloadWorker(
             download_url=self.best_asset.download_url,
@@ -331,7 +331,12 @@ class StartupUpdateDialog(QDialog):
             QMessageBox.warning(self, "Erro", "Arquivo de atualização não encontrado.")
             return
 
-        success, msg = install_downloaded_package(self.downloaded_file_path)
+        from central_nvr.core.updater import get_expected_sha256_for_asset
+        expected_sha = None
+        if self.release_info and self.best_asset:
+            expected_sha = get_expected_sha256_for_asset(self.release_info, self.best_asset.name, token=self.token)
+
+        success, msg = install_downloaded_package(self.downloaded_file_path, expected_sha256=expected_sha)
         if success:
             QMessageBox.information(
                 self,

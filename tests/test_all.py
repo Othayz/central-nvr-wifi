@@ -616,5 +616,214 @@ class TestFullscreenView(unittest.TestCase):
             mode = oct(test_file.stat().st_mode)[-3:]
             self.assertEqual(mode, "600")
 
+
+
+class TestSecurityAuditRemediations(unittest.TestCase):
+    """Testes automatizados cobrindo os 8 achados do Relatório de Auditoria de Segurança."""
+
+    @classmethod
+    def setUpClass(cls):
+        from PySide6.QtWidgets import QApplication
+        cls.app = QApplication.instance() or QApplication([])
+
+    def test_ws_discovery_defusedxml_billion_laughs_rejection(self):
+        """SEC-06: Valida que defusedxml rejeita payloads XML com explosão de entidades (Billion Laughs / DoS)."""
+        from central_nvr.scanner.parser import parse_ws_discovery_response
+
+        xml_bomb = """<?xml version="1.0"?>
+        <!DOCTYPE lolz [
+         <!ENTITY lol "lol">
+         <!ELEMENT lolz (#PCDATA)>
+         <!ENTITY lol1 "&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;">
+         <!ENTITY lol2 "&lol1;&lol1;&lol1;&lol1;&lol1;&lol1;&lol1;&lol1;&lol1;&lol1;">
+         <!ENTITY lol3 "&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;">
+        ]>
+        <SOAP-ENV:Envelope xmlns:SOAP-ENV="http://www.w3.org/2003/05/soap-envelope">
+          <SOAP-ENV:Body>
+            <d:ProbeMatches xmlns:d="http://schemas.xmlsoap.org/ws/2005/04/discovery">
+              <d:ProbeMatch>
+                <d:XAddrs>&lol3;</d:XAddrs>
+              </d:ProbeMatch>
+            </d:ProbeMatches>
+          </SOAP-ENV:Body>
+        </SOAP-ENV:Envelope>"""
+
+        # O parser deve retornar None de forma segura, bloqueando a expansão da entidade
+        result = parse_ws_discovery_response(xml_bomb, "192.168.1.100")
+        self.assertIsNone(result)
+
+    def test_devices_json_password_sanitization(self):
+        """SEC-01 & SEC-05: Valida que senhas são salvas no keyring e purgadas de devices.json."""
+        import json
+        from pathlib import Path
+        from central_nvr.core.config import ConfigManager
+
+        keyring_store = {}
+
+        def mock_set_pw(cam_id, pw):
+            keyring_store[cam_id] = pw
+            return True
+
+        def mock_get_pw(cam_id):
+            return keyring_store.get(cam_id)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            with patch("central_nvr.core.config.get_config_dir", return_value=tmp_path):
+                with patch("central_nvr.core.config.is_keyring_available", return_value=True):
+                    with patch("central_nvr.core.config.set_keyring_password", side_effect=mock_set_pw):
+                        with patch("central_nvr.core.config.get_keyring_password", side_effect=mock_get_pw):
+                            cfg = ConfigManager()
+                            cfg.add_or_update_device({
+                                "id": "cam-sec-01",
+                                "name": "Câmera Entrada",
+                                "ip": "192.168.1.10",
+                                "port": 80,
+                                "password": "SuperSecretPass123",
+                            })
+
+                            # Verificar se a senha foi salva no cofre
+                            self.assertEqual(keyring_store.get("cam-sec-01"), "SuperSecretPass123")
+
+                            # Ler devices.json diretamente do disco
+                            devices_file = tmp_path / "devices.json"
+                            self.assertTrue(devices_file.exists())
+                            with open(devices_file, "r", encoding="utf-8") as f:
+                                raw_json = f.read()
+
+                            # A senha NÃO pode estar em texto puro no arquivo
+                            self.assertNotIn("SuperSecretPass123", raw_json)
+
+    def test_github_pat_stored_in_keyring_and_omitted_from_settings(self):
+        """SEC-04: Valida que GitHub PAT é armazenado no Keyring e omitido de settings.json."""
+        import json
+        from pathlib import Path
+        from central_nvr.core.config import ConfigManager
+
+        keyring_store = {}
+
+        def mock_set_pat(token):
+            keyring_store["github_token"] = token
+            return True
+
+        def mock_get_pat():
+            return keyring_store.get("github_token")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            with patch("central_nvr.core.config.get_config_dir", return_value=tmp_path):
+                with patch("central_nvr.core.config.is_keyring_available", return_value=True):
+                    with patch("central_nvr.core.config.set_keyring_pat", side_effect=mock_set_pat):
+                        with patch("central_nvr.core.config.get_keyring_pat", side_effect=mock_get_pat):
+                            cfg = ConfigManager()
+                            cfg.set("github_token", "ghp_PersonalAccessTokenSecure123")
+
+                            # Recuperação transparente via get()
+                            self.assertEqual(cfg.get("github_token"), "ghp_PersonalAccessTokenSecure123")
+
+                            # settings.json em disco não deve conter o token
+                            settings_file = tmp_path / "settings.json"
+                            with open(settings_file, "r", encoding="utf-8") as f:
+                                raw_settings = f.read()
+                            self.assertNotIn("ghp_PersonalAccessTokenSecure123", raw_settings)
+
+    def test_legacy_credentials_auto_migration(self):
+        """SEC-01 & SEC-04: Valida migração automática de credenciais legadas para o Keyring."""
+        import json
+        from pathlib import Path
+        from central_nvr.core.config import ConfigManager
+
+        keyring_store = {}
+
+        def mock_set_pw(cam_id, pw):
+            keyring_store[cam_id] = pw
+            return True
+
+        def mock_get_pw(cam_id):
+            return keyring_store.get(cam_id)
+
+        def mock_set_pat(token):
+            keyring_store["pat"] = token
+            return True
+
+        def mock_get_pat():
+            return keyring_store.get("pat")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            # Criar arquivos legados com senhas e token em texto claro
+            with open(tmp_path / "settings.json", "w", encoding="utf-8") as f:
+                json.dump({"github_token": "ghp_LegacyTokenToBeMigrated"}, f)
+
+            with open(tmp_path / "devices.json", "w", encoding="utf-8") as f:
+                json.dump([{
+                    "id": "dev-legacy-1",
+                    "name": "Câmera Portão",
+                    "ip": "192.168.1.15",
+                    "password": "LegacyCameraPassword456",
+                }], f)
+
+            with patch("central_nvr.core.config.get_config_dir", return_value=tmp_path):
+                with patch("central_nvr.core.config.is_keyring_available", return_value=True):
+                    with patch("central_nvr.core.config.set_keyring_password", side_effect=mock_set_pw):
+                        with patch("central_nvr.core.config.get_keyring_password", side_effect=mock_get_pw):
+                            with patch("central_nvr.core.config.set_keyring_pat", side_effect=mock_set_pat):
+                                with patch("central_nvr.core.config.get_keyring_pat", side_effect=mock_get_pat):
+                                    cfg = ConfigManager()
+
+                                    # Verificar se foram migrados para o keyring
+                                    self.assertEqual(keyring_store.get("pat"), "ghp_LegacyTokenToBeMigrated")
+                                    self.assertEqual(keyring_store.get("dev-legacy-1"), "LegacyCameraPassword456")
+
+                                    # Verificar se foram limpos dos arquivos em disco
+                                    with open(tmp_path / "settings.json", "r", encoding="utf-8") as f:
+                                        s_text = f.read()
+                                    self.assertNotIn("ghp_LegacyTokenToBeMigrated", s_text)
+
+                                    with open(tmp_path / "devices.json", "r", encoding="utf-8") as f:
+                                        d_text = f.read()
+                                    self.assertNotIn("LegacyCameraPassword456", d_text)
+
+    def test_camera_view_and_timeline_html_escape(self):
+        """SEC-08: Valida sanitização html.escape() em QLabels dinâmicos com suporte a RichText."""
+        from central_nvr.ui.camera_view import CameraViewWidget
+        from central_nvr.ui.timeline_bar import TimelineBarWidget
+
+        # Câmera com caracteres de injeção HTML / XSS
+        cam = CameraDevice(
+            id="test-xss",
+            name="<img src=x onerror=alert(1)><b>HackerCam</b>",
+            ip="192.168.1.77",
+        )
+        view = CameraViewWidget(cam)
+
+        # O texto do QLabel deve estar devidamente sanitizado com entidades HTML
+        self.assertIn("&lt;img src=x onerror=alert(1)&gt;", view.lbl_title.text())
+        self.assertIn("&lt;b&gt;HackerCam&lt;/b&gt;", view.lbl_title.text())
+        self.assertNotIn("<img src=x", view.lbl_title.text())
+
+        # Renomeação dinâmica também deve sanitizar
+        view.update_camera_name("<a href='http://evil.com'>Click Here</a>")
+        self.assertIn("&lt;a href=", view.lbl_title.text())
+        self.assertNotIn("<a href=", view.lbl_title.text())
+
+        # Testar TimelineBarWidget
+        bar = TimelineBarWidget()
+        bar.set_camera_name("<iframe src='malicious.html'>")
+        self.assertIn("&lt;iframe", bar.lbl_cam.text())
+        self.assertNotIn("<iframe src=", bar.lbl_cam.text())
+
+        bar.set_camera_name("<script>stealCookie()</script>")
+        self.assertIn("&lt;script&gt;", bar.lbl_cam.text())
+        self.assertNotIn("<script>", bar.lbl_cam.text())
+
+        view.stop()
+        view.close()
+        view.deleteLater()
+        bar.close()
+        bar.deleteLater()
+        self.app.processEvents()
+
+
 if __name__ == "__main__":
     unittest.main()

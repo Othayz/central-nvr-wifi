@@ -4,7 +4,15 @@ Parser para mensagens XML SOAP de WS-Discovery e ONVIF com validação Anti-SSRF
 import logging
 import re
 import urllib.parse
-import xml.etree.ElementTree as ET
+try:
+    import defusedxml.ElementTree as SafeET
+    from defusedxml.common import DefusedXmlException
+    HAS_DEFUSEDXML = True
+except ImportError:
+    import xml.etree.ElementTree as SafeET
+    class DefusedXmlException(Exception):
+        pass
+    HAS_DEFUSEDXML = False
 from typing import Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
@@ -34,7 +42,11 @@ def parse_ws_discovery_response(xml_data: str, source_ip: str = "") -> Optional[
         # Remover declarações de namespace prefixados desconhecidos para parsing robusto
         cleaned_xml = re.sub(r'xmlns(:\w+)?="[^"]+"', '', xml_data, count=0)
         # Parseando o XML original com ElementTree
-        root = ET.fromstring(xml_data)
+        try:
+            root = SafeET.fromstring(xml_data)
+        except DefusedXmlException as e:
+            logger.warning(f"Ataque XML bloqueado no WS-Discovery (DefusedXmlException): {e}")
+            return None
 
         # Procurar elemento ProbeMatches em qualquer profundidade
         probe_matches = []

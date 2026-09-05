@@ -155,6 +155,15 @@ class SettingsDialog(QDialog):
         self.txt_github_token.setPlaceholderText("ghp_... (opcional, para repositórios privados)")
         up_form.addRow("GitHub Token (PAT):", self.txt_github_token)
 
+        from central_nvr.core.config import is_keyring_available
+        if is_keyring_available():
+            lbl_keyring_status = QLabel("🔒 Cofre de Senhas do Sistema (Keyring) ativo.")
+            lbl_keyring_status.setStyleSheet("color: #10B981; font-size: 11px; font-weight: 600;")
+        else:
+            lbl_keyring_status = QLabel("⚠️ Aviso: Keyring do sistema não detectado. Credenciais salvas localmente.")
+            lbl_keyring_status.setStyleSheet("color: #F59E0B; font-size: 11px; font-weight: 600;")
+        up_form.addRow("", lbl_keyring_status)
+
         check_now_layout = QHBoxLayout()
         lbl_cur_v = QLabel(f"Versão Instalada: <b>v{__version__}</b>")
         check_now_layout.addWidget(lbl_cur_v)

@@ -1,3 +1,4 @@
+import hashlib
 #!/usr/bin/env python3
 """
 Módulo Central de Atualizações via GitHub Releases.
@@ -379,6 +380,11 @@ def download_asset(
                     if progress_callback:
                         progress_callback(downloaded, total_size, speed_kbps)
 
+        try:
+            os.chmod(dest_path, 0o600)
+        except (OSError, PermissionError):
+            pass
+
         return True
 
     except Exception as e:
@@ -391,9 +397,116 @@ def download_asset(
         return False
 
 
+
+def get_updates_dir():
+    """
+    Retorna o diretório privado do usuário para download de atualizações (~/.cache/central-nvr/updates).
+    Garante permissões estritas 0700 (SEC-02).
+    """
+    from pathlib import Path
+    xdg_cache = os.environ.get("XDG_CACHE_HOME")
+    base_dir = Path(xdg_cache) if xdg_cache else (Path.home() / ".cache")
+    updates_dir = base_dir / "central-nvr" / "updates"
+    try:
+        updates_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(updates_dir, 0o700)
+    except (OSError, PermissionError):
+        pass
+    return updates_dir
+
+
+def compute_file_sha256(file_path: str) -> str:
+    """Calcula o hash SHA-256 hexadecimal de um arquivo no disco (SEC-07)."""
+    if not os.path.exists(file_path):
+        return ""
+    hasher = hashlib.sha256()
+    with open(file_path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            hasher.update(chunk)
+    return hasher.hexdigest().lower()
+
+
+def verify_file_sha256(file_path: str, expected_sha256: str) -> bool:
+    """Compara o hash SHA-256 real do arquivo com o hash esperado (SEC-07)."""
+    if not file_path or not expected_sha256 or not os.path.exists(file_path):
+        return False
+    actual_hash = compute_file_sha256(file_path)
+    return actual_hash.strip().lower() == expected_sha256.strip().lower()
+
+
+def get_expected_sha256_for_asset(
+    release_info: ReleaseInfo,
+    asset_name: str,
+    token: Optional[str] = None,
+) -> Optional[str]:
+    """
+    Busca o checksum SHA-256 correspondente ao asset da release do GitHub (SEC-07).
+    Examina anexos de checksum (ex: sha256sums.txt, <asset>.sha256) e o corpo da release.
+    """
+    if not release_info:
+        return None
+
+    direct_sha_asset = None
+    checksum_asset = None
+
+    for a in release_info.assets:
+        aname_low = a.name.lower()
+        if a.name == f"{asset_name}.sha256" or a.name == f"{asset_name}.sha256sum":
+            direct_sha_asset = a
+            break
+        if aname_low in ("sha256sums.txt", "sha256sums", "checksums.txt", "checksums", "sha256.txt"):
+            checksum_asset = a
+
+    headers = {"User-Agent": f"CentralNVR-Updater/{__version__}"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    if direct_sha_asset:
+        try:
+            resp = requests.get(direct_sha_asset.download_url, headers=headers, timeout=10)
+            if resp.status_code == 200:
+                m = re.search(r"([a-fA-F0-9]{64})", resp.text)
+                if m:
+                    return m.group(1).lower()
+        except Exception as e:
+            logger.debug(f"Erro ao baixar checksum {direct_sha_asset.name}: {e}")
+
+    if checksum_asset:
+        try:
+            resp = requests.get(checksum_asset.download_url, headers=headers, timeout=10)
+            if resp.status_code == 200:
+                for line in resp.text.splitlines():
+                    if asset_name in line:
+                        m = re.search(r"([a-fA-F0-9]{64})", line)
+                        if m:
+                            return m.group(1).lower()
+        except Exception as e:
+            logger.debug(f"Erro ao baixar checksum {checksum_asset.name}: {e}")
+
+    if release_info.body:
+        for line in release_info.body.splitlines():
+            if asset_name in line:
+                m = re.search(r"([a-fA-F0-9]{64})", line)
+                if m:
+                    return m.group(1).lower()
+        all_hashes = re.findall(r"([a-fA-F0-9]{64})", release_info.body)
+        if len(all_hashes) == 1:
+            return all_hashes[0].lower()
+
+    return None
+
 def _extract_tar_members_to_local(tar, target_base):
     from pathlib import Path
+    resolved_target = target_base.resolve()
+
     for member in tar.getmembers():
+        # Rejeitar links simbólicos ou hard links que apontem para fora de target_base (SEC-03)
+        if member.issym() or member.islnk():
+            link_target = (target_base / member.linkname).resolve()
+            if not (link_target == resolved_target or str(link_target).startswith(str(resolved_target) + os.sep)):
+                logger.warning(f"Tentativa de Symlink/Hardlink Traversal bloqueada: {member.name} -> {member.linkname}")
+                continue
+
         rel_parts = Path(member.name).parts
         if len(rel_parts) > 1 and rel_parts[0] in (".", "/"):
             rel_parts = rel_parts[1:]
@@ -401,13 +514,26 @@ def _extract_tar_members_to_local(tar, target_base):
             rel_parts = rel_parts[1:]
         if not rel_parts:
             continue
-        dest_path = target_base.joinpath(*rel_parts)
+
+        try:
+            dest_path = target_base.joinpath(*rel_parts).resolve()
+        except Exception as e:
+            logger.warning(f"Caminho inválido no pacote de atualização ({member.name}): {e}")
+            continue
+
+        # SEC-03: Validar contenção canônica estrita para prevenir Tar Slip
+        if not (dest_path == resolved_target or str(dest_path).startswith(str(resolved_target) + os.sep)):
+            logger.warning(f"Tentativa de Path Traversal bloqueada: {member.name} -> {dest_path}")
+            continue
+
         if member.isdir():
             dest_path.mkdir(parents=True, exist_ok=True)
         elif member.isfile():
             dest_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(dest_path, "wb") as out_f:
-                shutil.copyfileobj(tar.extractfile(member), out_f)
+            f_in = tar.extractfile(member)
+            if f_in is not None:
+                with open(dest_path, "wb") as out_f:
+                    shutil.copyfileobj(f_in, out_f)
             if member.mode:
                 try:
                     os.chmod(dest_path, member.mode)
@@ -510,14 +636,24 @@ exec /usr/bin/python3 -m central_nvr.app "$@"
     return True, "Central NVR WiFi instalada e atualizada com sucesso em ~/.local (Menu de Aplicativos atualizado)."
 
 
-def install_downloaded_package(file_path: str) -> Tuple[bool, str]:
+def install_downloaded_package(
+    file_path: str,
+    expected_sha256: Optional[str] = None,
+) -> Tuple[bool, str]:
     """
     Inicia a instalação do arquivo de atualização baixado (.deb, .rpm ou .tar.gz).
     Prioriza instalação nativa do sistema em distros compatíveis ou realiza a instalação
     direta no espaço do usuário (~/.local), prevenindo abertura indevida em gerenciadores de arquivo (Ark).
+    Exige validação prévia de integridade SHA-256 antes de elevar privilégios com pkexec (SEC-02 / SEC-07).
     """
     if not os.path.exists(file_path):
         return False, "Arquivo de instalação não encontrado no disco."
+
+    # SEC-07: Se um hash SHA-256 esperado foi especificado, validar rigorosamente
+    if expected_sha256:
+        if not verify_file_sha256(file_path, expected_sha256):
+            actual_hash = compute_file_sha256(file_path)
+            return False, f"Falha de integridade SHA-256: checksum divergente (esperado: {expected_sha256}, calculado: {actual_hash})."
 
     ext = os.path.splitext(file_path)[1].lower()
     is_ostree = os.path.exists("/run/ostree-booted")
@@ -525,11 +661,26 @@ def install_downloaded_package(file_path: str) -> Tuple[bool, str]:
     try:
         # Se for Ubuntu/Debian padrão (com apt e sem sistema imutável)
         if ext == ".deb" and not is_ostree and shutil.which("pkexec") and shutil.which("apt"):
+            # SEC-02 & SEC-07: Bloquear execução via pkexec sem validação de integridade SHA-256
+            if not expected_sha256:
+                logger.warning("Execução via pkexec apt bloqueada: hash SHA-256 não validado.")
+                # Fallback seguro: instalar no usuário local (~/.local)
+                success, msg = install_package_to_user_local(file_path)
+                if success:
+                    return True, f"{msg} (Instalação no usuário: execução root via pkexec requer validação de hash SHA-256)."
+                return False, "Instalação com privilégios de root (pkexec) requer verificação obrigatória de hash SHA-256."
             subprocess.Popen(["pkexec", "apt", "install", "-y", os.path.abspath(file_path)])
             return True, "Assistente de instalação iniciado via apt/pkexec."
 
         # Se for Fedora/RHEL tradicional (com dnf e sem sistema imutável)
         if ext == ".rpm" and not is_ostree and shutil.which("pkexec") and shutil.which("dnf"):
+            # SEC-02 & SEC-07: Bloquear execução via pkexec sem validação de integridade SHA-256
+            if not expected_sha256:
+                logger.warning("Execução via pkexec dnf bloqueada: hash SHA-256 não validado.")
+                success, msg = install_package_to_user_local(file_path)
+                if success:
+                    return True, f"{msg} (Instalação no usuário: execução root via pkexec requer validação de hash SHA-256)."
+                return False, "Instalação com privilégios de root (pkexec) requer verificação obrigatória de hash SHA-256."
             subprocess.Popen(["pkexec", "dnf", "install", "-y", os.path.abspath(file_path)])
             return True, "Assistente de instalação iniciado via dnf/pkexec."
 

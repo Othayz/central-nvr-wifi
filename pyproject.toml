@@ -37,6 +37,8 @@ dependencies = [
     "requests>=2.31.0",
     "zeep>=4.2.0",
     "pillow>=10.0.0",
+    "keyring>=24.0.0",
+    "defusedxml>=0.7.1",
 ]
 
 [project.scripts]

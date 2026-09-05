@@ -371,6 +371,13 @@ class MainWindow(QMainWindow):
         self.lbl_sb_streams.setStyleSheet("color: #4ADE80; font-weight: 600; padding: 0 8px;")
         status_bar.addWidget(self.lbl_sb_streams)
 
+        from central_nvr.core.config import is_keyring_available
+        if not is_keyring_available():
+            self.lbl_sb_keyring = QLabel("⚠️ Keyring Inativo")
+            self.lbl_sb_keyring.setToolTip("O serviço de cofre de senhas (keyring) do sistema não está disponível.")
+            self.lbl_sb_keyring.setStyleSheet("color: #F59E0B; font-weight: 600; padding: 0 8px;")
+            status_bar.addWidget(self.lbl_sb_keyring)
+
         self.btn_sb_update = QPushButton("⚡ Atualização Disponível")
         self.btn_sb_update.setStyleSheet("background-color: #16A34A; color: #FFFFFF; font-weight: 700; font-size: 11px; padding: 2px 8px; border-radius: 4px;")
         self.btn_sb_update.setCursor(Qt.CursorShape.PointingHandCursor)
