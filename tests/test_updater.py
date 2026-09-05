@@ -386,9 +386,10 @@ class TestUpdaterWorkers(unittest.TestCase):
             "published_at": "2026-08-30T21:48:05Z",
             "assets": [],
         }
-        rel = _parse_github_release_dict(mock_data)
-        self.assertEqual(rel.version, "1.1")
-        self.assertTrue(rel.is_newer)
+        with patch("central_nvr.core.updater.__version__", "1.0.0"):
+            rel = _parse_github_release_dict(mock_data)
+            self.assertEqual(rel.version, "1.1")
+            self.assertTrue(rel.is_newer)
 
 if __name__ == "__main__":
     unittest.main()

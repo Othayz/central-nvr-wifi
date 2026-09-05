@@ -594,6 +594,25 @@ def install_package_to_user_local(file_path: str) -> Tuple[bool, str]:
         except Exception as e:
             return False, f"Erro ao extrair tarball: {e}"
 
+    elif ext == ".rpm":
+        if shutil.which("rpm2cpio") and shutil.which("cpio"):
+            try:
+                p_rpm = subprocess.Popen(["rpm2cpio", os.path.abspath(file_path)], stdout=subprocess.PIPE)
+                p_cpio = subprocess.run(
+                    ["cpio", "-idmv", "--quiet", "--no-absolute-filenames"],
+                    stdin=p_rpm.stdout,
+                    cwd=str(target_base),
+                    capture_output=True,
+                    timeout=30,
+                )
+                p_rpm.wait()
+                if p_cpio.returncode != 0:
+                    return False, f"Falha na extração CPIO do RPM: {p_cpio.stderr.decode('utf-8', errors='ignore')}"
+            except Exception as e:
+                return False, f"Erro ao extrair pacote .rpm: {e}"
+        else:
+            return False, "Comandos rpm2cpio ou cpio necessários para extração do pacote .rpm não foram encontrados."
+
     else:
         return False, f"Formato '{ext}' não suporta instalação direta no usuário."
 

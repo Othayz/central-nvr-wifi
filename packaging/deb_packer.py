@@ -52,14 +52,19 @@ def build_deb_package(source_dir: str, output_deb_path: str):
                 tar.add(full_path, arcname=arcname)
     control_data = control_buf.getvalue()
 
-    # 3. Gerar data.tar.gz
+    # 3. Gerar data.tar.gz (excluindo __pycache__ e *.pyc)
+    def _data_filter(tarinfo):
+        if "__pycache__" in tarinfo.name or tarinfo.name.endswith((".pyc", ".pyo")):
+            return None
+        return tarinfo
+
     data_buf = io.BytesIO()
     with tarfile.open(fileobj=data_buf, mode="w:gz") as tar:
         for item in sorted(os.listdir(source_dir)):
             if item == "DEBIAN":
                 continue
             full_path = os.path.join(source_dir, item)
-            tar.add(full_path, arcname=f"./{item}")
+            tar.add(full_path, arcname=f"./{item}", filter=_data_filter)
     data_data = data_buf.getvalue()
 
     # 4. Escrever o container AR final

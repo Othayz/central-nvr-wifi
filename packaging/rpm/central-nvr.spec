@@ -1,5 +1,5 @@
 Name:           central-nvr
-Version:        1.0.0
+Version:        1.1.0
 Release:        1%{?dist}
 Summary:        Central NVR WiFi - Monitoramento, Descoberta ONVIF e Streaming RTSP para Linux
 

@@ -70,7 +70,8 @@ TAG_FILEDIGESTALGO = 5068
 TAG_SIG_SIZE = 1000
 TAG_SIG_MD5 = 1004
 TAG_SIG_PAYLOADSIZE = 1007
-TAG_SIG_SHA256 = 269
+TAG_SIG_SHA1 = 269
+TAG_SIG_SHA256 = 273
 
 
 class RpmHeaderBuilder:
@@ -114,11 +115,7 @@ class RpmHeaderBuilder:
         data_table = bytearray()
         
         for tag, typ, count, d_bytes in sorted_entries:
-            offset = len(data_table)
-            index_table.extend(struct.pack(">iiii", tag, typ, offset, count))
-            data_table.extend(d_bytes)
-            
-            # Align data table based on type
+            # Pre-align data table based on type before recording offset
             if typ in (TYPE_INT16,):
                 while len(data_table) % 2 != 0:
                     data_table.append(0)
@@ -128,6 +125,10 @@ class RpmHeaderBuilder:
             elif typ in (TYPE_INT64,):
                 while len(data_table) % 8 != 0:
                     data_table.append(0)
+
+            offset = len(data_table)
+            index_table.extend(struct.pack(">iiii", tag, typ, offset, count))
+            data_table.extend(d_bytes)
 
         nindex = len(sorted_entries)
         dsize = len(data_table)
@@ -177,17 +178,20 @@ def make_cpio_entry(filename, data, mode=0o100644, mtime=None):
     return bytes(buf)
 
 
-def build_rpm_package(root_dir: str, output_rpm_path: str, version: str = "1.0.0", release: str = "1"):
+def build_rpm_package(root_dir: str, output_rpm_path: str, version: str = "1.1.0", release: str = "1"):
     """Monta o arquivo RPM a partir da árvore de arquivos."""
     files_to_pack = []
     
     # 1. Coletar todos os arquivos a instalar
-    # Módulos Python
+    # Módulos Python (excluindo __pycache__ e *.pyc)
     src_dir = os.path.join(root_dir, "src", "central_nvr")
     for root, dirs, files in os.walk(src_dir):
+        if "__pycache__" in root:
+            continue
         for f in sorted(files):
+            if f.endswith(".pyc") or f.endswith(".pyo"):
+                continue
             full_p = os.path.join(root, f)
-            rel_p = os.path.relpath(full_p, root_dir)
             target_path = "/usr/lib/central-nvr/" + os.path.relpath(full_p, src_dir)
             with open(full_p, "rb") as fp:
                 data = fp.read()
@@ -207,12 +211,24 @@ def build_rpm_package(root_dir: str, output_rpm_path: str, version: str = "1.0.0
         with open(desktop_file, "rb") as fp:
             files_to_pack.append(("/usr/share/applications/central-nvr.desktop", fp.read(), 0o100644))
             
-    # Ícone SVG
-    icon_file = os.path.join(root_dir, "packaging", "icons", "central-nvr.svg")
-    if os.path.exists(icon_file):
-        with open(icon_file, "rb") as fp:
+    # Ícones PNG e SVG
+    icons_dir = os.path.join(root_dir, "packaging", "icons")
+    icon_svg = os.path.join(icons_dir, "central-nvr.svg")
+    if os.path.exists(icon_svg):
+        with open(icon_svg, "rb") as fp:
             files_to_pack.append(("/usr/share/icons/hicolor/scalable/apps/central-nvr.svg", fp.read(), 0o100644))
-            
+
+    for size in (16, 24, 32, 48, 64, 128, 256, 512):
+        png_p = os.path.join(icons_dir, f"central-nvr-{size}x{size}.png")
+        if os.path.exists(png_p):
+            with open(png_p, "rb") as fp:
+                files_to_pack.append((f"/usr/share/icons/hicolor/{size}x{size}/apps/central-nvr.png", fp.read(), 0o100644))
+
+    pixmap_png = os.path.join(icons_dir, "central-nvr.png")
+    if os.path.exists(pixmap_png):
+        with open(pixmap_png, "rb") as fp:
+            files_to_pack.append(("/usr/share/pixmaps/central-nvr.png", fp.read(), 0o100644))
+
     # Ordenar arquivos por caminho
     files_to_pack.sort(key=lambda x: x[0])
     
@@ -289,7 +305,7 @@ def build_rpm_package(root_dir: str, output_rpm_path: str, version: str = "1.0.0
     hb.add_int32(TAG_FILEFLAGS, [0 for _ in files_to_pack])
     hb.add_string_array(TAG_FILEUSERNAME, ["root" for _ in files_to_pack])
     hb.add_string_array(TAG_FILEGROUPNAME, ["root" for _ in files_to_pack])
-    hb.add_int16(TAG_FILEDEVICES, [1 for _ in files_to_pack])
+    hb.add_int32(TAG_FILEDEVICES, [1 for _ in files_to_pack])
     hb.add_int32(TAG_FILEINODES, list(range(1, len(files_to_pack) + 1)))
     
     main_header_data = hb.build()
@@ -299,6 +315,7 @@ def build_rpm_package(root_dir: str, output_rpm_path: str, version: str = "1.0.0
     combined_body = main_header_data + payload_data
     sb.add_int32(TAG_SIG_SIZE, [len(combined_body)])
     sb.add_bin(TAG_SIG_MD5, hashlib.md5(combined_body).digest())
+    sb.add_string(TAG_SIG_SHA1, hashlib.sha1(main_header_data).hexdigest())
     sb.add_string(TAG_SIG_SHA256, hashlib.sha256(main_header_data).hexdigest())
     sb.add_int32(TAG_SIG_PAYLOADSIZE, [len(payload_data)])
     sig_header_data = sb.build()
@@ -329,5 +346,15 @@ def build_rpm_package(root_dir: str, output_rpm_path: str, version: str = "1.0.0
 
 if __name__ == "__main__":
     root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-    out = os.path.join(root, "dist", "central-nvr-1.0.0-1.noarch.rpm")
-    build_rpm_package(root, out)
+    out = os.path.join(root, "dist", "central-nvr-1.1.0-1.noarch.rpm")
+    ver = "1.1.0"
+    rel = "1"
+    if len(sys.argv) > 1:
+        root = os.path.abspath(sys.argv[1])
+    if len(sys.argv) > 2:
+        out = os.path.abspath(sys.argv[2])
+    if len(sys.argv) > 3:
+        ver = sys.argv[3]
+    if len(sys.argv) > 4:
+        rel = sys.argv[4]
+    build_rpm_package(root, out, ver, rel)

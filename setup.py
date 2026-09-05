@@ -3,7 +3,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="central-nvr",
-    version="1.0.0",
+    version="1.1.0",
     description="Central NVR WiFi - Gerenciamento, Descoberta ONVIF e Streaming RTSP para Linux",
     packages=find_packages(where="src"),
     package_dir={"": "src"},

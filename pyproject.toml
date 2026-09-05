@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "central-nvr"
-version = "1.0.0"
+version = "1.1.0"
 description = "Central NVR WiFi - Aplicativo Desktop Linux para Gerenciamento, Descoberta ONVIF e Streaming RTSP"
 readme = "README.md"
 requires-python = ">=3.10"
