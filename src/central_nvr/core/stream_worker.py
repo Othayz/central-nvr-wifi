@@ -184,31 +184,48 @@ class StreamWorker(QThread):
         while self._is_running:
             success = False
 
-            for stream_url in candidate_urls:
-                if not self._is_running or success:
-                    break
-
-                if stream_url.startswith("demo://"):
-                    self._run_test_pattern_stream()
-                    success = True
-                    break
-
-                for trans in transports:
+            # Fase 1: Priorizar PyAV (libav / FFmpeg) com suporte total a H.265/HEVC, medição de bitrate real e estabilidade
+            if HAS_AV:
+                for stream_url in candidate_urls:
                     if not self._is_running or success:
                         break
 
-                    trans_label = "Auto (UDP)" if (user_transport == "auto" and trans == "udp") else ("Auto (TCP Fallback)" if (user_transport == "auto" and trans == "tcp") else trans.upper())
-                    self.stats.transport_mode = trans_label
-                    logger.info(f"Conectando RTSP ({self.camera.name}) via {trans_label}: {sanitize_rtsp_url(stream_url)}")
+                    if stream_url.startswith("demo://"):
+                        self._run_test_pattern_stream()
+                        success = True
+                        break
 
-                    # 1. Tentar decodificação via PyAV (FFmpeg)
-                    if HAS_AV:
+                    for trans in transports:
+                        if not self._is_running or success:
+                            break
+
+                        trans_label = "Auto (UDP)" if (user_transport == "auto" and trans == "udp") else ("Auto (TCP Fallback)" if (user_transport == "auto" and trans == "tcp") else trans.upper())
+                        self.stats.transport_mode = trans_label
+                        logger.info(f"Conectando RTSP PyAV ({self.camera.name}) via {trans_label}: {sanitize_rtsp_url(stream_url)}")
+
                         success = self._run_pyav_stream(stream_url, transport=trans)
                         if success:
                             break
 
-                    # 2. Se falhar ou não tiver PyAV, tentar OpenCV
-                    if not success and HAS_CV2 and self._is_running:
+            # Fase 2: Se PyAV não estiver disponível ou falhar em todas as tentativas, tentar OpenCV como fallback
+            if not success and HAS_CV2 and self._is_running:
+                for stream_url in candidate_urls:
+                    if not self._is_running or success:
+                        break
+
+                    if stream_url.startswith("demo://"):
+                        self._run_test_pattern_stream()
+                        success = True
+                        break
+
+                    for trans in transports:
+                        if not self._is_running or success:
+                            break
+
+                        trans_label = f"OpenCV ({trans.upper()})"
+                        self.stats.transport_mode = trans_label
+                        logger.info(f"Conectando RTSP OpenCV ({self.camera.name}) via {trans_label}: {sanitize_rtsp_url(stream_url)}")
+
                         success = self._run_opencv_stream(stream_url, transport=trans)
                         if success:
                             break
@@ -238,16 +255,17 @@ class StreamWorker(QThread):
         """Consome o fluxo utilizando PyAV (libav / FFmpeg) com suporte nativo a H.265 (HEVC) e UDP."""
         container_options = {
             "rtsp_transport": transport,
-            "reorder_queue_size": "0",
+            "reorder_queue_size": "100",
+            "buffer_size": "2048000",
             "fflags": "nobuffer+genpts+discardcorrupt",
             "flags": "low_delay",
             "max_delay": str(self.buffer_size_ms * 1000),
-            "stimeout": "2500000",
+            "stimeout": "5000000",
         }
 
         container = None
         try:
-            container = av.open(stream_url, mode="r", options=container_options, timeout=2.5)
+            container = av.open(stream_url, mode="r", options=container_options, timeout=5.0)
             video_stream = next((s for s in container.streams if s.type == "video"), None)
             if not video_stream:
                 return False
@@ -294,18 +312,31 @@ class StreamWorker(QThread):
                     pass
 
     def _run_opencv_stream(self, stream_url: str, transport: str = "udp") -> bool:
-        """Consome o fluxo utilizando OpenCV VideoCapture."""
+        """Consome o fluxo utilizando OpenCV VideoCapture como fallback resiliente."""
         cap = None
         try:
             with _opencv_lock:
-                os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = f"rtsp_transport;{transport}|reorder_queue_size;0|buffer_size;1024|stimeout;2500000|fflags;+nobuffer+discardcorrupt"
+                # buffer_size de 2MB (2048000 bytes) para evitar descarte de pacotes UDP em rajadas de I-Frames
+                os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
+                    f"rtsp_transport;{transport}|"
+                    f"reorder_queue_size;100|"
+                    f"buffer_size;2048000|"
+                    f"stimeout;5000000|"
+                    f"fflags;+nobuffer+genpts"
+                )
                 cap = cv2.VideoCapture(stream_url, cv2.CAP_FFMPEG)
                 cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
             if not cap.isOpened():
                 return False
 
-            self.stats.codec = "H.264"
+            mfg = (self.camera.manufacturer or "").lower()
+            url_lower = stream_url.lower()
+            if "hevc" in url_lower or "265" in url_lower or "yoosee" in mfg:
+                self.stats.codec = "H.265 / HEVC"
+            else:
+                self.stats.codec = "H.264"
+
             self.state_changed.emit(ConnectionState.STREAMING, f"Ao Vivo (OpenCV {self.stats.transport_mode})")
             self._last_frame_ts = time.time()
 
@@ -323,7 +354,9 @@ class StreamWorker(QThread):
                 h, w, _ = frame_rgb.shape
                 self.stats.width = w
                 self.stats.height = h
-                self._bytes_count += (w * h * 3) // 10  # Estimativa de fluxo comprimido
+
+                # Estimativa de fluxo comprimido realista para H.264/H.265 (~1.5-2.0 Mbps)
+                self._bytes_count += max(2000, (w * h * 3) // 200)
 
                 self._process_and_emit_frame(frame_rgb, w, h, delta_ms)
 
