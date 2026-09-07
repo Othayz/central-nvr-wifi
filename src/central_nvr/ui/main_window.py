@@ -31,6 +31,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from central_nvr import __version__
 from central_nvr.core.camera import CameraDevice
 from central_nvr.core.config import ConfigManager, get_data_dir
 from central_nvr.ui.camera_grid import CameraGridWidget
@@ -188,7 +189,7 @@ class MainWindow(QMainWindow):
         lbl_title.setObjectName("appLogoTitle")
         title_box.addWidget(lbl_title)
 
-        lbl_ver = QLabel("v1.0")
+        lbl_ver = QLabel(f"v{__version__}")
         lbl_ver.setObjectName("appVersionBadge")
         title_box.addWidget(lbl_ver)
         h_layout.addLayout(title_box)
