@@ -120,7 +120,7 @@ class SettingsDialog(QDialog):
         conn_group = QGroupBox("Padrões de Conexão")
         conn_form = QFormLayout(conn_group)
 
-        self.txt_default_user = QLineEdit("admin")
+        self.txt_default_user = QLineEdit("")
         conn_form.addRow("Usuário Padrão:", self.txt_default_user)
 
         self.spin_reconn = QSpinBox()

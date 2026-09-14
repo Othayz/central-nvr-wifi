@@ -194,7 +194,7 @@ class ConfigManager:
         "buffer_size_ms": 150,
         "auto_reconnect": True,
         "reconnect_interval_sec": 5,
-        "default_username": "admin",
+        "default_username": "",
         "snapshot_dir": str(get_data_dir() / "snapshots"),
         "recordings_dir": str(get_data_dir() / "recordings"),
         "ws_discovery_timeout": 3.0,
