@@ -306,6 +306,11 @@ class MainWindow(QMainWindow):
         btn_sb_add.clicked.connect(self._open_discovery_dialog)
         actions_layout.addWidget(btn_sb_add)
 
+        btn_sb_reconnect = QPushButton("↻ Reconectar")
+        btn_sb_reconnect.setToolTip("Reconectar a câmera selecionada (ou todas se nenhuma estiver selecionada)")
+        btn_sb_reconnect.clicked.connect(self._reconnect_selected_camera)
+        actions_layout.addWidget(btn_sb_reconnect)
+
         btn_sb_del = QPushButton("- Excluir")
         btn_sb_del.setToolTip("Remover a câmera selecionada")
         btn_sb_del.clicked.connect(self._remove_selected_camera)
@@ -501,6 +506,29 @@ class MainWindow(QMainWindow):
         # 6. Registrar nos Logs e na Barra de Status
         self._log_event("Dispositivo", f"Câmera renomeada: '{old_name}' ➔ '{new_name}'")
         self.statusBar().showMessage(f"Câmera renomeada para '{new_name}' com sucesso!", 4000)
+
+    def _reconnect_selected_camera(self):
+        """Reconecta a câmera selecionada ou todas caso nenhuma esteja selecionada."""
+        selected_item = self.device_tree.currentItem()
+        cam_id = None
+        if selected_item:
+            cam_id = selected_item.data(0, Qt.ItemDataRole.UserRole)
+        
+        if not cam_id and self.camera_grid.selected_camera_id:
+            cam_id = self.camera_grid.selected_camera_id
+
+        if cam_id:
+            if cam_id in self.camera_grid.camera_views:
+                view = self.camera_grid.camera_views[cam_id]
+                view.stop()
+                view._start_stream()
+                self._log_event("Conexão", f"Reconectando câmera: {view.camera.name}")
+        else:
+            # Reconectar todas
+            self._log_event("Conexão", "Reconectando todas as câmeras...")
+            for view in self.camera_grid.camera_views.values():
+                view.stop()
+                view._start_stream()
 
     def _remove_selected_camera(self):
         """Remove a câmera que estiver atualmente selecionada."""
