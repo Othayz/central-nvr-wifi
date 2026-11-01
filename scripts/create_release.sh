@@ -27,23 +27,10 @@ sed -i "s/__version__ = .*/__version__ = \"${NEW_VER}\"/g" src/central_nvr/__ini
 # 2. Atualizar pyproject.toml
 sed -i "s/version = \".*\"/version = \"${NEW_VER}\"/g" pyproject.toml
 
-# 3. Atualizar setup.py
-sed -i "s/version=\".*\"/version=\"${NEW_VER}\"/g" setup.py
-
-# 4. Atualizar packaging/build_deb.sh e packaging/build_rpm.sh
-sed -i "s/VERSION=\".*\"/VERSION=\"${NEW_VER}\"/g" packaging/build_deb.sh
-sed -i "s/VERSION=\".*\"/VERSION=\"${NEW_VER}\"/g" packaging/build_rpm.sh
-
-# 5. Atualizar packaging/debian/control
-sed -i "s/Version: .*/Version: ${NEW_VER}/g" packaging/debian/control
-
-# 6. Atualizar packaging/rpm/central-nvr.spec
-sed -i "s/Version: .*/Version:        ${NEW_VER}/g" packaging/rpm/central-nvr.spec
-
 echo "[1/3] Versão atualizada para ${NEW_VER} nos arquivos do projeto."
 
 # Git commit e tag
-git add src/central_nvr/__init__.py pyproject.toml setup.py packaging/
+git add src/central_nvr/__init__.py pyproject.toml
 git commit -m "chore(release): bump version to ${TAG_NAME}" || true
 git tag -a "${TAG_NAME}" -m "${MSG}"
 

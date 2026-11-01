@@ -52,14 +52,15 @@ Central NVR Wifi/
 │   ├── AppRun                          # Launcher portátil com Host Delegation para VA-API
 │   └── build_appimage.sh               # Script de geração do pacote AppImage universal
 ├── requirements.txt                    # Dependências do Python
-├── pyproject.toml                      # Metadados de empacotamento Python
-├── setup.py                            # Script setup.py
+├── pyproject.toml                      # Metadados de empacotamento Python (PEP 517/621)
 └── README.md                           # Documentação do projeto
 ```
 
 ---
 
-## 3. Instruções de Instalação e Execução
+## 3. Execução a partir do Código-Fonte (Desenvolvimento)
+
+> **Nota para Usuários Finais**: Não é necessário compilar nem instalar dependências manualmente. Basta baixar e executar o arquivo universal [AppImage](#4-pipeline-de-empacotamento-universal-appimage).
 
 ### A. Em Distribuições Debian / Ubuntu / Linux Mint
 
