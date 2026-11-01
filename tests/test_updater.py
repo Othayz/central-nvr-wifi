@@ -72,19 +72,14 @@ class TestUpdaterCore(unittest.TestCase):
     def test_find_best_asset_for_system(self):
         assets = [
             ReleaseAsset(name="central-nvr-1.1.0.tar.gz", size=1000, download_url="http://a.com/tar"),
-            ReleaseAsset(name="central-nvr_1.1.0_all.deb", size=2000, download_url="http://a.com/deb"),
-            ReleaseAsset(name="central-nvr-1.1.0.noarch.rpm", size=2500, download_url="http://a.com/rpm"),
+            ReleaseAsset(name="Central_NVR_WiFi-1.1.0-x86_64.AppImage", size=2000, download_url="http://a.com/appimage"),
+            ReleaseAsset(name="central-nvr_1.1.0_other.zip", size=2500, download_url="http://a.com/zip"),
         ]
 
-        with patch("central_nvr.core.updater.detect_system_package_format", return_value="deb"):
-            best = find_best_asset_for_system(assets)
-            self.assertIsNotNone(best)
-            self.assertTrue(best.name.endswith(".deb"))
-
-        with patch("central_nvr.core.updater.detect_system_package_format", return_value="rpm"):
-            best = find_best_asset_for_system(assets)
-            self.assertIsNotNone(best)
-            self.assertTrue(best.name.endswith(".rpm"))
+        best = find_best_asset_for_system(assets)
+        self.assertIsNotNone(best)
+        self.assertTrue(best.name.endswith(".AppImage"))
+        self.assertIn("x86_64", best.name)
 
     def test_parse_github_release_dict(self):
         mock_payload = {
@@ -251,37 +246,43 @@ class TestUpdaterWorkers(unittest.TestCase):
         self.assertEqual(len(no_update_results), 1)
 
 
-    def test_install_downloaded_package_safe_execution(self):
-        """Valida execução segura de pkexec quando SHA-256 é verificado com sucesso."""
+    def test_install_appimage_atomic_replacement(self):
+        """Valida substituição atômica (Atomic Replacement) quando executado a partir de um AppImage existente."""
         from central_nvr.core.updater import install_downloaded_package
-        with patch("os.path.exists", side_effect=lambda p: False if "ostree" in str(p) else True):
-            with patch("shutil.which") as mock_which:
-                mock_which.side_effect = lambda cmd: cmd in ("pkexec", "apt")
-                with patch("central_nvr.core.updater.verify_file_sha256", return_value=True):
-                    with patch("subprocess.Popen") as mock_popen:
-                        success, msg = install_downloaded_package(
-                            "/cache/central-nvr_1.0.0.deb",
-                            expected_sha256="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-                        )
-                        self.assertTrue(success)
-                        self.assertTrue(mock_popen.called)
-                        call_args = mock_popen.call_args[0][0]
-                        self.assertEqual(call_args[0], "pkexec")
-                        self.assertEqual(call_args[1], "apt")
-                        self.assertEqual(call_args[2], "install")
-                        self.assertNotIn("bash", call_args)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            running_img = Path(tmpdir) / "running.AppImage"
+            running_img.write_text("old app image")
 
-    def test_install_downloaded_package_blocks_unverified_pkexec(self):
-        """Valida que pkexec é bloqueado sem verificação prévia de SHA-256 (SEC-02 / SEC-07)."""
+            new_img = Path(tmpdir) / "downloaded.AppImage"
+            new_img.write_text("new app image v2")
+
+            with patch.dict(os.environ, {"APPIMAGE": str(running_img)}):
+                success, msg = install_downloaded_package(str(new_img))
+                self.assertTrue(success)
+                self.assertIn("atualizada com sucesso", msg)
+                self.assertEqual(running_img.read_text(), "new app image v2")
+
+    def test_install_appimage_to_user_local_bin(self):
+        """Valida instalação de AppImage em ~/.local/bin quando executado fora de um AppImage."""
         from central_nvr.core.updater import install_downloaded_package
-        with patch("os.path.exists", side_effect=lambda p: False if "ostree" in str(p) else True):
-            with patch("shutil.which") as mock_which:
-                mock_which.side_effect = lambda cmd: cmd in ("pkexec", "apt")
-                with patch("central_nvr.core.updater.install_package_to_user_local", return_value=(True, "Instalado no usuário")):
-                    # Sem expected_sha256, deve bloquear pkexec
-                    success, msg = install_downloaded_package("/cache/central-nvr_1.0.0.deb", expected_sha256=None)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fake_home = Path(tmpdir) / "user_home"
+            fake_home.mkdir()
+
+            new_img = Path(tmpdir) / "central-nvr.AppImage"
+            new_img.write_text("portable binary")
+
+            with patch.dict(os.environ, {}, clear=True):
+                with patch("pathlib.Path.home", return_value=fake_home):
+                    success, msg = install_downloaded_package(str(new_img))
                     self.assertTrue(success)
-                    self.assertIn("requer validação de hash SHA-256", msg)
+                    installed_path = fake_home / ".local" / "bin" / "central-nvr.AppImage"
+                    self.assertTrue(installed_path.exists())
+                    self.assertEqual(installed_path.read_text(), "portable binary")
+                    mode = oct(installed_path.stat().st_mode)[-3:]
+                    self.assertEqual(mode, "755")
+                    desktop_file = fake_home / ".local" / "share" / "applications" / "central-nvr.desktop"
+                    self.assertTrue(desktop_file.exists())
 
     def test_install_downloaded_package_sha256_mismatch(self):
         """Valida rejeição de pacote corrompido ou adulterado (SEC-07)."""
@@ -289,7 +290,7 @@ class TestUpdaterWorkers(unittest.TestCase):
         with patch("os.path.exists", return_value=True):
             with patch("central_nvr.core.updater.verify_file_sha256", return_value=False):
                 with patch("central_nvr.core.updater.compute_file_sha256", return_value="badhash"):
-                    success, msg = install_downloaded_package("/cache/pkg.deb", expected_sha256="expectedhash")
+                    success, msg = install_downloaded_package("/cache/pkg.AppImage", expected_sha256="expectedhash")
                     self.assertFalse(success)
                     self.assertIn("Falha de integridade SHA-256", msg)
 
@@ -366,15 +367,16 @@ class TestUpdaterWorkers(unittest.TestCase):
 
     def test_install_downloaded_package_user_local(self):
         from central_nvr.core.updater import install_downloaded_package
-        import tempfile
-        from pathlib import Path
-        deb_file = "dist/central-nvr_1.0.0_all.deb"
-        if os.path.exists(deb_file):
-            with tempfile.TemporaryDirectory() as tmpdir:
-                with patch("pathlib.Path.home", return_value=Path(tmpdir)):
-                    success, msg = install_downloaded_package(deb_file)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fake_home = Path(tmpdir) / "home"
+            fake_home.mkdir()
+            fake_appimage = Path(tmpdir) / "Central_NVR.AppImage"
+            fake_appimage.write_text("dummy binary")
+            with patch("pathlib.Path.home", return_value=fake_home):
+                with patch.dict(os.environ, {}, clear=True):
+                    success, msg = install_downloaded_package(str(fake_appimage))
                     self.assertTrue(success)
-                    self.assertTrue((Path(tmpdir) / ".local" / "bin" / "central-nvr").exists())
+                    self.assertTrue((fake_home / ".local" / "bin" / "central-nvr.AppImage").exists())
 
     def test_parse_release_version_title_tag_divergence(self):
         from central_nvr.core.updater import _parse_github_release_dict

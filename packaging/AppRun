@@ -1,0 +1,40 @@
+#!/bin/sh
+set -e
+
+# =============================================================================
+# AppRun: Launcher universal para Central NVR WiFi AppImage
+# =============================================================================
+
+# Determinar o diretório base montado do AppDir
+APPDIR="$(dirname "$(readlink -f "$0")")"
+export APPDIR
+
+# Configurar caminhos de busca de binários e bibliotecas da aplicação
+export PATH="${APPDIR}/usr/bin:${APPDIR}/bin:${PATH}"
+export LD_LIBRARY_PATH="${APPDIR}/usr/lib:${APPDIR}/usr/lib64:${APPDIR}/lib:${APPDIR}/lib64:${LD_LIBRARY_PATH}"
+export XDG_DATA_DIRS="${APPDIR}/usr/share:${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
+
+# Host Delegation: Garantir acesso aos drivers de aceleração VA-API da máquina hospedeira
+# Permite que Intel QuickSync (iHD/i965) e AMD Radeon (radeonsi) acessem /dev/dri/renderD128
+if [ -z "$LIBVA_DRIVERS_PATH" ]; then
+    export LIBVA_DRIVERS_PATH="/usr/lib64/dri:/usr/lib/x86_64-linux-gnu/dri:/usr/lib/dri"
+fi
+
+# Configurar caminhos do interpretador Python e bibliotecas PySide6/PyAV embutidas
+if [ -d "${APPDIR}/usr/lib/python3/site-packages" ]; then
+    export PYTHONPATH="${APPDIR}/usr/lib/python3/site-packages:${APPDIR}/usr/src:${PYTHONPATH}"
+fi
+
+# Configurar plugins Qt6 (plataformas xcb e wayland)
+if [ -d "${APPDIR}/usr/plugins" ]; then
+    export QT_PLUGIN_PATH="${APPDIR}/usr/plugins:${QT_PLUGIN_PATH}"
+fi
+
+# Executar a Central NVR
+if [ -x "${APPDIR}/usr/bin/central-nvr" ]; then
+    exec "${APPDIR}/usr/bin/central-nvr" "$@"
+elif [ -x "${APPDIR}/usr/bin/python3" ]; then
+    exec "${APPDIR}/usr/bin/python3" -m central_nvr "$@"
+else
+    exec python3 -m central_nvr "$@"
+fi

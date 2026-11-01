@@ -12,7 +12,7 @@ Aplicativo desktop profissional para Linux projetado para descoberta de rede, st
 | **Decodificação de Vídeo** | **PyAV / FFmpeg (VA-API)** | Decodificação direta de streams RTSP H.264 / H.265 via hardware Linux (Intel QuickSync, AMD Radeon via `/dev/dri/renderD128`) com buffer ultrabaixo (<150ms). |
 | **Descoberta de Rede** | **WS-Discovery Nativo (UDP Multicast)** | Envio RFC-compliant de sondas SOAP para `239.255.255.250:3702` (escopos ONVIF `NetworkVideoTransmitter`), combinado com scanner assíncrono de portas TCP (554, 80, 8080, 8899). |
 | **Controle ONVIF / PTZ** | **Cliente SOAP com WS-Security** | Implementação com autenticação `UsernameToken` (SHA-1 Password Digest e Nonce), resolução dinâmica de URLs RTSP e controle de Pan, Tilt, Zoom e Presets. |
-| **Empacotamento Nativo** | **`.deb` (Debian/Ubuntu) e `.rpm` (Fedora/RHEL)** | Estrutura padrão FHS (`/usr/bin`, `/usr/lib`, `/usr/share/applications`, `/usr/share/icons`). |
+| **Distribuição Universal** | **AppImage** | Formato portátil autocontido compatível com qualquer distribuição Linux (Ubuntu, Debian, Fedora, Arch, openSUSE e sistemas imutáveis como SteamOS e Bazzite). |
 
 ---
 
@@ -46,17 +46,11 @@ Central NVR Wifi/
 │           ├── timeline_bar.py         # Linha do tempo de gravações e eventos
 │           └── styles.py               # Folha de estilos QSS Dark Mode moderna
 ├── packaging/
-│   ├── debian/                         # Arquivos de controle do pacote Debian
-│   │   ├── control
-│   │   ├── postinst
-│   │   └── prerm
-│   ├── rpm/                            # Arquivo de especificação RPM
-│   │   └── central-nvr.spec
-│   ├── icons/                          # Ícone SVG do aplicativo
-│   │   └── central-nvr.svg
+│   ├── icons/                          # Ícones da aplicação em múltiplos tamanhos
+│   │   └── central-nvr.png
 │   ├── central-nvr.desktop             # Entrada do lançador do sistema Linux
-│   ├── build_deb.sh                    # Script de geração do pacote .deb
-│   └── build_rpm.sh                    # Script de geração do pacote .rpm
+│   ├── AppRun                          # Launcher portátil com Host Delegation para VA-API
+│   └── build_appimage.sh               # Script de geração do pacote AppImage universal
 ├── requirements.txt                    # Dependências do Python
 ├── pyproject.toml                      # Metadados de empacotamento Python
 ├── setup.py                            # Script setup.py
@@ -112,31 +106,23 @@ python3 -m central_nvr
 
 ---
 
-## 4. Pipeline de Empacotamento Nativo Linux
+## 4. Pipeline de Empacotamento Universal (AppImage)
 
-### Gerando o Pacote Debian (`.deb`)
-Para compilar e gerar o instalador `.deb` compatível com Debian, Ubuntu, Mint e derivados:
-```bash
-chmod +x packaging/build_deb.sh
-./packaging/build_deb.sh
-```
-O pacote será gerado em `dist/central-nvr_1.0.0_all.deb`. Para instalar no sistema:
-```bash
-sudo dpkg -i dist/central-nvr_1.0.0_all.deb
-sudo apt install -f  # Para resolver dependências faltantes caso necessário
-```
+O Central NVR WiFi adota o formato universal **AppImage**, permitindo que o aplicativo seja executado diretamente em qualquer distribuição Linux sem necessidade de instalação tradicional nem permissões de root.
 
----
-
-### Gerando o Pacote Red Hat (`.rpm`)
-Para compilar e gerar o pacote `.rpm` compatível com Fedora, RHEL, CentOS e Bazzite:
+### Gerando o Pacote AppImage
+Para compilar e gerar o binário portátil `.AppImage`:
 ```bash
-chmod +x packaging/build_rpm.sh
-./packaging/build_rpm.sh
+chmod +x packaging/build_appimage.sh
+./packaging/build_appimage.sh
 ```
-O pacote será gerado em `dist/central-nvr-1.0.0-1.noarch.rpm`. Para instalar no sistema:
+O pacote será gerado em `dist/Central_NVR_WiFi-<versão>-x86_64.AppImage`.
+
+### Executando o AppImage
+Basta conceder permissão de execução e rodar:
 ```bash
-sudo dnf install dist/central-nvr-1.0.0-1.noarch.rpm
+chmod +x dist/Central_NVR_WiFi-*-x86_64.AppImage
+./dist/Central_NVR_WiFi-*-x86_64.AppImage
 ```
 
 ---

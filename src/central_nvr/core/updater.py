@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Módulo Central de Atualizações via GitHub Releases.
+Módulo Central de Atualizações via GitHub Releases para AppImage universal.
 Gerencia verificação de versão semântica, consulta à API do GitHub,
-download de pacotes (.deb, .rpm) e execução assíncrona com threads Qt.
+download seguro com validação SHA-256 e substituição atômica de executáveis.
 """
 from dataclasses import dataclass, field
 import datetime
@@ -10,6 +10,7 @@ import hashlib
 import json
 import logging
 import os
+from pathlib import Path
 import platform
 import re
 import shutil
@@ -134,48 +135,31 @@ def is_version_newer(current_ver: str, remote_ver: str) -> bool:
 
 def detect_system_package_format() -> str:
     """
-    Detecta o formato preferencial de pacote nativo da distribuição Linux.
-    Retorna 'deb', 'rpm' ou 'tar.gz'.
+    Retorna o formato padrão e universal de distribuição do projeto ('appimage').
     """
-    if os.path.exists("/etc/os-release"):
-        try:
-            with open("/etc/os-release", "r", encoding="utf-8") as f:
-                content = f.read().lower()
-                if any(x in content for x in ["ubuntu", "debian", "mint", "pop!_os", "elementary"]):
-                    return "deb"
-                if any(x in content for x in ["fedora", "rhel", "centos", "rocky", "almalinux", "opensuse", "suse"]):
-                    return "rpm"
-        except Exception as e:
-            logger.debug(f"Erro ao ler /etc/os-release: {e}")
-
-    if shutil.which("dpkg") or shutil.which("apt"):
-        return "deb"
-    if shutil.which("rpm") or shutil.which("dnf"):
-        return "rpm"
-
-    return "deb"
+    return "appimage"
 
 
 def find_best_asset_for_system(assets: List[ReleaseAsset]) -> Optional[ReleaseAsset]:
     """
-    Encontra o asset de download mais adequado para a máquina atual (.deb, .rpm ou tar.gz).
+    Encontra o asset de download mais adequado para a máquina atual (.AppImage ou tar.gz).
+    Prioriza binários AppImage para arquitetura x86_64.
     """
     if not assets:
         return None
 
-    pkg_format = detect_system_package_format()
-
-    # Prioridade 1: Pacote do formato nativo detectado
+    # Prioridade 1: AppImage correspondente à arquitetura x86_64
     for asset in assets:
-        if asset.name.lower().endswith(f".{pkg_format}"):
+        name_lower = asset.name.lower()
+        if name_lower.endswith(".appimage") and ("x86_64" in name_lower or "amd64" in name_lower):
             return asset
 
-    # Prioridade 2: Outros formatos de instalador binário
+    # Prioridade 2: Qualquer asset AppImage
     for asset in assets:
-        if asset.name.lower().endswith(".deb") or asset.name.lower().endswith(".rpm"):
+        if asset.name.lower().endswith(".appimage"):
             return asset
 
-    # Prioridade 3: Arquivo comprimido
+    # Prioridade 3: Arquivo comprimido tar.gz / zip
     for asset in assets:
         if asset.name.lower().endswith((".tar.gz", ".tgz", ".zip")):
             return asset
@@ -541,138 +525,31 @@ def _extract_tar_members_to_local(tar, target_base):
                     pass
 
 
-def install_package_to_user_local(file_path: str) -> Tuple[bool, str]:
-    """
-    Instala ou atualiza o pacote diretamente no espaço do usuário (~/.local/).
-    Funciona em qualquer distribuição Linux, inclusive sistemas imutáveis (Bazzite, Kinoite, SteamOS),
-    sem requerer privilégios de root nem abrir gerenciadores de arquivo (Ark/File Roller).
-    """
-    import io
-    import tarfile
-    from pathlib import Path
-
-    target_base = Path.home() / ".local"
-    target_base.mkdir(parents=True, exist_ok=True)
-
-    data_tar_bytes = None
-    ext = os.path.splitext(file_path)[1].lower()
-
-    if ext == ".deb":
-        try:
-            with open(file_path, "rb") as f:
-                magic = f.read(8)
-                if magic != b"!<arch>\n":
-                    return False, "O arquivo .deb baixado não possui formato ar válido."
-                while True:
-                    hdr = f.read(60)
-                    if len(hdr) < 60:
-                        break
-                    m_name = hdr[:16].decode("ascii", errors="ignore").strip()
-                    m_size = int(hdr[48:58].decode("ascii", errors="ignore").strip())
-                    content = f.read(m_size)
-                    if m_size % 2 != 0:
-                        f.read(1)
-                    if "data.tar" in m_name:
-                        data_tar_bytes = content
-                        break
-        except Exception as e:
-            return False, f"Falha ao processar pacote .deb: {e}"
-
-        if not data_tar_bytes:
-            return False, "Arquivo de dados (data.tar) não encontrado no pacote .deb."
-
-        try:
-            with tarfile.open(fileobj=io.BytesIO(data_tar_bytes)) as tar:
-                _extract_tar_members_to_local(tar, target_base)
-        except Exception as e:
-            return False, f"Erro ao extrair arquivos da aplicação: {e}"
-
-    elif file_path.endswith((".tar.gz", ".tgz")):
-        try:
-            with tarfile.open(file_path, "r:*") as tar:
-                _extract_tar_members_to_local(tar, target_base)
-        except Exception as e:
-            return False, f"Erro ao extrair tarball: {e}"
-
-    elif ext == ".rpm":
-        if shutil.which("rpm2cpio") and shutil.which("cpio"):
-            try:
-                p_rpm = subprocess.Popen(["rpm2cpio", os.path.abspath(file_path)], stdout=subprocess.PIPE)
-                p_cpio = subprocess.run(
-                    ["cpio", "-idmv", "--quiet", "--no-absolute-filenames"],
-                    stdin=p_rpm.stdout,
-                    cwd=str(target_base),
-                    capture_output=True,
-                    timeout=30,
-                )
-                p_rpm.wait()
-                if p_cpio.returncode != 0:
-                    return False, f"Falha na extração CPIO do RPM: {p_cpio.stderr.decode('utf-8', errors='ignore')}"
-            except Exception as e:
-                return False, f"Erro ao extrair pacote .rpm: {e}"
-        else:
-            return False, "Comandos rpm2cpio ou cpio necessários para extração do pacote .rpm não foram encontrados."
-
-    else:
-        return False, f"Formato '{ext}' não suporta instalação direta no usuário."
-
-    # Configurar executável launcher ~/.local/bin/central-nvr
-    bin_path = target_base / "bin" / "central-nvr"
-    bin_path.parent.mkdir(parents=True, exist_ok=True)
-    launcher_content = f"""#!/bin/sh
-export PYTHONPATH="{target_base / 'lib' / 'central-nvr'}:${{PYTHONPATH}}"
-exec /usr/bin/python3 -m central_nvr.app "$@"
+def _ensure_desktop_entry_for_appimage(appimage_path: Path):
+    """Cria ou atualiza a entrada de menu (.desktop) apontando para o AppImage."""
+    apps_dir = Path.home() / ".local" / "share" / "applications"
+    apps_dir.mkdir(parents=True, exist_ok=True)
+    desktop_file = apps_dir / "central-nvr.desktop"
+    content = f"""[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Central NVR WiFi
+GenericName=NVR IP Camera Viewer
+Comment=Sistema de Gerenciamento, Descoberta ONVIF e Streaming RTSP de Baixa Latência
+Exec="{appimage_path}" %U
+Icon=central-nvr
+Terminal=false
+Categories=AudioVideo;Video;Network;Monitor;Security;
+StartupNotify=true
+StartupWMClass=central-nvr
 """
     try:
-        with open(bin_path, "w", encoding="utf-8") as f:
-            f.write(launcher_content)
-        os.chmod(bin_path, 0o755)
+        with open(desktop_file, "w", encoding="utf-8") as f:
+            f.write(content)
+        if shutil.which("update-desktop-database"):
+            subprocess.run(["update-desktop-database", str(apps_dir)], capture_output=True, timeout=4)
     except Exception as e:
-        logger.warning(f"Erro criando launcher em {bin_path}: {e}")
-
-    # Atualizar lançador .desktop
-    desktop_path = target_base / "share" / "applications" / "central-nvr.desktop"
-    if desktop_path.exists():
-        try:
-            with open(desktop_path, "r", encoding="utf-8") as f:
-                d_content = f.read()
-            d_content = re.sub(r"^Exec=.*$", f"Exec={bin_path}", d_content, flags=re.MULTILINE)
-            icon_svg = target_base / "share" / "icons" / "hicolor" / "scalable" / "apps" / "central-nvr.svg"
-            icon_png = target_base / "share" / "icons" / "hicolor" / "512x512" / "apps" / "central-nvr.png"
-            icon_to_use = icon_svg if icon_svg.exists() else (icon_png if icon_png.exists() else "central-nvr")
-            d_content = re.sub(r"^Icon=.*$", f"Icon={icon_to_use}", d_content, flags=re.MULTILINE)
-            with open(desktop_path, "w", encoding="utf-8") as f:
-                f.write(d_content)
-        except Exception as e:
-            logger.warning(f"Erro atualizando .desktop: {e}")
-
-    if shutil.which("update-desktop-database"):
-        try:
-            subprocess.run(["update-desktop-database", str(target_base / "share" / "applications")], capture_output=True, timeout=4)
-        except Exception:
-            pass
-
-    return True, "Central NVR WiFi instalada e atualizada com sucesso em ~/.local (Menu de Aplicativos atualizado)."
-
-
-def _execute_pkexec_or_user_install(
-    file_path: str,
-    pkg_manager: str,
-    expected_sha256: Optional[str],
-) -> Tuple[bool, str]:
-    """
-    Executa a instalação via pkexec com validação de SHA-256 (SEC-02 e SEC-07).
-    Bloqueia elevação root se hash não foi verificado, redirecionando para instalação no usuário.
-    """
-    if not expected_sha256:
-        logger.warning(f"Execução via pkexec {pkg_manager} bloqueada: hash SHA-256 não validado.")
-        success, msg = install_package_to_user_local(file_path)
-        if success:
-            return True, f"{msg} (Instalação no usuário: execução root via pkexec requer validação de hash SHA-256)."
-        return False, "Instalação com privilégios de root (pkexec) requer verificação obrigatória de hash SHA-256."
-
-    subprocess.Popen(["pkexec", pkg_manager, "install", "-y", os.path.abspath(file_path)])
-    return True, f"Assistente de instalação iniciado via {pkg_manager}/pkexec."
+        logger.debug(f"Erro ao registrar atalho desktop: {e}")
 
 
 def install_downloaded_package(
@@ -680,10 +557,9 @@ def install_downloaded_package(
     expected_sha256: Optional[str] = None,
 ) -> Tuple[bool, str]:
     """
-    Inicia a instalação do arquivo de atualização baixado (.deb, .rpm ou .tar.gz).
-    Prioriza instalação nativa do sistema em distros compatíveis ou realiza a instalação
-    direta no espaço do usuário (~/.local), prevenindo abertura indevida em gerenciadores de arquivo (Ark).
-    Exige validação prévia de integridade SHA-256 antes de elevar privilégios com pkexec (SEC-02 / SEC-07).
+    Instala ou atualiza o binário portátil AppImage com verificação de integridade SHA-256 (SEC-07).
+    Executa substituição atômica no arquivo AppImage atual (Atomic Replacement) ou instala
+    em ~/.local/bin/central-nvr.AppImage sem requerer privilégios de root (pkexec).
     """
     if not os.path.exists(file_path):
         return False, "Arquivo de instalação não encontrado no disco."
@@ -694,29 +570,54 @@ def install_downloaded_package(
             actual_hash = compute_file_sha256(file_path)
             return False, f"Falha de integridade SHA-256: checksum divergente (esperado: {expected_sha256}, calculado: {actual_hash})."
 
-    ext = os.path.splitext(file_path)[1].lower()
-    is_ostree = os.path.exists("/run/ostree-booted")
+    file_obj = Path(file_path).resolve()
+    filename_lower = file_obj.name.lower()
 
     try:
-        # Se for Ubuntu/Debian padrão (com apt e sem sistema imutável)
-        if ext == ".deb" and not is_ostree and shutil.which("pkexec") and shutil.which("apt"):
-            return _execute_pkexec_or_user_install(file_path, "apt", expected_sha256)
+        # Formato Principal: AppImage universal
+        if filename_lower.endswith(".appimage"):
+            os.chmod(file_obj, 0o755)
+            running_appimage = os.environ.get("APPIMAGE")
 
-        # Se for Fedora/RHEL tradicional (com dnf e sem sistema imutável)
-        if ext == ".rpm" and not is_ostree and shutil.which("pkexec") and shutil.which("dnf"):
-            return _execute_pkexec_or_user_install(file_path, "dnf", expected_sha256)
+            # Se estiver rodando a partir de um AppImage existente, realizar Atomic Replacement
+            if running_appimage and os.path.exists(running_appimage):
+                target_path = Path(running_appimage).resolve()
+                temp_target = target_path.with_name(f"{target_path.name}.tmp.{os.getpid()}")
+                shutil.copy2(file_obj, temp_target)
+                os.chmod(temp_target, 0o755)
+                os.replace(temp_target, target_path)
+                return True, f"Central NVR WiFi atualizada com sucesso em {target_path}. Reinicie o aplicativo para usar a nova versão."
 
-        # Para sistemas imutáveis (Bazzite, Kinoite, SteamOS) ou quando apt/dnf não estiverem disponíveis:
-        # Instala diretamente no espaço do usuário (~/.local), sem root e sem abrir gerenciadores como o Ark.
-        success, msg = install_package_to_user_local(file_path)
-        if success:
-            return True, msg
+            # Caso contrário, instalar no diretório de binários do usuário (~/.local/bin)
+            user_bin_dir = Path.home() / ".local" / "bin"
+            user_bin_dir.mkdir(parents=True, exist_ok=True)
+            target_path = user_bin_dir / "central-nvr.AppImage"
+            temp_target = target_path.with_name(f"{target_path.name}.tmp.{os.getpid()}")
+            shutil.copy2(file_obj, temp_target)
+            os.chmod(temp_target, 0o755)
+            os.replace(temp_target, target_path)
+            _ensure_desktop_entry_for_appimage(target_path)
+            return True, f"Central NVR WiFi AppImage instalada com sucesso em {target_path}."
 
-        return False, f"Falha na instalação automática: {msg}"
+        # Formato Secundário: Tarball comprimido (.tar.gz / .tgz) com proteção Tar Slip (SEC-03)
+        elif filename_lower.endswith((".tar.gz", ".tgz")):
+            target_base = Path.home() / ".local"
+            target_base.mkdir(parents=True, exist_ok=True)
+            import tarfile
+            with tarfile.open(file_obj, "r:*") as tar:
+                _extract_tar_members_to_local(tar, target_base)
+            return True, "Central NVR WiFi instalada com sucesso em ~/.local."
+
+        return False, f"Formato não suportado para atualização: {file_obj.suffix}"
 
     except Exception as e:
-        logger.error(f"Erro ao acionar instalador: {e}")
+        logger.error(f"Erro ao processar pacote AppImage: {e}")
         return False, str(e)
+
+
+def install_package_to_user_local(file_path: str) -> Tuple[bool, str]:
+    """Alias para install_downloaded_package, mantendo compatibilidade de API."""
+    return install_downloaded_package(file_path)
 
 
 # =============================================================================

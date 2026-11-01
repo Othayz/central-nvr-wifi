@@ -1,7 +1,0 @@
-#!/bin/sh
-set -e
-
-# Remoção limpa de arquivos compilados
-rm -rf /usr/lib/central-nvr/__pycache__ || true
-
-exit 0
