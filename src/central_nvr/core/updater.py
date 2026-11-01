@@ -1,4 +1,3 @@
-import hashlib
 #!/usr/bin/env python3
 """
 Módulo Central de Atualizações via GitHub Releases.
@@ -7,6 +6,7 @@ download de pacotes (.deb, .rpm) e execução assíncrona com threads Qt.
 """
 from dataclasses import dataclass, field
 import datetime
+import hashlib
 import json
 import logging
 import os
@@ -655,6 +655,26 @@ exec /usr/bin/python3 -m central_nvr.app "$@"
     return True, "Central NVR WiFi instalada e atualizada com sucesso em ~/.local (Menu de Aplicativos atualizado)."
 
 
+def _execute_pkexec_or_user_install(
+    file_path: str,
+    pkg_manager: str,
+    expected_sha256: Optional[str],
+) -> Tuple[bool, str]:
+    """
+    Executa a instalação via pkexec com validação de SHA-256 (SEC-02 e SEC-07).
+    Bloqueia elevação root se hash não foi verificado, redirecionando para instalação no usuário.
+    """
+    if not expected_sha256:
+        logger.warning(f"Execução via pkexec {pkg_manager} bloqueada: hash SHA-256 não validado.")
+        success, msg = install_package_to_user_local(file_path)
+        if success:
+            return True, f"{msg} (Instalação no usuário: execução root via pkexec requer validação de hash SHA-256)."
+        return False, "Instalação com privilégios de root (pkexec) requer verificação obrigatória de hash SHA-256."
+
+    subprocess.Popen(["pkexec", pkg_manager, "install", "-y", os.path.abspath(file_path)])
+    return True, f"Assistente de instalação iniciado via {pkg_manager}/pkexec."
+
+
 def install_downloaded_package(
     file_path: str,
     expected_sha256: Optional[str] = None,
@@ -680,28 +700,11 @@ def install_downloaded_package(
     try:
         # Se for Ubuntu/Debian padrão (com apt e sem sistema imutável)
         if ext == ".deb" and not is_ostree and shutil.which("pkexec") and shutil.which("apt"):
-            # SEC-02 & SEC-07: Bloquear execução via pkexec sem validação de integridade SHA-256
-            if not expected_sha256:
-                logger.warning("Execução via pkexec apt bloqueada: hash SHA-256 não validado.")
-                # Fallback seguro: instalar no usuário local (~/.local)
-                success, msg = install_package_to_user_local(file_path)
-                if success:
-                    return True, f"{msg} (Instalação no usuário: execução root via pkexec requer validação de hash SHA-256)."
-                return False, "Instalação com privilégios de root (pkexec) requer verificação obrigatória de hash SHA-256."
-            subprocess.Popen(["pkexec", "apt", "install", "-y", os.path.abspath(file_path)])
-            return True, "Assistente de instalação iniciado via apt/pkexec."
+            return _execute_pkexec_or_user_install(file_path, "apt", expected_sha256)
 
         # Se for Fedora/RHEL tradicional (com dnf e sem sistema imutável)
         if ext == ".rpm" and not is_ostree and shutil.which("pkexec") and shutil.which("dnf"):
-            # SEC-02 & SEC-07: Bloquear execução via pkexec sem validação de integridade SHA-256
-            if not expected_sha256:
-                logger.warning("Execução via pkexec dnf bloqueada: hash SHA-256 não validado.")
-                success, msg = install_package_to_user_local(file_path)
-                if success:
-                    return True, f"{msg} (Instalação no usuário: execução root via pkexec requer validação de hash SHA-256)."
-                return False, "Instalação com privilégios de root (pkexec) requer verificação obrigatória de hash SHA-256."
-            subprocess.Popen(["pkexec", "dnf", "install", "-y", os.path.abspath(file_path)])
-            return True, "Assistente de instalação iniciado via dnf/pkexec."
+            return _execute_pkexec_or_user_install(file_path, "dnf", expected_sha256)
 
         # Para sistemas imutáveis (Bazzite, Kinoite, SteamOS) ou quando apt/dnf não estiverem disponíveis:
         # Instala diretamente no espaço do usuário (~/.local), sem root e sem abrir gerenciadores como o Ark.

@@ -1,6 +1,6 @@
 """
-Widget de Controle PTZ (Pan / Tilt / Presets) com suporte nativo a câmeras Wi-Fi ONVIF.
-Design limpo, sem botões de zoom supérfluos para câmeras de lente fixa e com botão PARAR desobstruído.
+Widget de Controle PTZ (Pan / Tilt / Zoom / Presets) com suporte nativo a câmeras Wi-Fi ONVIF.
+Suporte completo a movimentação direcional contínua de 8 eixos, zoom contínuo e posições salvas.
 """
 import logging
 import threading
@@ -123,7 +123,27 @@ class PTZControllerWidget(QWidget):
 
         layout.addWidget(dpad_frame)
 
-        # 3. Velocidade de Rotação do Motor (Pan / Tilt)
+        # 3. Controles de Zoom (In / Out)
+        zoom_row = QHBoxLayout()
+        zoom_row.setSpacing(6)
+
+        self.btn_zoom_out = QPushButton("🔍− Zoom Out")
+        self.btn_zoom_out.setProperty("class", "card-action-btn")
+        self.btn_zoom_out.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_zoom_out.pressed.connect(lambda: self._start_zoom_move(-1.0))
+        self.btn_zoom_out.released.connect(self._stop_ptz)
+        zoom_row.addWidget(self.btn_zoom_out)
+
+        self.btn_zoom_in = QPushButton("🔍+ Zoom In")
+        self.btn_zoom_in.setProperty("class", "card-action-btn")
+        self.btn_zoom_in.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_zoom_in.pressed.connect(lambda: self._start_zoom_move(1.0))
+        self.btn_zoom_in.released.connect(self._stop_ptz)
+        zoom_row.addWidget(self.btn_zoom_in)
+
+        layout.addLayout(zoom_row)
+
+        # 4. Velocidade de Rotação do Motor (Pan / Tilt / Zoom)
         speed_frame = QFrame()
         speed_frame.setObjectName("cardFrame")
         sp_layout = QVBoxLayout(speed_frame)
@@ -247,6 +267,23 @@ class PTZControllerWidget(QWidget):
                 self.command_executed.emit(self.camera.name, f"Movimento PTZ: Pan={p_speed:.2f} Tilt={t_speed:.2f}")
             except Exception as e:
                 logger.error(f"Erro no comando PTZ: {e}")
+
+        threading.Thread(target=_send, daemon=True).start()
+
+    def _start_zoom_move(self, direction: float):
+        """Envia comando ONVIF ContinuousMove para zoom in (+1.0) ou zoom out (-1.0)."""
+        if not self.camera or not self.client:
+            return
+
+        z_speed = direction * self.ptz_speed
+
+        def _send():
+            try:
+                self.client.ptz_continuous_move(pan_speed=0.0, tilt_speed=0.0, zoom_speed=z_speed)
+                action = "Zoom In" if direction > 0 else "Zoom Out"
+                self.command_executed.emit(self.camera.name, f"Comando PTZ: {action} ({z_speed:+.2f})")
+            except Exception as e:
+                logger.error(f"Erro no comando Zoom: {e}")
 
         threading.Thread(target=_send, daemon=True).start()
 

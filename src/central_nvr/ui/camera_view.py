@@ -1,8 +1,8 @@
-import html
 """
 Widget de Viewport de Câmera Individual com OSD, Controles em Tempo Real e Renomeação Rápida.
 """
 import datetime
+import html
 import os
 import re
 import time

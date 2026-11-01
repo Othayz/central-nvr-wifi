@@ -1,9 +1,9 @@
-import html
 """
 Barra de Linha do Tempo (Timeline) para visualização de gravações e eventos de detecção de movimento.
 Inspirado na interface de referência da Central NVR.
 """
 import datetime
+import html
 from typing import List, Optional
 
 from PySide6.QtCore import QPoint, QRectF, QSize, Qt, Signal

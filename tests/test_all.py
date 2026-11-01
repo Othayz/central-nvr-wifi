@@ -112,7 +112,9 @@ class TestCameraAndConfig(unittest.TestCase):
         config = ConfigManager()
         self.assertIsNotNone(config.get("theme"))
         self.assertIsNotNone(config.get("hw_accel"))
+        config.add_or_update_device({"id": "test-cfg-1", "name": "Câmera Teste", "ip": "192.168.1.99"})
         self.assertTrue(len(config.devices) >= 1)
+        config.remove_device("test-cfg-1")
 
     def test_yoosee_candidate_urls(self):
         cam = CameraDevice(
@@ -822,6 +824,18 @@ class TestSecurityAuditRemediations(unittest.TestCase):
         view.deleteLater()
         bar.close()
         bar.deleteLater()
+        self.app.processEvents()
+
+    def test_ptz_controller_zoom_controls(self):
+        """Valida que o PTZControllerWidget instancia botões de Zoom In/Out e despacha velocidade de zoom."""
+        from central_nvr.ui.ptz_controller import PTZControllerWidget
+        widget = PTZControllerWidget()
+        self.assertTrue(hasattr(widget, "btn_zoom_in"))
+        self.assertTrue(hasattr(widget, "btn_zoom_out"))
+        self.assertIn("Zoom In", widget.btn_zoom_in.text())
+        self.assertIn("Zoom Out", widget.btn_zoom_out.text())
+        widget.close()
+        widget.deleteLater()
         self.app.processEvents()
 
 

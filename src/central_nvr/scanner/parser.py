@@ -39,6 +39,11 @@ def parse_ws_discovery_response(xml_data: str, source_ip: str = "") -> Optional[
         return None
 
     try:
+        # SEC-06: Defesa contra DoS / Billion Laughs / XXE (rejeição de DTD e declarações de entidade)
+        if "<!DOCTYPE" in xml_data or "<!ENTITY" in xml_data:
+            logger.warning("Ataque DTD/Entity XML bloqueado no WS-Discovery (Billion Laughs / XXE).")
+            return None
+
         # Remover declarações de namespace prefixados desconhecidos para parsing robusto
         cleaned_xml = re.sub(r'xmlns(:\w+)?="[^"]+"', '', xml_data, count=0)
         # Parseando o XML original com ElementTree

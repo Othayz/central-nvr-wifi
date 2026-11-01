@@ -3,6 +3,7 @@ Worker de Streaming RTSP de Baixa Latência com suporte a VA-API / Aceleração 
 Transporte Adaptativo (Auto-Fallback UDP/TCP), Métricas de QoS (Jitter/Perda) e Detecção de Movimento Integrada.
 """
 import datetime
+from enum import Enum
 import logging
 import math
 import re
@@ -90,6 +91,33 @@ except ImportError:
     pass
 
 _opencv_lock = threading.Lock()
+
+VAAPI_DEVICE_PATH = "/dev/dri/renderD128"
+
+
+def is_vaapi_supported() -> bool:
+    """Verifica se o dispositivo de aceleração gráfica por hardware VA-API (/dev/dri/renderD128) está acessível."""
+    try:
+        return os.path.exists(VAAPI_DEVICE_PATH) and os.access(VAAPI_DEVICE_PATH, os.R_OK)
+    except Exception:
+        return False
+
+
+class TransportMode(str, Enum):
+    AUTO_UDP = "Auto (UDP)"
+    AUTO_TCP_FALLBACK = "Auto (TCP Fallback)"
+    UDP = "UDP"
+    TCP = "TCP"
+    OPENCV_UDP = "OpenCV (UDP)"
+    OPENCV_TCP = "OpenCV (TCP)"
+    DEMO = "Demo"
+
+
+class VideoCodec(str, Enum):
+    H264 = "H.264"
+    H265_HEVC = "H.265 / HEVC"
+    MJPEG = "MJPEG"
+    UNKNOWN = "Desconhecido"
 
 
 class StreamWorker(QThread):
@@ -184,51 +212,17 @@ class StreamWorker(QThread):
         while self._is_running:
             success = False
 
-            # Fase 1: Priorizar PyAV (libav / FFmpeg) com suporte total a H.265/HEVC, medição de bitrate real e estabilidade
+            # Fase 1: Priorizar PyAV (libav / FFmpeg) com suporte total a H.265/HEVC e medição de bitrate real
             if HAS_AV:
-                for stream_url in candidate_urls:
-                    if not self._is_running or success:
-                        break
+                success = self._attempt_stream_backend(
+                    "PyAV", self._run_pyav_stream, candidate_urls, transports, user_transport
+                )
 
-                    if stream_url.startswith("demo://"):
-                        self._run_test_pattern_stream()
-                        success = True
-                        break
-
-                    for trans in transports:
-                        if not self._is_running or success:
-                            break
-
-                        trans_label = "Auto (UDP)" if (user_transport == "auto" and trans == "udp") else ("Auto (TCP Fallback)" if (user_transport == "auto" and trans == "tcp") else trans.upper())
-                        self.stats.transport_mode = trans_label
-                        logger.info(f"Conectando RTSP PyAV ({self.camera.name}) via {trans_label}: {sanitize_rtsp_url(stream_url)}")
-
-                        success = self._run_pyav_stream(stream_url, transport=trans)
-                        if success:
-                            break
-
-            # Fase 2: Se PyAV não estiver disponível ou falhar em todas as tentativas, tentar OpenCV como fallback
+            # Fase 2: Se PyAV não estiver disponível ou falhar, tentar OpenCV como fallback resiliente
             if not success and HAS_CV2 and self._is_running:
-                for stream_url in candidate_urls:
-                    if not self._is_running or success:
-                        break
-
-                    if stream_url.startswith("demo://"):
-                        self._run_test_pattern_stream()
-                        success = True
-                        break
-
-                    for trans in transports:
-                        if not self._is_running or success:
-                            break
-
-                        trans_label = f"OpenCV ({trans.upper()})"
-                        self.stats.transport_mode = trans_label
-                        logger.info(f"Conectando RTSP OpenCV ({self.camera.name}) via {trans_label}: {sanitize_rtsp_url(stream_url)}")
-
-                        success = self._run_opencv_stream(stream_url, transport=trans)
-                        if success:
-                            break
+                success = self._attempt_stream_backend(
+                    "OpenCV", self._run_opencv_stream, candidate_urls, transports, user_transport
+                )
 
             # Se falhar todas as URLs candidatas e transportes, marcar como Offline / Erro
             if not success and self._is_running:
@@ -251,6 +245,58 @@ class StreamWorker(QThread):
 
         self.state_changed.emit(ConnectionState.DISCONNECTED, "Desconectado")
 
+    def _attempt_stream_backend(
+        self,
+        backend_name: str,
+        runner_fn: Callable[[str, str], bool],
+        candidate_urls: List[str],
+        transports: List[str],
+        user_transport: str,
+    ) -> bool:
+        """Executa tentativas de conexão de fluxo para URLs candidatas e transportes configurados."""
+        for stream_url in candidate_urls:
+            if not self._is_running:
+                return False
+
+            if stream_url.startswith("demo://"):
+                self.stats.transport_mode = TransportMode.DEMO.value
+                self._run_test_pattern_stream()
+                return True
+
+            for trans in transports:
+                if not self._is_running:
+                    return False
+
+                if backend_name == "PyAV":
+                    if user_transport == "auto":
+                        trans_label = (
+                            TransportMode.AUTO_UDP.value
+                            if trans == "udp"
+                            else TransportMode.AUTO_TCP_FALLBACK.value
+                        )
+                    else:
+                        trans_label = (
+                            TransportMode.UDP.value
+                            if trans == "udp"
+                            else TransportMode.TCP.value
+                        )
+                else:
+                    trans_label = (
+                        TransportMode.OPENCV_UDP.value
+                        if trans == "udp"
+                        else TransportMode.OPENCV_TCP.value
+                    )
+
+                self.stats.transport_mode = trans_label
+                logger.info(
+                    f"Conectando RTSP {backend_name} ({self.camera.name}) via {trans_label}: {sanitize_rtsp_url(stream_url)}"
+                )
+
+                if runner_fn(stream_url, transport=trans):
+                    return True
+
+        return False
+
     def _run_pyav_stream(self, stream_url: str, transport: str = "udp") -> bool:
         """Consome o fluxo utilizando PyAV (libav / FFmpeg) com suporte nativo a H.265 (HEVC) e UDP."""
         container_options = {
@@ -272,8 +318,17 @@ class StreamWorker(QThread):
 
             video_stream.thread_type = "AUTO"
             raw_codec = video_stream.codec_context.name.upper()
-            self.stats.codec = "H.265 / HEVC" if ("HEVC" in raw_codec or "265" in raw_codec) else raw_codec
-            self.stats.hw_accel_active = (self.hw_accel == "vaapi")
+            if "HEVC" in raw_codec or "265" in raw_codec:
+                self.stats.codec = VideoCodec.H265_HEVC.value
+            elif "264" in raw_codec or "AVC" in raw_codec:
+                self.stats.codec = VideoCodec.H264.value
+            elif "MJPEG" in raw_codec or "JPEG" in raw_codec:
+                self.stats.codec = VideoCodec.MJPEG.value
+            else:
+                self.stats.codec = raw_codec or VideoCodec.UNKNOWN.value
+
+            vaapi_ok = (self.hw_accel == "vaapi" and is_vaapi_supported())
+            self.stats.hw_accel_active = vaapi_ok
             self.state_changed.emit(ConnectionState.STREAMING, f"Ao Vivo ({self.stats.codec} {self.stats.transport_mode})")
 
             self._last_frame_ts = time.time()
@@ -330,12 +385,21 @@ class StreamWorker(QThread):
             if not cap.isOpened():
                 return False
 
+            if hasattr(cv2, "CAP_PROP_HW_ACCELERATION") and hasattr(cv2, "VIDEO_ACCELERATION_VAAPI"):
+                if self.hw_accel == "vaapi" and is_vaapi_supported():
+                    cap.set(cv2.CAP_PROP_HW_ACCELERATION, cv2.VIDEO_ACCELERATION_VAAPI)
+                    self.stats.hw_accel_active = (cap.get(cv2.CAP_PROP_HW_ACCELERATION) == cv2.VIDEO_ACCELERATION_VAAPI)
+                else:
+                    self.stats.hw_accel_active = False
+            else:
+                self.stats.hw_accel_active = (self.hw_accel == "vaapi" and is_vaapi_supported())
+
             mfg = (self.camera.manufacturer or "").lower()
             url_lower = stream_url.lower()
             if "hevc" in url_lower or "265" in url_lower or "yoosee" in mfg:
-                self.stats.codec = "H.265 / HEVC"
+                self.stats.codec = VideoCodec.H265_HEVC.value
             else:
-                self.stats.codec = "H.264"
+                self.stats.codec = VideoCodec.H264.value
 
             self.state_changed.emit(ConnectionState.STREAMING, f"Ao Vivo (OpenCV {self.stats.transport_mode})")
             self._last_frame_ts = time.time()

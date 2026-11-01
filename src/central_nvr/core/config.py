@@ -18,44 +18,60 @@ KEYRING_SERVICE_NAME = "central-nvr"
 logger = logging.getLogger(__name__)
 
 
-def get_keyring_password(camera_id: str) -> Optional[str]:
-    """Recupera a senha da câmera do cofre do sistema (Keyring), se disponível."""
-    if not HAS_KEYRING or not camera_id:
+def _safe_keyring_get(username: str) -> Optional[str]:
+    """Recupera um segredo do cofre do sistema (Keyring) de forma resiliente."""
+    if not HAS_KEYRING or not username:
         return None
     try:
-        return keyring.get_password(KEYRING_SERVICE_NAME, f"camera_{camera_id}")
+        return keyring.get_password(KEYRING_SERVICE_NAME, username)
     except Exception as e:
-        logger.debug(f"Falha ao obter senha do keyring para camera {camera_id}: {e}")
+        logger.debug(f"Falha ao obter '{username}' do keyring: {e}")
         return None
 
 
-def set_keyring_password(camera_id: str, password: str) -> bool:
-    """Armazena a senha da câmera no cofre do sistema (Keyring), se disponível."""
-    if not HAS_KEYRING or not camera_id:
+def _safe_keyring_set(username: str, secret: str) -> bool:
+    """Armazena ou remove um segredo no cofre do sistema (Keyring)."""
+    if not HAS_KEYRING or not username:
         return False
     try:
-        if password:
-            keyring.set_password(KEYRING_SERVICE_NAME, f"camera_{camera_id}", password)
+        if secret:
+            keyring.set_password(KEYRING_SERVICE_NAME, username, secret)
         else:
             try:
-                keyring.delete_password(KEYRING_SERVICE_NAME, f"camera_{camera_id}")
+                keyring.delete_password(KEYRING_SERVICE_NAME, username)
             except Exception:
                 pass
         return True
     except Exception as e:
-        logger.debug(f"Falha ao salvar senha no keyring para camera {camera_id}: {e}")
+        logger.debug(f"Falha ao persistir '{username}' no keyring: {e}")
         return False
+
+
+def _safe_keyring_delete(username: str) -> bool:
+    """Remove um segredo do cofre do sistema de forma segura."""
+    if not HAS_KEYRING or not username:
+        return False
+    try:
+        keyring.delete_password(KEYRING_SERVICE_NAME, username)
+        return True
+    except Exception:
+        return False
+
+
+def get_keyring_password(camera_id: str) -> Optional[str]:
+    """Recupera a senha da câmera do cofre do sistema (Keyring), se disponível."""
+    return _safe_keyring_get(f"camera_{camera_id}") if camera_id else None
+
+
+def set_keyring_password(camera_id: str, password: str) -> bool:
+    """Armazena a senha da câmera no cofre do sistema (Keyring), se disponível."""
+    return _safe_keyring_set(f"camera_{camera_id}", password) if camera_id else False
 
 
 def delete_keyring_password(camera_id: str) -> bool:
     """Remove a senha da câmera do cofre do sistema."""
-    if not HAS_KEYRING or not camera_id:
-        return False
-    try:
-        keyring.delete_password(KEYRING_SERVICE_NAME, f"camera_{camera_id}")
-        return True
-    except Exception:
-        return False
+    return _safe_keyring_delete(f"camera_{camera_id}") if camera_id else False
+
 
 def is_keyring_available() -> bool:
     """Verifica se o subsistema de keyring do sistema operacional está operacional."""
@@ -76,31 +92,12 @@ def is_keyring_available() -> bool:
 
 def get_keyring_pat() -> Optional[str]:
     """Recupera o GitHub Personal Access Token (PAT) do cofre do sistema."""
-    if not HAS_KEYRING:
-        return None
-    try:
-        return keyring.get_password(KEYRING_SERVICE_NAME, "github_token")
-    except Exception as e:
-        logger.debug(f"Falha ao obter github_token do keyring: {e}")
-        return None
+    return _safe_keyring_get("github_token")
 
 
 def set_keyring_pat(token: str) -> bool:
     """Armazena ou remove o GitHub Personal Access Token (PAT) no cofre do sistema."""
-    if not HAS_KEYRING:
-        return False
-    try:
-        if token:
-            keyring.set_password(KEYRING_SERVICE_NAME, "github_token", token)
-        else:
-            try:
-                keyring.delete_password(KEYRING_SERVICE_NAME, "github_token")
-            except Exception:
-                pass
-        return True
-    except Exception as e:
-        logger.debug(f"Falha ao salvar github_token no keyring: {e}")
-        return False
+    return _safe_keyring_set("github_token", token)
 
 
 
