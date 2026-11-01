@@ -9,9 +9,31 @@ set -e
 APPDIR="$(dirname "$(readlink -f "$0")")"
 export APPDIR
 
-# Configurar caminhos de busca de binários e bibliotecas da aplicação
+# Configurar diretório base do Python embutido
+if [ -f "${APPDIR}/usr/bin/python3" ]; then
+    export PYTHONHOME="${APPDIR}/usr"
+fi
+
+# Configurar caminhos de busca de binários
 export PATH="${APPDIR}/usr/bin:${APPDIR}/bin:${PATH}"
-export LD_LIBRARY_PATH="${APPDIR}/usr/lib:${APPDIR}/usr/lib64:${APPDIR}/lib:${APPDIR}/lib64:${LD_LIBRARY_PATH}"
+
+# Configurar bibliotecas dinâmicas do sistema e bibliotecas embutidas dos wheels Python
+SITE_PACKAGES="${APPDIR}/usr/lib/python3.12/site-packages"
+[ ! -d "$SITE_PACKAGES" ] && SITE_PACKAGES="${APPDIR}/usr/lib/python3/site-packages"
+
+EXTRA_LIBS=""
+for libdir in \
+    "${SITE_PACKAGES}/av.libs" \
+    "${SITE_PACKAGES}/opencv_python_headless.libs" \
+    "${SITE_PACKAGES}/numpy.libs" \
+    "${SITE_PACKAGES}/pillow.libs" \
+    "${SITE_PACKAGES}/PySide6/Qt/lib"; do
+    if [ -d "$libdir" ]; then
+        EXTRA_LIBS="${libdir}:${EXTRA_LIBS}"
+    fi
+done
+
+export LD_LIBRARY_PATH="${APPDIR}/usr/lib:${APPDIR}/usr/lib64:${APPDIR}/lib:${APPDIR}/lib64:${EXTRA_LIBS}${LD_LIBRARY_PATH}"
 export XDG_DATA_DIRS="${APPDIR}/usr/share:${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
 
 # Host Delegation: Garantir acesso aos drivers de aceleração VA-API da máquina hospedeira
@@ -20,13 +42,13 @@ if [ -z "$LIBVA_DRIVERS_PATH" ]; then
     export LIBVA_DRIVERS_PATH="/usr/lib64/dri:/usr/lib/x86_64-linux-gnu/dri:/usr/lib/dri"
 fi
 
-# Configurar caminhos do interpretador Python e bibliotecas PySide6/PyAV embutidas
-if [ -d "${APPDIR}/usr/lib/python3/site-packages" ]; then
-    export PYTHONPATH="${APPDIR}/usr/lib/python3/site-packages:${APPDIR}/usr/src:${PYTHONPATH}"
-fi
+# Configurar caminhos do interpretador Python e código da aplicação
+export PYTHONPATH="${APPDIR}/usr/src:${SITE_PACKAGES}:${PYTHONPATH}"
 
 # Configurar plugins Qt6 (plataformas xcb e wayland)
-if [ -d "${APPDIR}/usr/plugins" ]; then
+if [ -d "${SITE_PACKAGES}/PySide6/Qt/plugins" ]; then
+    export QT_PLUGIN_PATH="${SITE_PACKAGES}/PySide6/Qt/plugins:${QT_PLUGIN_PATH}"
+elif [ -d "${APPDIR}/usr/plugins" ]; then
     export QT_PLUGIN_PATH="${APPDIR}/usr/plugins:${QT_PLUGIN_PATH}"
 fi
 
