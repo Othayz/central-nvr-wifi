@@ -136,7 +136,8 @@ if [ -x "${TOOL_CMD}" ] || command -v "${TOOL_CMD}" &> /dev/null; then
     # 9. Gerar Checksums SHA-256
     cd "${DIST_DIR}"
     sha256sum "$(basename "${OUTPUT_APPIMAGE}")" > "${OUTPUT_APPIMAGE}.sha256"
-    sha256sum Central_NVR_WiFi-*.AppImage > sha256sums.txt 2>/dev/null || true
+    sha256sum Central_NVR_WiFi-*.AppImage > sha256sums.txt
+    [ -s sha256sums.txt ] || { echo "===> [ERRO] sha256sums.txt vazio."; exit 1; }
     
     echo "============================================================================="
     echo "===> AppImage gerado com sucesso: ${OUTPUT_APPIMAGE}"

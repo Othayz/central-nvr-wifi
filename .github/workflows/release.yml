@@ -3,7 +3,7 @@ name: Build and Publish Release
 on:
   push:
     tags:
-      - 'v*'
+      - 'v[0-9]*'
 
 permissions:
   contents: write
@@ -27,6 +27,20 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Verify tag matches project version
+        run: |
+          TAG_VER="${GITHUB_REF_NAME#v}"
+          PY_VER=$(grep -m1 'version = ' pyproject.toml | cut -d '"' -f 2)
+          PKG_VER=$(grep -m1 '__version__' src/central_nvr/__init__.py | cut -d '"' -f 2)
+          if [ "$TAG_VER" != "$PY_VER" ] || [ "$TAG_VER" != "$PKG_VER" ]; then
+            echo "Tag ($TAG_VER) diverge de pyproject ($PY_VER) / __version__ ($PKG_VER)"; exit 1
+          fi
+
+      - name: Run Tests
+        run: |
+          pip install pytest
+          python -m pytest tests/test_updater.py -q
+
       - name: Build Universal AppImage
         run: |
           chmod +x packaging/build_appimage.sh
@@ -39,6 +53,12 @@ jobs:
           mkdir -p dist
           tar --exclude='./.git' --exclude='./build' --exclude='./dist' --exclude='./venv' -czf "dist/${ARCHIVE_NAME}" .
           ls -la dist/
+
+      - name: Verify Checksums
+        run: |
+          cd dist
+          test -s sha256sums.txt
+          sha256sum -c sha256sums.txt
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2

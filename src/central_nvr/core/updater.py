@@ -27,6 +27,8 @@ from central_nvr import __version__
 
 logger = logging.getLogger(__name__)
 
+_SHA256_RE = re.compile(r"^[a-fA-F0-9]{64}$")
+
 DEFAULT_GITHUB_REPO = "Othayz/central-nvr-wifi"
 
 
@@ -164,7 +166,7 @@ def find_best_asset_for_system(assets: List[ReleaseAsset]) -> Optional[ReleaseAs
         if asset.name.lower().endswith((".tar.gz", ".tgz", ".zip")):
             return asset
 
-    return assets[0]
+    return None
 
 
 def fetch_latest_release(
@@ -327,6 +329,7 @@ def download_asset(
     token: Optional[str] = None,
     progress_callback: Optional[Callable[[int, int, float], None]] = None,
     cancel_event: Optional[threading.Event] = None,
+    expected_size: Optional[int] = None,
 ) -> bool:
     """
     Baixa um asset via stream HTTP com notificação de progresso (downloaded_bytes, total_bytes, speed_kBps).
@@ -346,13 +349,14 @@ def download_asset(
         downloaded = 0
         start_time = time.time()
 
-        with open(dest_path, "wb") as f:
+        part_path = dest_path + ".part"
+        with open(part_path, "wb") as f:
             for chunk in response.iter_content(chunk_size=65536):
                 if cancel_event and cancel_event.is_set():
                     logger.info("Download cancelado pelo usuário.")
                     f.close()
-                    if os.path.exists(dest_path):
-                        os.remove(dest_path)
+                    if os.path.exists(part_path):
+                        os.remove(part_path)
                     return False
 
                 if chunk:
@@ -364,6 +368,11 @@ def download_asset(
                     if progress_callback:
                         progress_callback(downloaded, total_size, speed_kbps)
 
+        expected = expected_size if expected_size else total_size
+        if expected and downloaded != expected:
+            raise IOError(f"Tamanho incorreto: recebido {downloaded} B, esperado {expected} B.")
+
+        os.replace(part_path, dest_path)
         try:
             os.chmod(dest_path, 0o600)
         except (OSError, PermissionError):
@@ -373,11 +382,12 @@ def download_asset(
 
     except Exception as e:
         logger.error(f"Erro ao baixar arquivo {url}: {e}")
-        if os.path.exists(dest_path):
-            try:
-                os.remove(dest_path)
-            except Exception:
-                pass
+        for leftover in (dest_path + ".part", dest_path):
+            if os.path.exists(leftover):
+                try:
+                    os.remove(leftover)
+                except Exception:
+                    pass
         return False
 
 
@@ -473,9 +483,6 @@ def get_expected_sha256_for_asset(
                 m = re.search(r"([a-fA-F0-9]{64})", line)
                 if m:
                     return m.group(1).lower()
-        all_hashes = re.findall(r"([a-fA-F0-9]{64})", release_info.body)
-        if len(all_hashes) == 1:
-            return all_hashes[0].lower()
 
     return None
 
@@ -555,6 +562,7 @@ StartupWMClass=central-nvr
 def install_downloaded_package(
     file_path: str,
     expected_sha256: Optional[str] = None,
+    allow_unverified: bool = False,
 ) -> Tuple[bool, str]:
     """
     Instala ou atualiza o binário portátil AppImage com verificação de integridade SHA-256 (SEC-07).
@@ -564,7 +572,10 @@ def install_downloaded_package(
     if not os.path.exists(file_path):
         return False, "Arquivo de instalação não encontrado no disco."
 
-    # SEC-07: Se um hash SHA-256 esperado foi especificado, validar rigorosamente
+    # SEC-07: checksum SHA-256 obrigatório; sem ele a instalação é bloqueada
+    if not allow_unverified and not (expected_sha256 and _SHA256_RE.match(expected_sha256.strip())):
+        return False, "Release sem checksum SHA-256 válido: instalação bloqueada por segurança."
+
     if expected_sha256:
         if not verify_file_sha256(file_path, expected_sha256):
             actual_hash = compute_file_sha256(file_path)
@@ -583,9 +594,18 @@ def install_downloaded_package(
             if running_appimage and os.path.exists(running_appimage):
                 target_path = Path(running_appimage).resolve()
                 temp_target = target_path.with_name(f"{target_path.name}.tmp.{os.getpid()}")
-                shutil.copy2(file_obj, temp_target)
-                os.chmod(temp_target, 0o755)
-                os.replace(temp_target, target_path)
+                backup_path = target_path.with_name(f"{target_path.name}.bak")
+                try:
+                    shutil.copy2(file_obj, temp_target)
+                    os.chmod(temp_target, 0o755)
+                    shutil.copy2(target_path, backup_path)
+                    os.replace(temp_target, target_path)
+                except Exception:
+                    if temp_target.exists():
+                        temp_target.unlink()
+                    if backup_path.exists() and not target_path.exists():
+                        os.replace(backup_path, target_path)
+                    raise
                 return True, f"Central NVR WiFi atualizada com sucesso em {target_path}. Reinicie o aplicativo para usar a nova versão."
 
             # Caso contrário, instalar no diretório de binários do usuário (~/.local/bin)
@@ -615,9 +635,9 @@ def install_downloaded_package(
         return False, str(e)
 
 
-def install_package_to_user_local(file_path: str) -> Tuple[bool, str]:
+def install_package_to_user_local(file_path: str, expected_sha256: Optional[str] = None) -> Tuple[bool, str]:
     """Alias para install_downloaded_package, mantendo compatibilidade de API."""
-    return install_downloaded_package(file_path)
+    return install_downloaded_package(file_path, expected_sha256=expected_sha256)
 
 
 # =============================================================================
@@ -683,8 +703,10 @@ class AssetDownloadWorker(QThread):
         destination_path: str,
         token: Optional[str] = None,
         parent: Optional[QObject] = None,
+        expected_size: Optional[int] = None,
     ):
         super().__init__(parent)
+        self.expected_size = expected_size
         self.download_url = download_url
         self.destination_path = destination_path
         self.token = token
@@ -704,6 +726,7 @@ class AssetDownloadWorker(QThread):
             token=self.token,
             progress_callback=_on_progress,
             cancel_event=self._cancel_event,
+            expected_size=self.expected_size,
         )
 
         if self._cancel_event.is_set():
@@ -712,3 +735,34 @@ class AssetDownloadWorker(QThread):
             self.download_finished.emit(self.destination_path)
         else:
             self.download_failed.emit("Falha durante a transferência do pacote de atualização.")
+
+
+def resolve_checksum_or_none(
+    release_info: ReleaseInfo,
+    asset_name: str,
+    token: Optional[str] = None,
+) -> Optional[str]:
+    """Retorna o SHA-256 válido do asset ou None se ausente/inválido."""
+    h = get_expected_sha256_for_asset(release_info, asset_name, token=token)
+    if h and _SHA256_RE.match(h.strip()):
+        return h.strip().lower()
+    return None
+
+
+class ChecksumFetchWorker(QThread):
+    """Busca o checksum SHA-256 em segundo plano antes de iniciar o download."""
+    checksum_ready = Signal(str)
+    checksum_missing = Signal()
+
+    def __init__(self, release_info, asset_name: str, token: Optional[str] = None, parent: Optional[QObject] = None):
+        super().__init__(parent)
+        self.release_info = release_info
+        self.asset_name = asset_name
+        self.token = token
+
+    def run(self):
+        h = resolve_checksum_or_none(self.release_info, self.asset_name, self.token)
+        if h:
+            self.checksum_ready.emit(h)
+        else:
+            self.checksum_missing.emit()

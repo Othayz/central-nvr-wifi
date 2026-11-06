@@ -257,7 +257,7 @@ class TestUpdaterWorkers(unittest.TestCase):
             new_img.write_text("new app image v2")
 
             with patch.dict(os.environ, {"APPIMAGE": str(running_img)}):
-                success, msg = install_downloaded_package(str(new_img))
+                success, msg = install_downloaded_package(str(new_img), allow_unverified=True)
                 self.assertTrue(success)
                 self.assertIn("atualizada com sucesso", msg)
                 self.assertEqual(running_img.read_text(), "new app image v2")
@@ -274,7 +274,7 @@ class TestUpdaterWorkers(unittest.TestCase):
 
             with patch.dict(os.environ, {}, clear=True):
                 with patch("pathlib.Path.home", return_value=fake_home):
-                    success, msg = install_downloaded_package(str(new_img))
+                    success, msg = install_downloaded_package(str(new_img), allow_unverified=True)
                     self.assertTrue(success)
                     installed_path = fake_home / ".local" / "bin" / "central-nvr.AppImage"
                     self.assertTrue(installed_path.exists())
@@ -290,9 +290,49 @@ class TestUpdaterWorkers(unittest.TestCase):
         with patch("os.path.exists", return_value=True):
             with patch("central_nvr.core.updater.verify_file_sha256", return_value=False):
                 with patch("central_nvr.core.updater.compute_file_sha256", return_value="badhash"):
-                    success, msg = install_downloaded_package("/cache/pkg.AppImage", expected_sha256="expectedhash")
+                    success, msg = install_downloaded_package("/cache/pkg.AppImage", expected_sha256="a"*64)
                     self.assertFalse(success)
                     self.assertIn("Falha de integridade SHA-256", msg)
+
+    def test_install_blocked_without_checksum(self):
+        from central_nvr.core.updater import install_downloaded_package
+        with tempfile.TemporaryDirectory() as tmpdir:
+            img = Path(tmpdir) / "x.AppImage"
+            img.write_text("data")
+            for bad in (None, "", "abc"):
+                ok, msg = install_downloaded_package(str(img), expected_sha256=bad)
+                self.assertFalse(ok)
+                self.assertIn("bloqueada", msg)
+
+    def test_install_creates_backup_and_verifies_hash(self):
+        from central_nvr.core.updater import install_downloaded_package, compute_file_sha256
+        with tempfile.TemporaryDirectory() as tmpdir:
+            running = Path(tmpdir) / "running.AppImage"
+            running.write_text("old")
+            new = Path(tmpdir) / "new.AppImage"
+            new.write_text("new")
+            with patch.dict(os.environ, {"APPIMAGE": str(running)}):
+                ok, _ = install_downloaded_package(str(new), expected_sha256=compute_file_sha256(str(new)))
+            self.assertTrue(ok)
+            self.assertEqual(running.read_text(), "new")
+            self.assertEqual((Path(tmpdir) / "running.AppImage.bak").read_text(), "old")
+
+    def test_download_size_mismatch_cleans_part(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            dest = os.path.join(tmpdir, "a.AppImage")
+            resp = MagicMock()
+            resp.headers = {"content-length": "4"}
+            resp.raise_for_status = MagicMock()
+            resp.iter_content.return_value = [b"abcd"]
+            with patch("central_nvr.core.updater.requests.get", return_value=resp):
+                self.assertFalse(download_asset("http://x/a", dest, expected_size=99))
+            self.assertEqual(os.listdir(tmpdir), [])
+            with patch("central_nvr.core.updater.requests.get", return_value=resp):
+                self.assertTrue(download_asset("http://x/a", dest, expected_size=4))
+            self.assertEqual(os.listdir(tmpdir), ["a.AppImage"])
+
+    def test_find_best_asset_none_without_appimage(self):
+        self.assertIsNone(find_best_asset_for_system([ReleaseAsset(name="x.deb", size=1, download_url="u")]))
 
     def test_tar_slip_and_symlink_prevention(self):
         """Valida que _extract_tar_members_to_local bloqueia Tar Slip e links maliciosos (SEC-03)."""
@@ -374,7 +414,7 @@ class TestUpdaterWorkers(unittest.TestCase):
             fake_appimage.write_text("dummy binary")
             with patch("pathlib.Path.home", return_value=fake_home):
                 with patch.dict(os.environ, {}, clear=True):
-                    success, msg = install_downloaded_package(str(fake_appimage))
+                    success, msg = install_downloaded_package(str(fake_appimage), allow_unverified=True)
                     self.assertTrue(success)
                     self.assertTrue((fake_home / ".local" / "bin" / "central-nvr.AppImage").exists())
 

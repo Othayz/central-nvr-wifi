@@ -30,6 +30,7 @@ from central_nvr import __version__
 from central_nvr.core.config import get_data_dir
 from central_nvr.core.updater import (
     AssetDownloadWorker,
+    ChecksumFetchWorker,
     DEFAULT_GITHUB_REPO,
     ReleaseAsset,
     ReleaseInfo,
@@ -256,6 +257,33 @@ class StartupUpdateDialog(QDialog):
             return
 
         self.status_container.show()
+        self.lbl_status.setText("Verificando checksum SHA-256...")
+        self.lbl_status.setStyleSheet("font-size: 12px; font-weight: 600; color: #0284C7;")
+        self.progress_bar.setRange(0, 0)
+        self.btn_skip.setEnabled(False)
+        self.btn_update.setEnabled(False)
+        self.btn_update.setText("Verificando...")
+
+        self.checksum_worker = ChecksumFetchWorker(self.release_info, self.best_asset.name, self.token, parent=self)
+        self.checksum_worker.checksum_ready.connect(self._on_checksum_ready)
+        self.checksum_worker.checksum_missing.connect(self._on_checksum_missing)
+        self.checksum_worker.start()
+
+    def _on_checksum_missing(self):
+        self.progress_bar.setRange(0, 100)
+        self.btn_skip.setEnabled(True)
+        self.btn_update.setEnabled(True)
+        self.btn_update.setText("Atualizar")
+        self.lbl_status.setText("Release sem checksum SHA-256: download bloqueado.")
+        self.lbl_status.setStyleSheet("font-size: 12px; font-weight: 700; color: #EF4444;")
+        self._block_missing_checksum()
+
+    def _on_checksum_ready(self, sha: str):
+        self.expected_sha256 = sha
+        self.progress_bar.setRange(0, 100)
+        self._begin_download()
+
+    def _begin_download(self):
         self.lbl_status.setText(f"Baixando {self.best_asset.name}...")
         self.lbl_status.setStyleSheet("font-size: 12px; font-weight: 600; color: #0284C7;")
         self.progress_bar.setRange(0, 100)
@@ -273,6 +301,7 @@ class StartupUpdateDialog(QDialog):
             download_url=self.best_asset.download_url,
             destination_path=dest_file,
             token=self.token,
+            expected_size=self.best_asset.size,
             parent=self,
         )
         self.download_worker.progress.connect(self._on_download_progress)
@@ -331,10 +360,10 @@ class StartupUpdateDialog(QDialog):
             QMessageBox.warning(self, "Erro", "Arquivo de atualização não encontrado.")
             return
 
-        from central_nvr.core.updater import get_expected_sha256_for_asset
-        expected_sha = None
-        if self.release_info and self.best_asset:
-            expected_sha = get_expected_sha256_for_asset(self.release_info, self.best_asset.name, token=self.token)
+        expected_sha = getattr(self, "expected_sha256", None)
+        if not expected_sha:
+            self._block_missing_checksum()
+            return
 
         success, msg = install_downloaded_package(self.downloaded_file_path, expected_sha256=expected_sha)
         if success:
@@ -350,6 +379,21 @@ class StartupUpdateDialog(QDialog):
 
 
 
+    def _block_missing_checksum(self):
+        QMessageBox.critical(
+            self,
+            "Instalação bloqueada",
+            "Esta release não possui checksum SHA-256 (sha256sums.txt). "
+            "Por segurança a instalação automática foi bloqueada.\n\n"
+            "Abra a página da release para baixar manualmente.",
+        )
+        self._open_release_page()
+
+    def _open_release_page(self):
+        url = self.release_info.html_url if self.release_info else ""
+        if url:
+            QDesktopServices.openUrl(QUrl(url))
+
     def closeEvent(self, event):
         self._cleanup_workers()
         super().closeEvent(event)
@@ -359,6 +403,9 @@ class StartupUpdateDialog(QDialog):
         super().reject()
 
     def _cleanup_workers(self):
+        cw = getattr(self, "checksum_worker", None)
+        if cw and cw.isRunning():
+            cw.wait(500)
         if hasattr(self, "check_worker") and self.check_worker and self.check_worker.isRunning():
             try:
                 self.check_worker.quit()
@@ -550,7 +597,31 @@ class UpdateDialog(QDialog):
             return
 
         self.status_box.show()
+        self.progress_bar.setRange(0, 0)
+        self.lbl_status.setText("Verificando checksum SHA-256...")
+        self.lbl_status.setStyleSheet("font-size: 12px; font-weight: 600; color: #0284C7;")
+        self.btn_action.setEnabled(False)
+        self.btn_action.setText("Verificando...")
+
+        self.checksum_worker = ChecksumFetchWorker(self.release_info, self.best_asset.name, self.token, parent=self)
+        self.checksum_worker.checksum_ready.connect(self._on_checksum_ready)
+        self.checksum_worker.checksum_missing.connect(self._on_checksum_missing)
+        self.checksum_worker.start()
+
+    def _on_checksum_missing(self):
         self.progress_bar.setRange(0, 100)
+        self.lbl_status.setText("Release sem checksum SHA-256: download bloqueado.")
+        self.lbl_status.setStyleSheet("font-size: 12px; font-weight: 700; color: #EF4444;")
+        self.btn_action.setEnabled(True)
+        self.btn_action.setText("Abrir página da release")
+        self._block_missing_checksum()
+
+    def _on_checksum_ready(self, sha: str):
+        self.expected_sha256 = sha
+        self.progress_bar.setRange(0, 100)
+        self._begin_download()
+
+    def _begin_download(self):
         self.progress_bar.setValue(0)
         self.lbl_status.setText(f"Iniciando download de {self.best_asset.name}...")
         self.lbl_status.setStyleSheet("font-size: 12px; font-weight: 600; color: #0284C7;")
@@ -564,6 +635,8 @@ class UpdateDialog(QDialog):
         self.download_worker = AssetDownloadWorker(
             download_url=self.best_asset.download_url,
             destination_path=dest_file,
+            token=self.token,
+            expected_size=self.best_asset.size,
             parent=self,
         )
         self.download_worker.progress.connect(self._on_download_progress)
@@ -597,9 +670,23 @@ class UpdateDialog(QDialog):
         self.btn_action.setEnabled(True)
         self.btn_action.setText("Tentar Novamente")
 
+    def _block_missing_checksum(self):
+        QMessageBox.critical(
+            self,
+            "Instalação bloqueada",
+            "Esta release não possui checksum SHA-256 (sha256sums.txt). "
+            "Por segurança a instalação automática foi bloqueada.\n\n"
+            "Abra a página da release para baixar manualmente.",
+        )
+        self._open_github()
+
     def _install_package(self):
         if self.downloaded_file_path and os.path.exists(self.downloaded_file_path):
-            success, msg = install_downloaded_package(self.downloaded_file_path)
+            expected_sha = getattr(self, "expected_sha256", None)
+            if not expected_sha:
+                self._block_missing_checksum()
+                return
+            success, msg = install_downloaded_package(self.downloaded_file_path, expected_sha256=expected_sha)
             if success:
                 QMessageBox.information(self, "Instalação", f"{msg}\n\nO aplicativo deve ser reiniciado após a instalação.")
                 self.accept()
@@ -615,6 +702,9 @@ class UpdateDialog(QDialog):
         super().reject()
 
     def _cleanup_workers(self):
+        cw = getattr(self, "checksum_worker", None)
+        if cw and cw.isRunning():
+            cw.wait(500)
         if hasattr(self, "check_worker") and self.check_worker and self.check_worker.isRunning():
             try:
                 self.check_worker.quit()
