@@ -11,12 +11,12 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-APPDATA_PATH = PROJECT_ROOT / "packaging" / "central-nvr.appdata.xml"
+APPDATA_PATH = PROJECT_ROOT / "packaging" / "io.github.othayz.central_nvr.appdata.xml"
 
 
 class AppStreamMetadataTest(unittest.TestCase):
     def test_appdata_file_exists(self):
-        self.assertTrue(APPDATA_PATH.exists(), "packaging/central-nvr.appdata.xml deve existir")
+        self.assertTrue(APPDATA_PATH.exists(), "packaging/io.github.othayz.central_nvr.appdata.xml deve existir")
 
     def test_appdata_xml_structure(self):
         content = APPDATA_PATH.read_text(encoding="utf-8")

@@ -98,11 +98,11 @@ cp "${PROJECT_ROOT}/packaging/icons/central-nvr-256x256.png" "${APPDIR}/usr/shar
 cp "${PROJECT_ROOT}/packaging/icons/central-nvr.svg" "${APPDIR}/usr/share/icons/hicolor/scalable/apps/central-nvr.svg"
 
 echo "===> Instalando metadados AppStream..."
+rm -rf "${APPDIR}/usr/share/metainfo"
 mkdir -p "${APPDIR}/usr/share/metainfo"
 TODAY=$(date +%Y-%m-%d)
 sed -e "s/@VERSION@/${VERSION}/g" -e "s/@DATE@/${TODAY}/g" \
-    "${PROJECT_ROOT}/packaging/central-nvr.appdata.xml" > "${APPDIR}/usr/share/metainfo/io.github.othayz.central_nvr.appdata.xml"
-cp "${APPDIR}/usr/share/metainfo/io.github.othayz.central_nvr.appdata.xml" "${APPDIR}/usr/share/metainfo/central-nvr.appdata.xml"
+    "${PROJECT_ROOT}/packaging/io.github.othayz.central_nvr.appdata.xml" > "${APPDIR}/usr/share/metainfo/io.github.othayz.central_nvr.appdata.xml"
 
 # 5. Copiar launcher AppRun
 echo "===> Instalando launcher portátil AppRun (Host Delegation para VA-API)..."
