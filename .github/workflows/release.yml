@@ -4,6 +4,7 @@ on:
   push:
     tags:
       - 'v[0-9]*'
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -28,6 +29,7 @@ jobs:
           pip install -r requirements.txt
 
       - name: Verify tag matches project version
+        if: startsWith(github.ref, 'refs/tags/')
         run: |
           TAG_VER="${GITHUB_REF_NAME#v}"
           PY_VER=$(grep -m1 'version = ' pyproject.toml | cut -d '"' -f 2)
@@ -55,7 +57,11 @@ jobs:
 
       - name: Create Source Archive (.tar.gz)
         run: |
-          TAG_NAME="${GITHUB_REF#refs/tags/}"
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            TAG_NAME="${GITHUB_REF#refs/tags/}"
+          else
+            TAG_NAME="v$(grep -m1 'version = ' pyproject.toml | cut -d '"' -f 2)"
+          fi
           ARCHIVE_NAME="central-nvr-${TAG_NAME}.tar.gz"
           mkdir -p dist
           tar --exclude='./.git' --exclude='./build' --exclude='./dist' --exclude='./venv' -czf "dist/${ARCHIVE_NAME}" .
@@ -67,7 +73,13 @@ jobs:
           test -s sha256sums.txt
           sha256sum -c sha256sums.txt
 
+      - name: Inspect GLIBC requirements
+        run: |
+          echo "=== Dependência máxima de GLIBC encontrada nos binários gerados ==="
+          find build/ -type f -executable -exec strings {} + 2>/dev/null | grep -E '^GLIBC_[0-9]+\.[0-9]+' | sort -V | tail -n 10 || true
+
       - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v3
         with:
           generate_release_notes: true
@@ -78,3 +90,10 @@ jobs:
             dist/sha256sums.txt
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload Build Artifacts (Dry Run)
+        if: "!startsWith(github.ref, 'refs/tags/')"
+        uses: actions/upload-artifact@v7
+        with:
+          name: build-dist
+          path: dist/
