@@ -21,7 +21,7 @@
       <li>Atualizações atômicas e seguras com verificação de integridade SHA-256</li>
     </ul>
   </description>
-  <launchable type="desktop-id">central-nvr.desktop</launchable>
+  <launchable type="desktop-id">io.github.othayz.central_nvr.desktop</launchable>
   <url type="homepage">https://github.com/Othayz/central-nvr-wifi</url>
   <url type="bugtracker">https://github.com/Othayz/central-nvr-wifi/issues</url>
   <developer id="io.github.othayz">

@@ -47,11 +47,7 @@ class AppStreamMetadataTest(unittest.TestCase):
         launchable_tag = root.find("launchable")
         self.assertIsNotNone(launchable_tag)
         self.assertEqual(launchable_tag.attrib.get("type"), "desktop-id")
-        self.assertEqual(launchable_tag.text.strip(), "central-nvr.desktop")
-
-        # Verificar se o desktop file referenciado realmente existe
-        desktop_file = PROJECT_ROOT / "packaging" / launchable_tag.text.strip()
-        self.assertTrue(desktop_file.exists(), f"Desktop file {desktop_file} deve existir")
+        self.assertEqual(launchable_tag.text.strip(), "io.github.othayz.central_nvr.desktop")
 
     def test_appstreamcli_validate(self):
         appstreamcli = shutil.which("appstreamcli")

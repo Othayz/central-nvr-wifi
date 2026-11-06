@@ -87,8 +87,9 @@ chmod +x "${APPDIR}/usr/bin/central-nvr"
 
 # 4. Copiar metadados de Desktop, Ícones e AppStream
 echo "===> Instalando ícones e arquivo de menu .desktop..."
-cp "${PROJECT_ROOT}/packaging/central-nvr.desktop" "${APPDIR}/central-nvr.desktop"
-cp "${PROJECT_ROOT}/packaging/central-nvr.desktop" "${APPDIR}/usr/share/applications/central-nvr.desktop"
+cp "${PROJECT_ROOT}/packaging/central-nvr.desktop" "${APPDIR}/io.github.othayz.central_nvr.desktop"
+cp "${PROJECT_ROOT}/packaging/central-nvr.desktop" "${APPDIR}/usr/share/applications/io.github.othayz.central_nvr.desktop"
+ln -sf "io.github.othayz.central_nvr.desktop" "${APPDIR}/usr/share/applications/central-nvr.desktop"
 
 cp "${PROJECT_ROOT}/packaging/icons/central-nvr.png" "${APPDIR}/central-nvr.png"
 cp "${PROJECT_ROOT}/packaging/icons/central-nvr.png" "${APPDIR}/.DirIcon"
@@ -100,8 +101,8 @@ echo "===> Instalando metadados AppStream..."
 mkdir -p "${APPDIR}/usr/share/metainfo"
 TODAY=$(date +%Y-%m-%d)
 sed -e "s/@VERSION@/${VERSION}/g" -e "s/@DATE@/${TODAY}/g" \
-    "${PROJECT_ROOT}/packaging/central-nvr.appdata.xml" > "${APPDIR}/usr/share/metainfo/central-nvr.appdata.xml"
-cp "${APPDIR}/usr/share/metainfo/central-nvr.appdata.xml" "${APPDIR}/usr/share/metainfo/io.github.othayz.central_nvr.metainfo.xml"
+    "${PROJECT_ROOT}/packaging/central-nvr.appdata.xml" > "${APPDIR}/usr/share/metainfo/io.github.othayz.central_nvr.appdata.xml"
+cp "${APPDIR}/usr/share/metainfo/io.github.othayz.central_nvr.appdata.xml" "${APPDIR}/usr/share/metainfo/central-nvr.appdata.xml"
 
 # 5. Copiar launcher AppRun
 echo "===> Instalando launcher portátil AppRun (Host Delegation para VA-API)..."
