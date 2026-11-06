@@ -108,6 +108,12 @@ class UpdateFlowTest(unittest.TestCase):
         self.assertIsNone(dlg.downloaded_file_path)
         self.assertEqual(running.read_text(), "old")
 
+        # Ao clicar no botão após o bloqueio, deve abrir a release no navegador e não entrar em loop
+        with patch("central_nvr.ui.update_dialog.QDesktopServices.openUrl") as mock_open:
+            dlg.btn_action.click()
+            mock_open.assert_called_once()
+            self.assertEqual(dlg.btn_action.text(), "Abrir página da release")
+
     def test_hash_mismatch_rejected(self):
         sums = f"{'0' * 64}  {APP_NAME}\n".encode()
         dlg, running, hits, _ = self._run({APP_NAME: PAYLOAD, "sha256sums.txt": sums})
@@ -124,6 +130,26 @@ class UpdateFlowTest(unittest.TestCase):
         self.assertIsNone(dlg.downloaded_file_path)
         leftovers = [f for _, _, fs in os.walk(tmp.name) for f in fs if f.endswith((".part", ".AppImage")) and f != "running.AppImage"]
         self.assertEqual(leftovers, [])
+
+    def test_startup_missing_checksum_redirects_browser(self):
+        from central_nvr.ui.update_dialog import StartupUpdateDialog
+        base = "http://fake.test"
+        assets = [ReleaseAsset(name=APP_NAME, size=len(PAYLOAD), download_url=f"{base}/{APP_NAME}")]
+        rel = ReleaseInfo(tag_name="v9.9.9", version="9.9.9", title="v9.9.9", body="", html_url="https://github.com/test", published_at="", assets=assets, is_newer=True)
+
+        with patch.object(StartupUpdateDialog, "_start_check", return_value=None):
+            dlg = StartupUpdateDialog(repo="test/test")
+            self.addCleanup(dlg._cleanup_workers)
+            dlg.release_info = rel
+            dlg.best_asset = assets[0]
+
+            with patch.object(QMessageBox, "critical", return_value=None), \
+                 patch("central_nvr.ui.update_dialog.QDesktopServices.openUrl") as mock_open:
+                dlg._on_checksum_missing()
+                self.assertEqual(dlg.btn_update.text(), "Abrir página da release")
+                mock_open.reset_mock()
+                dlg.btn_update.click()
+                mock_open.assert_called_once()
 
 
 if __name__ == "__main__":

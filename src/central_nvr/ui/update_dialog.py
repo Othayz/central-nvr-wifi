@@ -273,7 +273,12 @@ class StartupUpdateDialog(QDialog):
         self.progress_bar.setRange(0, 100)
         self.btn_skip.setEnabled(True)
         self.btn_update.setEnabled(True)
-        self.btn_update.setText("Atualizar")
+        self.btn_update.setText("Abrir página da release")
+        try:
+            self.btn_update.clicked.disconnect()
+        except Exception:
+            pass
+        self.btn_update.clicked.connect(self._open_release_page)
         self.lbl_status.setText("Release sem checksum SHA-256: download bloqueado.")
         self.lbl_status.setStyleSheet("font-size: 12px; font-weight: 700; color: #EF4444;")
         self._block_missing_checksum()
@@ -614,6 +619,11 @@ class UpdateDialog(QDialog):
         self.lbl_status.setStyleSheet("font-size: 12px; font-weight: 700; color: #EF4444;")
         self.btn_action.setEnabled(True)
         self.btn_action.setText("Abrir página da release")
+        try:
+            self.btn_action.clicked.disconnect()
+        except Exception:
+            pass
+        self.btn_action.clicked.connect(self._open_github)
         self._block_missing_checksum()
 
     def _on_checksum_ready(self, sha: str):
