@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.othayz.central_nvr</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <name>Central NVR WiFi</name>
+  <summary>Sistema Desktop Linux para Gerenciamento, Descoberta ONVIF e Streaming RTSP</summary>
+  <description>
+    <p>
+      Central NVR WiFi é uma solução completa para visualização e monitoramento de câmeras de segurança IP
+      em redes locais e Wi-Fi. O aplicativo oferece streaming de vídeo de baixa latência via RTSP com aceleração
+      de hardware (VA-API), descoberta automática de dispositivos compatíveis com ONVIF, controle motorizado PTZ
+      (Pan-Tilt-Zoom), detecção de movimento e gerenciamento de gravações.
+    </p>
+    <p>Funcionalidades principais:</p>
+    <ul>
+      <li>Descoberta automática de câmeras na rede via WS-Discovery (ONVIF)</li>
+      <li>Exibição simultânea de múltiplos canais em grade responsiva</li>
+      <li>Streaming RTSP em tempo real com buffer dinâmico de baixa latência</li>
+      <li>Controle motorizado PTZ e suporte a presets de câmera</li>
+      <li>Atualizações atômicas e seguras com verificação de integridade SHA-256</li>
+    </ul>
+  </description>
+  <launchable type="desktop-id">central-nvr.desktop</launchable>
+  <url type="homepage">https://github.com/Othayz/central-nvr-wifi</url>
+  <url type="bugtracker">https://github.com/Othayz/central-nvr-wifi/issues</url>
+  <developer id="io.github.othayz">
+    <name>Othay</name>
+  </developer>
+  <categories>
+    <category>AudioVideo</category>
+    <category>Video</category>
+    <category>Network</category>
+    <category>Monitor</category>
+    <category>Security</category>
+  </categories>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="@VERSION@" date="@DATE@"/>
+  </releases>
+</component>
