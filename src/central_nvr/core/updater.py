@@ -562,7 +562,6 @@ StartupWMClass=central-nvr
 def install_downloaded_package(
     file_path: str,
     expected_sha256: Optional[str] = None,
-    allow_unverified: bool = False,
 ) -> Tuple[bool, str]:
     """
     Instala ou atualiza o binário portátil AppImage com verificação de integridade SHA-256 (SEC-07).
@@ -573,13 +572,13 @@ def install_downloaded_package(
         return False, "Arquivo de instalação não encontrado no disco."
 
     # SEC-07: checksum SHA-256 obrigatório; sem ele a instalação é bloqueada
-    if not allow_unverified and not (expected_sha256 and _SHA256_RE.match(expected_sha256.strip())):
+    if not (expected_sha256 and _SHA256_RE.match(expected_sha256.strip())):
         return False, "Release sem checksum SHA-256 válido: instalação bloqueada por segurança."
 
-    if expected_sha256:
-        if not verify_file_sha256(file_path, expected_sha256):
-            actual_hash = compute_file_sha256(file_path)
-            return False, f"Falha de integridade SHA-256: checksum divergente (esperado: {expected_sha256}, calculado: {actual_hash})."
+    expected_hash = expected_sha256.strip()
+    if not verify_file_sha256(file_path, expected_hash):
+        actual_hash = compute_file_sha256(file_path)
+        return False, f"Falha de integridade SHA-256: checksum divergente (esperado: {expected_hash}, calculado: {actual_hash})."
 
     file_obj = Path(file_path).resolve()
     filename_lower = file_obj.name.lower()

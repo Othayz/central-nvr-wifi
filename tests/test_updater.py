@@ -248,7 +248,7 @@ class TestUpdaterWorkers(unittest.TestCase):
 
     def test_install_appimage_atomic_replacement(self):
         """Valida substituição atômica (Atomic Replacement) quando executado a partir de um AppImage existente."""
-        from central_nvr.core.updater import install_downloaded_package
+        from central_nvr.core.updater import compute_file_sha256, install_downloaded_package
         with tempfile.TemporaryDirectory() as tmpdir:
             running_img = Path(tmpdir) / "running.AppImage"
             running_img.write_text("old app image")
@@ -257,14 +257,17 @@ class TestUpdaterWorkers(unittest.TestCase):
             new_img.write_text("new app image v2")
 
             with patch.dict(os.environ, {"APPIMAGE": str(running_img)}):
-                success, msg = install_downloaded_package(str(new_img), allow_unverified=True)
+                success, msg = install_downloaded_package(
+                    str(new_img),
+                    expected_sha256=compute_file_sha256(str(new_img)),
+                )
                 self.assertTrue(success)
                 self.assertIn("atualizada com sucesso", msg)
                 self.assertEqual(running_img.read_text(), "new app image v2")
 
     def test_install_appimage_to_user_local_bin(self):
         """Valida instalação de AppImage em ~/.local/bin quando executado fora de um AppImage."""
-        from central_nvr.core.updater import install_downloaded_package
+        from central_nvr.core.updater import compute_file_sha256, install_downloaded_package
         with tempfile.TemporaryDirectory() as tmpdir:
             fake_home = Path(tmpdir) / "user_home"
             fake_home.mkdir()
@@ -274,7 +277,10 @@ class TestUpdaterWorkers(unittest.TestCase):
 
             with patch.dict(os.environ, {}, clear=True):
                 with patch("pathlib.Path.home", return_value=fake_home):
-                    success, msg = install_downloaded_package(str(new_img), allow_unverified=True)
+                    success, msg = install_downloaded_package(
+                        str(new_img),
+                        expected_sha256=compute_file_sha256(str(new_img)),
+                    )
                     self.assertTrue(success)
                     installed_path = fake_home / ".local" / "bin" / "central-nvr.AppImage"
                     self.assertTrue(installed_path.exists())
@@ -406,7 +412,7 @@ class TestUpdaterWorkers(unittest.TestCase):
         self.assertEqual(h, "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2")
 
     def test_install_downloaded_package_user_local(self):
-        from central_nvr.core.updater import install_downloaded_package
+        from central_nvr.core.updater import compute_file_sha256, install_downloaded_package
         with tempfile.TemporaryDirectory() as tmpdir:
             fake_home = Path(tmpdir) / "home"
             fake_home.mkdir()
@@ -414,9 +420,18 @@ class TestUpdaterWorkers(unittest.TestCase):
             fake_appimage.write_text("dummy binary")
             with patch("pathlib.Path.home", return_value=fake_home):
                 with patch.dict(os.environ, {}, clear=True):
-                    success, msg = install_downloaded_package(str(fake_appimage), allow_unverified=True)
+                    success, msg = install_downloaded_package(
+                        str(fake_appimage),
+                        expected_sha256=compute_file_sha256(str(fake_appimage)),
+                    )
                     self.assertTrue(success)
                     self.assertTrue((fake_home / ".local" / "bin" / "central-nvr.AppImage").exists())
+
+    def test_install_downloaded_package_rejects_allow_unverified_kwarg(self):
+        """Assegura remoção de bypass inseguro na assinatura de install_downloaded_package."""
+        from central_nvr.core.updater import install_downloaded_package
+        with self.assertRaises(TypeError):
+            install_downloaded_package("/fake/path", allow_unverified=True)  # type: ignore
 
     def test_parse_release_version_title_tag_divergence(self):
         from central_nvr.core.updater import _parse_github_release_dict
