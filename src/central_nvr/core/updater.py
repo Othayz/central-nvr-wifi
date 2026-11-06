@@ -144,26 +144,16 @@ def detect_system_package_format() -> str:
 
 def find_best_asset_for_system(assets: List[ReleaseAsset]) -> Optional[ReleaseAsset]:
     """
-    Encontra o asset de download mais adequado para a máquina atual (.AppImage ou tar.gz).
-    Prioriza binários AppImage para arquitetura x86_64.
+    Encontra o asset de download adequado para a máquina atual (.AppImage x86_64).
+    Retorna None se nenhum AppImage x86_64 for encontrado (rejeitando tarballs, zips e outras arquiteturas).
     """
     if not assets:
         return None
 
-    # Prioridade 1: AppImage correspondente à arquitetura x86_64
+    # Seleção estrita: apenas executável AppImage compatível com arquitetura x86_64 / amd64
     for asset in assets:
         name_lower = asset.name.lower()
         if name_lower.endswith(".appimage") and ("x86_64" in name_lower or "amd64" in name_lower):
-            return asset
-
-    # Prioridade 2: Qualquer asset AppImage
-    for asset in assets:
-        if asset.name.lower().endswith(".appimage"):
-            return asset
-
-    # Prioridade 3: Arquivo comprimido tar.gz / zip
-    for asset in assets:
-        if asset.name.lower().endswith((".tar.gz", ".tgz", ".zip")):
             return asset
 
     return None
@@ -612,9 +602,19 @@ def install_downloaded_package(
             user_bin_dir.mkdir(parents=True, exist_ok=True)
             target_path = user_bin_dir / "central-nvr.AppImage"
             temp_target = target_path.with_name(f"{target_path.name}.tmp.{os.getpid()}")
-            shutil.copy2(file_obj, temp_target)
-            os.chmod(temp_target, 0o755)
-            os.replace(temp_target, target_path)
+            backup_path = target_path.with_name(f"{target_path.name}.bak")
+            try:
+                shutil.copy2(file_obj, temp_target)
+                os.chmod(temp_target, 0o755)
+                if target_path.exists():
+                    shutil.copy2(target_path, backup_path)
+                os.replace(temp_target, target_path)
+            except Exception:
+                if temp_target.exists():
+                    temp_target.unlink()
+                if backup_path.exists() and not target_path.exists():
+                    os.replace(backup_path, target_path)
+                raise
             _ensure_desktop_entry_for_appimage(target_path)
             return True, f"Central NVR WiFi AppImage instalada com sucesso em {target_path}."
 
