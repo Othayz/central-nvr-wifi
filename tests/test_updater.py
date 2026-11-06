@@ -338,7 +338,38 @@ class TestUpdaterWorkers(unittest.TestCase):
             self.assertEqual(os.listdir(tmpdir), ["a.AppImage"])
 
     def test_find_best_asset_none_without_appimage(self):
+        # Deve retornar None para qualquer lista sem AppImage x86_64 / amd64
         self.assertIsNone(find_best_asset_for_system([ReleaseAsset(name="x.deb", size=1, download_url="u")]))
+        self.assertIsNone(find_best_asset_for_system([ReleaseAsset(name="central-nvr.tar.gz", size=1, download_url="u")]))
+        self.assertIsNone(find_best_asset_for_system([ReleaseAsset(name="central-nvr.zip", size=1, download_url="u")]))
+        self.assertIsNone(find_best_asset_for_system([ReleaseAsset(name="central-nvr-arm64.AppImage", size=1, download_url="u")]))
+        self.assertIsNone(find_best_asset_for_system([ReleaseAsset(name="central-nvr-aarch64.AppImage", size=1, download_url="u")]))
+
+    def test_install_appimage_user_local_creates_backup_if_exists(self):
+        """Valida criação de backup .bak em ~/.local/bin/central-nvr.AppImage ao atualizar binário existente."""
+        from central_nvr.core.updater import compute_file_sha256, install_downloaded_package
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fake_home = Path(tmpdir) / "user_home"
+            fake_home.mkdir()
+            bin_dir = fake_home / ".local" / "bin"
+            bin_dir.mkdir(parents=True)
+            existing_target = bin_dir / "central-nvr.AppImage"
+            existing_target.write_text("old user local binary")
+
+            new_img = Path(tmpdir) / "new.AppImage"
+            new_img.write_text("updated user local binary")
+
+            with patch.dict(os.environ, {}, clear=True):
+                with patch("pathlib.Path.home", return_value=fake_home):
+                    ok, msg = install_downloaded_package(
+                        str(new_img),
+                        expected_sha256=compute_file_sha256(str(new_img)),
+                    )
+                    self.assertTrue(ok)
+                    self.assertEqual(existing_target.read_text(), "updated user local binary")
+                    backup_file = bin_dir / "central-nvr.AppImage.bak"
+                    self.assertTrue(backup_file.exists())
+                    self.assertEqual(backup_file.read_text(), "old user local binary")
 
     def test_tar_slip_and_symlink_prevention(self):
         """Valida que _extract_tar_members_to_local bloqueia Tar Slip e links maliciosos (SEC-03)."""
