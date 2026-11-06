@@ -72,7 +72,117 @@ def _format_markdown_to_html(md_text: str) -> str:
     return "".join(html_lines)
 
 
-class StartupUpdateDialog(QDialog):
+class BaseUpdateDialog(QDialog):
+    """
+    Classe base para diálogos de atualização (StartupUpdateDialog e UpdateDialog).
+    Centraliza o gerenciamento de threads assíncronas, navegação para a release e ciclo de vida do ChecksumFetchWorker.
+    """
+
+    def __init__(self, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.repo: str = DEFAULT_GITHUB_REPO
+        self.token: Optional[str] = None
+        self.release_info: Optional[ReleaseInfo] = None
+        self.best_asset: Optional[ReleaseAsset] = None
+        self.check_worker: Optional[UpdateCheckWorker] = None
+        self.download_worker: Optional[AssetDownloadWorker] = None
+        self.checksum_worker: Optional[ChecksumFetchWorker] = None
+        self.downloaded_file_path: Optional[str] = None
+        self.expected_sha256: Optional[str] = None
+
+    def _open_release_page(self):
+        """Abre a URL da release atual ou a página de releases do repositório no navegador."""
+        url = ""
+        if self.release_info and self.release_info.html_url:
+            url = self.release_info.html_url
+        elif getattr(self, "repo", None):
+            url = f"https://github.com/{self.repo}/releases"
+        if url:
+            QDesktopServices.openUrl(QUrl(url))
+
+    def _open_github(self):
+        """Alias para _open_release_page mantendo compatibilidade de API."""
+        self._open_release_page()
+
+    def _open_github_release(self):
+        """Alias para _open_release_page mantendo compatibilidade de API."""
+        self._open_release_page()
+
+    def _block_missing_checksum(self):
+        """Exibe diálogo de segurança e redireciona para a página da release no navegador."""
+        QMessageBox.critical(
+            self,
+            "Instalação bloqueada",
+            "Esta release não possui checksum SHA-256 (sha256sums.txt). "
+            "Por segurança a instalação automática foi bloqueada.\n\n"
+            "Abra a página da release para baixar manualmente.",
+        )
+        self._open_release_page()
+
+    def _start_checksum_fetch(self, on_ready, on_missing):
+        """Inicia a consulta assíncrona do checksum SHA-256 sem travar a interface."""
+        if not self.release_info or not self.best_asset:
+            return
+        self.checksum_worker = ChecksumFetchWorker(
+            self.release_info,
+            self.best_asset.name,
+            self.token,
+            parent=self,
+        )
+        self.checksum_worker.checksum_ready.connect(on_ready)
+        self.checksum_worker.checksum_missing.connect(on_missing)
+        self.checksum_worker.start()
+
+    def _rebind_button_to_release_page(self, button: QPushButton, label: str = "Abrir página da release"):
+        """Revincula o botão para abrir a URL da release ao ser clicado."""
+        button.setEnabled(True)
+        button.setText(label)
+        try:
+            button.clicked.disconnect()
+        except Exception:
+            pass
+        button.clicked.connect(self._open_release_page)
+
+    def _on_checksum_ready(self, sha: str):
+        """Trata o recebimento bem-sucedido do hash SHA-256 da release."""
+        self.expected_sha256 = sha
+        if hasattr(self, "progress_bar"):
+            self.progress_bar.setRange(0, 100)
+        if hasattr(self, "_begin_download"):
+            self._begin_download()
+
+    def _cleanup_workers(self):
+        """Interrompe e aguarda a finalização segura de qualquer worker assíncrono ativo."""
+        checksum_worker = getattr(self, "checksum_worker", None)
+        if checksum_worker and checksum_worker.isRunning():
+            checksum_worker.wait(500)
+
+        check_worker = getattr(self, "check_worker", None) or getattr(self, "worker", None)
+        if check_worker and check_worker.isRunning():
+            try:
+                check_worker.quit()
+                check_worker.wait(300)
+            except Exception:
+                pass
+
+        download_worker = getattr(self, "download_worker", None)
+        if download_worker and download_worker.isRunning():
+            try:
+                download_worker.cancel()
+                download_worker.wait(500)
+            except Exception:
+                pass
+
+    def closeEvent(self, event):
+        self._cleanup_workers()
+        super().closeEvent(event)
+
+    def reject(self):
+        self._cleanup_workers()
+        super().reject()
+
+
+class StartupUpdateDialog(BaseUpdateDialog):
     """
     Tela de Inicialização / Splash que verifica automaticamente se há uma nova versão no GitHub.
     - Se encontrar: pergunta ao usuário se deseja atualizar (com changelog e download).
@@ -83,10 +193,6 @@ class StartupUpdateDialog(QDialog):
         super().__init__(parent)
         self.repo = repo
         self.token = token
-        self.release_info: Optional[ReleaseInfo] = None
-        self.best_asset: Optional[ReleaseAsset] = None
-        self.download_worker: Optional[AssetDownloadWorker] = None
-        self.downloaded_file_path: Optional[str] = None
         self.should_open_main_window = True
 
         self.setWindowTitle("Central NVR WiFi")
@@ -264,29 +370,15 @@ class StartupUpdateDialog(QDialog):
         self.btn_update.setEnabled(False)
         self.btn_update.setText("Verificando...")
 
-        self.checksum_worker = ChecksumFetchWorker(self.release_info, self.best_asset.name, self.token, parent=self)
-        self.checksum_worker.checksum_ready.connect(self._on_checksum_ready)
-        self.checksum_worker.checksum_missing.connect(self._on_checksum_missing)
-        self.checksum_worker.start()
+        self._start_checksum_fetch(self._on_checksum_ready, self._on_checksum_missing)
 
     def _on_checksum_missing(self):
         self.progress_bar.setRange(0, 100)
         self.btn_skip.setEnabled(True)
-        self.btn_update.setEnabled(True)
-        self.btn_update.setText("Abrir página da release")
-        try:
-            self.btn_update.clicked.disconnect()
-        except Exception:
-            pass
-        self.btn_update.clicked.connect(self._open_release_page)
+        self._rebind_button_to_release_page(self.btn_update)
         self.lbl_status.setText("Release sem checksum SHA-256: download bloqueado.")
         self.lbl_status.setStyleSheet("font-size: 12px; font-weight: 700; color: #EF4444;")
         self._block_missing_checksum()
-
-    def _on_checksum_ready(self, sha: str):
-        self.expected_sha256 = sha
-        self.progress_bar.setRange(0, 100)
-        self._begin_download()
 
     def _begin_download(self):
         self.lbl_status.setText(f"Baixando {self.best_asset.name}...")
@@ -383,49 +475,7 @@ class StartupUpdateDialog(QDialog):
             QMessageBox.critical(self, "Falha na Instalação", f"Não foi possível iniciar o instalador:\n{msg}")
 
 
-
-    def _block_missing_checksum(self):
-        QMessageBox.critical(
-            self,
-            "Instalação bloqueada",
-            "Esta release não possui checksum SHA-256 (sha256sums.txt). "
-            "Por segurança a instalação automática foi bloqueada.\n\n"
-            "Abra a página da release para baixar manualmente.",
-        )
-        self._open_release_page()
-
-    def _open_release_page(self):
-        url = self.release_info.html_url if self.release_info else ""
-        if url:
-            QDesktopServices.openUrl(QUrl(url))
-
-    def closeEvent(self, event):
-        self._cleanup_workers()
-        super().closeEvent(event)
-
-    def reject(self):
-        self._cleanup_workers()
-        super().reject()
-
-    def _cleanup_workers(self):
-        cw = getattr(self, "checksum_worker", None)
-        if cw and cw.isRunning():
-            cw.wait(500)
-        if hasattr(self, "check_worker") and self.check_worker and self.check_worker.isRunning():
-            try:
-                self.check_worker.quit()
-                self.check_worker.wait(300)
-            except Exception:
-                pass
-        if hasattr(self, "download_worker") and self.download_worker and self.download_worker.isRunning():
-            try:
-                self.download_worker.cancel()
-                self.download_worker.wait(500)
-            except Exception:
-                pass
-
-
-class UpdateDialog(QDialog):
+class UpdateDialog(BaseUpdateDialog):
     """
     Diálogo para verificação manual ou notificação periódica (a cada 10 minutos).
     """
@@ -598,7 +648,7 @@ class UpdateDialog(QDialog):
 
     def _on_action_clicked(self):
         if not self.release_info or not self.best_asset:
-            self._open_github()
+            self._open_release_page()
             return
 
         self.status_box.show()
@@ -608,28 +658,14 @@ class UpdateDialog(QDialog):
         self.btn_action.setEnabled(False)
         self.btn_action.setText("Verificando...")
 
-        self.checksum_worker = ChecksumFetchWorker(self.release_info, self.best_asset.name, self.token, parent=self)
-        self.checksum_worker.checksum_ready.connect(self._on_checksum_ready)
-        self.checksum_worker.checksum_missing.connect(self._on_checksum_missing)
-        self.checksum_worker.start()
+        self._start_checksum_fetch(self._on_checksum_ready, self._on_checksum_missing)
 
     def _on_checksum_missing(self):
         self.progress_bar.setRange(0, 100)
         self.lbl_status.setText("Release sem checksum SHA-256: download bloqueado.")
         self.lbl_status.setStyleSheet("font-size: 12px; font-weight: 700; color: #EF4444;")
-        self.btn_action.setEnabled(True)
-        self.btn_action.setText("Abrir página da release")
-        try:
-            self.btn_action.clicked.disconnect()
-        except Exception:
-            pass
-        self.btn_action.clicked.connect(self._open_github)
+        self._rebind_button_to_release_page(self.btn_action)
         self._block_missing_checksum()
-
-    def _on_checksum_ready(self, sha: str):
-        self.expected_sha256 = sha
-        self.progress_bar.setRange(0, 100)
-        self._begin_download()
 
     def _begin_download(self):
         self.progress_bar.setValue(0)
@@ -654,11 +690,15 @@ class UpdateDialog(QDialog):
         self.download_worker.download_failed.connect(self._on_download_failed)
         self.download_worker.start()
 
-    def _on_download_progress(self, dl: int, tot: int, spd: float):
-        if tot > 0:
-            pct = int((dl / tot) * 100)
-            self.progress_bar.setValue(pct)
-            self.lbl_status.setText(f"Baixando: {dl/(1024*1024):.1f} MB / {tot/(1024*1024):.1f} MB ({pct}%) • {spd:.0f} KB/s")
+    def _on_download_progress(self, downloaded_bytes: int, total_bytes: int, speed_kbps: float):
+        if total_bytes > 0:
+            percentage = int((downloaded_bytes / total_bytes) * 100)
+            self.progress_bar.setValue(percentage)
+            downloaded_mb = downloaded_bytes / (1024 * 1024)
+            total_mb = total_bytes / (1024 * 1024)
+            self.lbl_status.setText(
+                f"Baixando: {downloaded_mb:.1f} MB / {total_mb:.1f} MB ({percentage}%) • {speed_kbps:.0f} KB/s"
+            )
 
     def _on_download_finished(self, file_path: str):
         self.downloaded_file_path = file_path
@@ -680,16 +720,6 @@ class UpdateDialog(QDialog):
         self.btn_action.setEnabled(True)
         self.btn_action.setText("Tentar Novamente")
 
-    def _block_missing_checksum(self):
-        QMessageBox.critical(
-            self,
-            "Instalação bloqueada",
-            "Esta release não possui checksum SHA-256 (sha256sums.txt). "
-            "Por segurança a instalação automática foi bloqueada.\n\n"
-            "Abra a página da release para baixar manualmente.",
-        )
-        self._open_github()
-
     def _install_package(self):
         if self.downloaded_file_path and os.path.exists(self.downloaded_file_path):
             expected_sha = getattr(self, "expected_sha256", None)
@@ -702,28 +732,3 @@ class UpdateDialog(QDialog):
                 self.accept()
             else:
                 QMessageBox.critical(self, "Erro", f"Falha ao iniciar instalação: {msg}")
-
-    def closeEvent(self, event):
-        self._cleanup_workers()
-        super().closeEvent(event)
-
-    def reject(self):
-        self._cleanup_workers()
-        super().reject()
-
-    def _cleanup_workers(self):
-        cw = getattr(self, "checksum_worker", None)
-        if cw and cw.isRunning():
-            cw.wait(500)
-        if hasattr(self, "check_worker") and self.check_worker and self.check_worker.isRunning():
-            try:
-                self.check_worker.quit()
-                self.check_worker.wait(300)
-            except Exception:
-                pass
-        if hasattr(self, "download_worker") and self.download_worker and self.download_worker.isRunning():
-            try:
-                self.download_worker.cancel()
-                self.download_worker.wait(500)
-            except Exception:
-                pass
