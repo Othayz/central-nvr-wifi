@@ -85,16 +85,24 @@ exec "${APPDIR}/usr/bin/python3" -m central_nvr "$@"
 EOF
 chmod +x "${APPDIR}/usr/bin/central-nvr"
 
-# 4. Copiar metadados de Desktop e Ícones
+# 4. Copiar metadados de Desktop, Ícones e AppStream
 echo "===> Instalando ícones e arquivo de menu .desktop..."
-cp "${PROJECT_ROOT}/packaging/central-nvr.desktop" "${APPDIR}/central-nvr.desktop"
-cp "${PROJECT_ROOT}/packaging/central-nvr.desktop" "${APPDIR}/usr/share/applications/central-nvr.desktop"
+cp "${PROJECT_ROOT}/packaging/central-nvr.desktop" "${APPDIR}/io.github.othayz.central_nvr.desktop"
+cp "${PROJECT_ROOT}/packaging/central-nvr.desktop" "${APPDIR}/usr/share/applications/io.github.othayz.central_nvr.desktop"
+ln -sf "io.github.othayz.central_nvr.desktop" "${APPDIR}/usr/share/applications/central-nvr.desktop"
 
 cp "${PROJECT_ROOT}/packaging/icons/central-nvr.png" "${APPDIR}/central-nvr.png"
 cp "${PROJECT_ROOT}/packaging/icons/central-nvr.png" "${APPDIR}/.DirIcon"
 cp "${PROJECT_ROOT}/packaging/icons/central-nvr-512x512.png" "${APPDIR}/usr/share/icons/hicolor/512x512/apps/central-nvr.png"
 cp "${PROJECT_ROOT}/packaging/icons/central-nvr-256x256.png" "${APPDIR}/usr/share/icons/hicolor/256x256/apps/central-nvr.png"
 cp "${PROJECT_ROOT}/packaging/icons/central-nvr.svg" "${APPDIR}/usr/share/icons/hicolor/scalable/apps/central-nvr.svg"
+
+echo "===> Instalando metadados AppStream..."
+rm -rf "${APPDIR}/usr/share/metainfo"
+mkdir -p "${APPDIR}/usr/share/metainfo"
+TODAY=$(date +%Y-%m-%d)
+sed -e "s/@VERSION@/${VERSION}/g" -e "s/@DATE@/${TODAY}/g" \
+    "${PROJECT_ROOT}/packaging/io.github.othayz.central_nvr.appdata.xml" > "${APPDIR}/usr/share/metainfo/io.github.othayz.central_nvr.appdata.xml"
 
 # 5. Copiar launcher AppRun
 echo "===> Instalando launcher portátil AppRun (Host Delegation para VA-API)..."
