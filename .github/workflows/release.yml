@@ -21,7 +21,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v7
         with:
-          python-version: '3.11'
+          python-version: '3.12'
 
       - name: Install Build Dependencies
         run: |
@@ -54,6 +54,18 @@ jobs:
         run: |
           chmod +x packaging/build_appimage.sh
           ./packaging/build_appimage.sh
+
+      - name: Verify AppImage Integrity & Dependencies
+        run: |
+          echo "=== Verificando integridade e dependências críticas do AppImage gerado ==="
+          APPIMAGE_FILE=$(ls dist/Central_NVR_WiFi-*.AppImage | head -n1)
+          FILESIZE=$(stat -c%s "$APPIMAGE_FILE")
+          echo "Tamanho do binário: $FILESIZE bytes"
+          if [ "$FILESIZE" -lt 100000000 ]; then
+            echo "ERRO: O AppImage gerado possui menos de 100MB ($FILESIZE bytes). Falta de dependências (PySide6/Qt)!"
+            exit 1
+          fi
+          build/appimage/Central_NVR_WiFi.AppDir/usr/bin/python3 -c "import PySide6, av, cv2, numpy, keyring, defusedxml; print('Verificação de imports no AppDir: OK')"
 
       - name: Create Source Archive (.tar.gz)
         run: |

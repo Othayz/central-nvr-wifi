@@ -52,19 +52,25 @@ fi
 SITE_PACKAGES="${APPDIR}/usr/lib/python3.12/site-packages"
 mkdir -p "${SITE_PACKAGES}"
 
-if [ -d "${PROJECT_ROOT}/venv/lib/python3.12/site-packages" ]; then
+if [ -d "${PROJECT_ROOT}/venv/lib/python3.12/site-packages/PySide6" ]; then
     echo "===> Sincronizando dependências compiladas de venv/lib/python3.12/site-packages..."
     rsync -a --exclude='pip*' --exclude='_distutils*' "${PROJECT_ROOT}/venv/lib/python3.12/site-packages/" "${SITE_PACKAGES}/"
 fi
 
-# Garantir presença de keyring e defusedxml
-echo "===> Verificando dependências essenciais (keyring, defusedxml)..."
-if ! "${APPDIR}/usr/bin/python3" -c "import keyring, defusedxml" 2>/dev/null; then
-    echo "     Instalando keyring e defusedxml no ambiente embutido..."
-    rm -rf "${SITE_PACKAGES}/pip"* 2>/dev/null || true
+# Garantir presença de todas as dependências essenciais do requirements.txt
+echo "===> Verificando dependências completas (PySide6, av, cv2, numpy, keyring, defusedxml)..."
+if ! "${APPDIR}/usr/bin/python3" -c "import PySide6, av, cv2, numpy, keyring, defusedxml" 2>/dev/null; then
+    echo "     Instalando dependências completas do requirements.txt no ambiente embutido..."
     "${APPDIR}/usr/bin/python3" -m ensurepip --default-pip 2>/dev/null || true
-    "${APPDIR}/usr/bin/python3" -m pip install --no-warn-script-location --target "${SITE_PACKAGES}" keyring defusedxml
+    "${APPDIR}/usr/bin/python3" -m pip install --no-warn-script-location --target "${SITE_PACKAGES}" -r "${PROJECT_ROOT}/requirements.txt"
 fi
+
+# Sanity check estrito: se os imports críticos falharem, o build DEVE falhar aqui
+echo "===> Validando sanidade das dependências essenciais no runtime do AppImage..."
+"${APPDIR}/usr/bin/python3" -c "import PySide6, av, cv2, numpy, PIL, keyring, defusedxml; print('     [OK] Todas as dependências críticas estão presentes.')" || {
+    echo "===> [ERRO CRÍTICO] Falha ao importar dependências no ambiente embutido! Interrompendo build."
+    exit 1
+}
 
 # 3. Copiar código-fonte da aplicação
 echo "===> Sincronizando código-fonte da Central NVR..."

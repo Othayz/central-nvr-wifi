@@ -462,7 +462,12 @@ class StartupUpdateDialog(BaseUpdateDialog):
             self._block_missing_checksum()
             return
 
-        success, msg = install_downloaded_package(self.downloaded_file_path, expected_sha256=expected_sha)
+        min_size = int(os.environ.get("CENTRAL_NVR_MIN_APPIMAGE_SIZE", "0"))
+        success, msg = install_downloaded_package(
+            self.downloaded_file_path,
+            expected_sha256=expected_sha,
+            min_size=min_size,
+        )
         if success:
             QMessageBox.information(
                 self,
@@ -726,7 +731,12 @@ class UpdateDialog(BaseUpdateDialog):
             if not expected_sha:
                 self._block_missing_checksum()
                 return
-            success, msg = install_downloaded_package(self.downloaded_file_path, expected_sha256=expected_sha)
+            min_size = int(os.environ.get("CENTRAL_NVR_MIN_APPIMAGE_SIZE", "0"))
+            success, msg = install_downloaded_package(
+                self.downloaded_file_path,
+                expected_sha256=expected_sha,
+                min_size=min_size,
+            )
             if success:
                 QMessageBox.information(self, "Instalação", f"{msg}\n\nO aplicativo deve ser reiniciado após a instalação.")
                 self.accept()

@@ -552,6 +552,7 @@ StartupWMClass=central-nvr
 def install_downloaded_package(
     file_path: str,
     expected_sha256: Optional[str] = None,
+    min_size: int = 0,
 ) -> Tuple[bool, str]:
     """
     Instala ou atualiza o binário portátil AppImage com verificação de integridade SHA-256 (SEC-07).
@@ -560,6 +561,10 @@ def install_downloaded_package(
     """
     if not os.path.exists(file_path):
         return False, "Arquivo de instalação não encontrado no disco."
+
+    file_obj = Path(file_path).resolve()
+    if min_size > 0 and file_obj.stat().st_size < min_size:
+        return False, f"Pacote com tamanho anômalo ({file_obj.stat().st_size} B). O tamanho mínimo esperado é de {min_size} B."
 
     # SEC-07: checksum SHA-256 obrigatório; sem ele a instalação é bloqueada
     if not (expected_sha256 and _SHA256_RE.match(expected_sha256.strip())):
