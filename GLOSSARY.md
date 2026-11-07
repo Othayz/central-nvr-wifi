@@ -19,3 +19,11 @@ _Avoid_: Bundling gráfico completo, driver embutido
 **Atomic Replacement**:
 Mecanismo de atualização no qual o novo binário é baixado, tem sua integridade criptográfica SHA-256 validada e substitui o arquivo original em uma única chamada atômica de sistema (`os.replace`), prevenindo corrupção em caso de encerramento abrupto.
 _Avoid_: Atualização in-place via apt/dnf, extração com pkexec
+
+**Dispositivo Cadastrado**:
+Câmera IP configurada e persistida pelo operador em `devices.json` sob o padrão XDG Config, monitorada de forma perene no mosaico de vídeo da Central NVR.
+_Avoid_: Câmera de demonstração, canal mock, dispositivo temporário
+
+**Dispositivo Descoberto**:
+Equipamento de vídeo IP localizado na rede local por sondagem WS-Discovery ou varredura de portas, cujos parâmetros existem de forma volátil apenas durante o diálogo de adição.
+_Avoid_: Dispositivo não registrado, câmera fantasma

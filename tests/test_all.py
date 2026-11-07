@@ -11,9 +11,14 @@ import urllib.parse
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-# Adicionar src ao path de importação
+# Adicionar src ao path de importação e isolar diretórios XDG dos testes
 root_path = Path(__file__).parent.parent
 sys.path.insert(0, str(root_path / "src"))
+
+# Isolar diretórios de configuração e dados para nunca afetar ~/.config/central-nvr do usuário
+_test_xdg_temp = tempfile.TemporaryDirectory()
+os.environ["XDG_CONFIG_HOME"] = str(Path(_test_xdg_temp.name) / "config")
+os.environ["XDG_DATA_HOME"] = str(Path(_test_xdg_temp.name) / "data")
 
 from central_nvr.core.camera import CameraDevice, ConnectionState, StreamStats
 from central_nvr.core.config import (
@@ -837,6 +842,47 @@ class TestSecurityAuditRemediations(unittest.TestCase):
         widget.close()
         widget.deleteLater()
         self.app.processEvents()
+
+    def test_camera_persistence_names_and_ids(self):
+        """Valida que câmeras nomeadas 'Garagem', 'Sala de Estar', etc. e com IDs 'cam-' persistem sem expurgo."""
+        import json
+        from pathlib import Path
+        from central_nvr.core.config import ConfigManager
+
+        initial_devices = [
+            {"id": "cam_192_168_1_3", "name": "Varanda", "ip": "192.168.1.3", "port": 80},
+            {"id": "cam_192_168_1_2", "name": "Garagem", "ip": "192.168.1.2", "port": 80},
+            {"id": "cam-01", "name": "Sala de Estar", "ip": "192.168.1.10", "port": 80},
+            {"id": "cam-02", "name": "Cozinha", "ip": "192.168.1.11", "port": 80},
+            {"id": "cam-03", "name": "Quintal", "ip": "192.168.1.12", "port": 80},
+        ]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            devices_file = tmp_path / "devices.json"
+            with open(devices_file, "w", encoding="utf-8") as f:
+                json.dump(initial_devices, f)
+
+            with patch("central_nvr.core.config.get_config_dir", return_value=tmp_path):
+                cfg = ConfigManager()
+
+                # Todos os 5 dispositivos devem ser carregados
+                self.assertEqual(len(cfg.devices), 5)
+                names = [d["name"] for d in cfg.devices]
+                self.assertIn("Garagem", names)
+                self.assertIn("Varanda", names)
+                self.assertIn("Sala de Estar", names)
+                self.assertIn("Cozinha", names)
+                self.assertIn("Quintal", names)
+
+                # Novo ciclo de load() não pode alterar a lista
+                cfg.load()
+                self.assertEqual(len(cfg.devices), 5)
+
+                # Verificar se o arquivo em disco preservou todos os dispositivos
+                with open(devices_file, "r", encoding="utf-8") as f:
+                    disk_devices = json.load(f)
+                self.assertEqual(len(disk_devices), 5)
 
 
 if __name__ == "__main__":

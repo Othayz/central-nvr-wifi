@@ -235,15 +235,7 @@ class ConfigManager:
             try:
                 with open(self.devices_path, "r", encoding="utf-8") as f:
                     raw_devices = json.load(f)
-                    # Remover qualquer dispositivo de demonstração legado
-                    self.devices = [
-                        d for d in raw_devices 
-                        if not d.get("id", "").startswith("cam-") 
-                        and "Sala de Estar" not in d.get("name", "")
-                        and "Cozinha" not in d.get("name", "")
-                        and "Garagem" not in d.get("name", "")
-                        and "Quintal" not in d.get("name", "")
-                    ]
+                    self.devices = list(raw_devices) if isinstance(raw_devices, list) else []
                     # SEC-01: Carregar senhas do keyring e migrar senhas legadas em texto puro
                     need_resave = False
                     keyring_active = is_keyring_available()
@@ -258,7 +250,7 @@ class ConfigManager:
                             if kr_pass is not None:
                                 d["password"] = kr_pass
 
-                    if len(self.devices) != len(raw_devices) or need_resave:
+                    if need_resave:
                         self.save_devices()
             except Exception as e:
                 logger.error(f"Erro ao ler {self.devices_path}: {e}")
