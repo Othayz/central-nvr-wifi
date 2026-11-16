@@ -153,6 +153,7 @@ class StreamWorker(QThread):
         self.prefer_substream = prefer_substream
         
         self._is_running = False
+        self._stop_requested = False
         self._is_paused = False
         self._request_snapshot: Optional[str] = None
         self._is_recording = False
@@ -172,9 +173,14 @@ class StreamWorker(QThread):
         self._motion_cooldown = 0
         self._motion_eval_counter = 0
 
-    def stop(self):
-        """Para a thread de streaming de forma limpa e aguarda encerramento cooperativo."""
+    def request_stop(self):
+        """Pede o encerramento sem bloquear; a thread termina ao sair da operação de rede em curso."""
+        self._stop_requested = True
         self._is_running = False
+
+    def stop(self):
+        """Pede o encerramento e aguarda até 1 s. Na interface, prefira request_stop() + retire_thread()."""
+        self.request_stop()
         self.quit()
         self.wait(1000)
 
@@ -194,7 +200,8 @@ class StreamWorker(QThread):
         self._request_snapshot = output_path
 
     def run(self):
-        self._is_running = True
+        # Uma parada pedida antes de a thread começar a executar não pode ser desfeita aqui
+        self._is_running = not self._stop_requested
         self.state_changed.emit(ConnectionState.CONNECTING, "Iniciando conexão RTSP...")
 
         is_demo = self.camera.rtsp_url.startswith("demo://")

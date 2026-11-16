@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 import time
 import urllib.parse
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 
 
 class ConnectionState(Enum):
@@ -180,6 +180,24 @@ class CameraDevice:
                 urls.append(candidate)
 
         return urls
+
+    def stream_settings(self) -> Tuple[Any, ...]:
+        """
+        Campos que determinam a conexão RTSP. Enquanto forem iguais, um stream já aberto continua
+        válido; nome, porta ONVIF, modelo e capacidades podem mudar sem exigir reconexão.
+        """
+        return (
+            self.ip,
+            self.rtsp_port,
+            self.rtsp_path,
+            self.rtsp_url,
+            self.substream_path,
+            self.substream_url,
+            self.username,
+            self.password,
+            self.manufacturer,
+            self.rtsp_transport,
+        )
 
     def to_dict(self) -> Dict[str, Any]:
         """Converte para dicionário serializável em JSON."""

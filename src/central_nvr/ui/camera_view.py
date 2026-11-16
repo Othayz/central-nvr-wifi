@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
 
 from central_nvr.core.camera import CameraDevice, ConnectionState, StreamStats
 from central_nvr.core.stream_worker import StreamWorker
+from central_nvr.core.threads import retire_thread
 
 
 class CameraViewWidget(QFrame):
@@ -56,6 +57,8 @@ class CameraViewWidget(QFrame):
         self.stats = StreamStats()
         self.connection_state = ConnectionState.DISCONNECTED
         self.status_message = "Desconectado"
+        self.worker: Optional[StreamWorker] = None
+        self._restart_after: Optional[StreamWorker] = None  # sessão anterior aguardada por reconnect()
 
         self.setObjectName("cameraContainer")
         self.setFrameShape(QFrame.Shape.StyledPanel)
@@ -327,8 +330,7 @@ class CameraViewWidget(QFrame):
         self.worker.stats_updated.connect(self._on_stats_updated)
         self.worker.state_changed.connect(self._on_state_changed)
         self.worker.snapshot_saved.connect(self._on_snapshot_saved)
-        if hasattr(self.worker, "motion_detected"):
-            self.worker.motion_detected.connect(self._on_motion_detected)
+        self.worker.motion_detected.connect(self._on_motion_detected)
         self.worker.start()
 
     def set_selected(self, selected: bool):
@@ -397,7 +399,7 @@ class CameraViewWidget(QFrame):
 
     def _toggle_stream_profile(self):
         """Alterna entre MainStream (HD) e SubStream (SD) para controle de banda."""
-        if not hasattr(self, "worker") or not self.worker:
+        if not self.worker:
             return
         new_pref = not self.worker.prefer_substream
         self.worker.set_prefer_substream(new_pref)
@@ -434,7 +436,7 @@ class CameraViewWidget(QFrame):
         safe_id = re.sub(r'[^a-zA-Z0-9_-]', '_', str(self.camera.id))
         filename = f"snap_{safe_id}_{ts}.jpg"
         filepath = str(snap_dir / filename)
-        if hasattr(self, "worker") and self.worker.isRunning():
+        if self.worker and self.worker.isRunning():
             self.worker.take_snapshot(filepath)
 
     def _on_snapshot_saved(self, filepath: str):
@@ -491,19 +493,43 @@ class CameraViewWidget(QFrame):
             except Exception:
                 pass
 
-        if hasattr(self, "worker") and self.worker:
+        self._restart_after = None
+        if self.worker:
             w = self.worker
             self.worker = None
-            try:
-                w.frame_received.disconnect()
-                w.stats_updated.disconnect()
-                w.state_changed.disconnect()
-                w.snapshot_saved.disconnect()
-            except Exception:
-                pass
-            if w.isRunning():
-                w.stop()
-                w.wait(500)
+            for worker_signal in (w.frame_received, w.stats_updated, w.state_changed, w.snapshot_saved, w.motion_detected):
+                try:
+                    worker_signal.disconnect()
+                except (RuntimeError, TypeError):
+                    pass
+            # A thread pode estar bloqueada na rede por segundos: não esperar por ela (congelaria a
+            # interface) nem deixá-la ser destruída junto com este widget (abortaria o processo).
+            w.request_stop()
+            retire_thread(w)
+
+    def reconnect(self):
+        """
+        Reabre o stream sem bloquear a interface e sem manter duas sessões RTSP na mesma câmera
+        (muitas câmeras Wi-Fi aceitam apenas uma): a nova conexão só começa quando a anterior encerra.
+        """
+        previous = self.worker
+        self.stop()
+        if previous is None or not previous.isRunning():
+            self._start_stream()
+            return
+        self._restart_after = previous
+        previous.finished.connect(self._on_previous_session_finished)
+        if previous.isFinished():  # encerrou antes de o sinal ser conectado
+            self._start_stream_after(previous)
+
+    def _on_previous_session_finished(self):
+        self._start_stream_after(self.sender())
+
+    def _start_stream_after(self, finished_session):
+        # stop() ou outro reconnect() depois do pedido cancelam este reinício
+        if self._restart_after is not None and finished_session is self._restart_after:
+            self._restart_after = None
+            self._start_stream()
 
     def closeEvent(self, event):
         self.stop()

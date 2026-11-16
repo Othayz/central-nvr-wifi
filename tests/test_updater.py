@@ -2,6 +2,7 @@
 """
 Testes unitários para o módulo de atualizações via GitHub (central_nvr.core.updater).
 """
+import hashlib
 import os
 import sys
 import tempfile
@@ -291,14 +292,23 @@ class TestUpdaterWorkers(unittest.TestCase):
                     self.assertTrue(desktop_file.exists())
 
     def test_install_downloaded_package_sha256_mismatch(self):
-        """Valida rejeição de pacote corrompido ou adulterado (SEC-07)."""
+        """Valida rejeição de pacote corrompido ou adulterado (SEC-07): destino intacto e sem resíduos."""
         from central_nvr.core.updater import install_downloaded_package
-        with patch("os.path.exists", return_value=True):
-            with patch("central_nvr.core.updater.verify_file_sha256", return_value=False):
-                with patch("central_nvr.core.updater.compute_file_sha256", return_value="badhash"):
-                    success, msg = install_downloaded_package("/cache/pkg.AppImage", expected_sha256="a"*64)
-                    self.assertFalse(success)
-                    self.assertIn("Falha de integridade SHA-256", msg)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            install_dir = Path(tmpdir) / "apps"
+            install_dir.mkdir()
+            running = install_dir / "running.AppImage"
+            running.write_bytes(b"old")
+            new = Path(tmpdir) / "pkg.AppImage"
+            new.write_bytes(b"tampered")
+
+            with patch.dict(os.environ, {"APPIMAGE": str(running)}):
+                success, msg = install_downloaded_package(str(new), expected_sha256="a" * 64)
+
+            self.assertFalse(success)
+            self.assertIn("Falha de integridade SHA-256", msg)
+            self.assertEqual(running.read_bytes(), b"old")
+            self.assertEqual(os.listdir(install_dir), ["running.AppImage"])
 
     def test_install_blocked_without_checksum(self):
         from central_nvr.core.updater import install_downloaded_package
@@ -323,6 +333,31 @@ class TestUpdaterWorkers(unittest.TestCase):
             self.assertEqual(running.read_text(), "new")
             self.assertEqual((Path(tmpdir) / "running.AppImage.bak").read_text(), "old")
 
+    def test_install_never_installs_content_swapped_after_verification(self):
+        """Um pacote trocado logo após a verificação do SHA-256 nunca vira o AppImage instalado (#15)."""
+        from central_nvr.core import updater
+        with tempfile.TemporaryDirectory() as tmpdir:
+            running = Path(tmpdir) / "running.AppImage"
+            running.write_bytes(b"old")
+            downloads = Path(tmpdir) / "downloads"
+            downloads.mkdir()
+            new = downloads / "new.AppImage"
+            new.write_bytes(b"legit")
+            real_verify = updater.verify_file_sha256
+
+            def verify_then_swap(path, sha):
+                ok = real_verify(path, sha)
+                new.write_bytes(b"malicious")  # outro processo vence a corrida logo após a verificação
+                return ok
+
+            with patch.dict(os.environ, {"APPIMAGE": str(running)}), \
+                 patch.object(updater, "verify_file_sha256", side_effect=verify_then_swap):
+                updater.install_downloaded_package(
+                    str(new), expected_sha256=hashlib.sha256(b"legit").hexdigest()
+                )
+
+            self.assertIn(running.read_bytes(), (b"legit", b"old"))
+
     def test_download_size_mismatch_cleans_part(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             dest = os.path.join(tmpdir, "a.AppImage")
@@ -336,6 +371,25 @@ class TestUpdaterWorkers(unittest.TestCase):
             with patch("central_nvr.core.updater.requests.get", return_value=resp):
                 self.assertTrue(download_asset("http://x/a", dest, expected_size=4))
             self.assertEqual(os.listdir(tmpdir), ["a.AppImage"])
+
+    def test_download_does_not_follow_planted_symlink(self):
+        """Um symlink plantado em <destino>.part não desvia o download para outro arquivo (#15)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            victim = Path(tmpdir) / "victim.txt"
+            victim.write_bytes(b"precious")
+            dest = os.path.join(tmpdir, "a.AppImage")
+            os.symlink(victim, dest + ".part")
+            resp = MagicMock()
+            resp.headers = {"content-length": "4"}
+            resp.raise_for_status = MagicMock()
+            resp.iter_content.return_value = [b"abcd"]
+
+            with patch("central_nvr.core.updater.requests.get", return_value=resp):
+                self.assertTrue(download_asset("http://x/a", dest, expected_size=4))
+
+            self.assertEqual(victim.read_bytes(), b"precious")
+            self.assertFalse(os.path.islink(dest))
+            self.assertEqual(Path(dest).read_bytes(), b"abcd")
 
     def test_find_best_asset_none_without_appimage(self):
         # Deve retornar None para qualquer lista sem AppImage x86_64 / amd64

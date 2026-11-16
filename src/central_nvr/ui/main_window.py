@@ -520,15 +520,13 @@ class MainWindow(QMainWindow):
         if cam_id:
             if cam_id in self.camera_grid.camera_views:
                 view = self.camera_grid.camera_views[cam_id]
-                view.stop()
-                view._start_stream()
+                view.reconnect()
                 self._log_event("Conexão", f"Reconectando câmera: {view.camera.name}")
         else:
             # Reconectar todas
             self._log_event("Conexão", "Reconectando todas as câmeras...")
             for view in self.camera_grid.camera_views.values():
-                view.stop()
-                view._start_stream()
+                view.reconnect()
 
     def _remove_selected_camera(self):
         """Remove a câmera que estiver atualmente selecionada."""
@@ -786,12 +784,7 @@ class MainWindow(QMainWindow):
         if hasattr(self, "update_periodic_timer") and self.update_periodic_timer.isActive():
             self.update_periodic_timer.stop()
 
-        if hasattr(self, "_periodic_worker") and self._periodic_worker and self._periodic_worker.isRunning():
-            try:
-                self._periodic_worker.quit()
-                self._periodic_worker.wait(300)
-            except Exception:
-                pass
-
+        # Nenhuma espera aqui: as threads de streaming são aposentadas (retire_thread) e as demais
+        # threads filhas desta janela são tratadas no encerramento do processo (app.main).
         self.camera_grid.stop_all()
         super().closeEvent(event)

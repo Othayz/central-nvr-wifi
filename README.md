@@ -50,6 +50,7 @@ Central NVR Wifi/
 │   │   └── central-nvr.png
 │   ├── central-nvr.desktop             # Entrada do lançador do sistema Linux
 │   ├── AppRun                          # Launcher portátil com Host Delegation para VA-API
+│   ├── central-nvr-launcher.sh         # Launcher instalado em usr/bin/central-nvr dentro do AppDir
 │   └── build_appimage.sh               # Script de geração do pacote AppImage universal
 ├── requirements.txt                    # Dependências do Python
 ├── pyproject.toml                      # Metadados de empacotamento Python (PEP 517/621)
