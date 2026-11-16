@@ -48,7 +48,7 @@ jobs:
           QT_QPA_PLATFORM: offscreen
         run: |
           pip install pytest
-          python -m pytest tests/test_updater.py tests/test_update_flow.py tests/test_appstream.py tests/test_apprun.py -q
+          python -m pytest tests/test_updater.py tests/test_update_flow.py tests/test_appstream.py tests/test_apprun.py tests/test_stream_lifecycle.py -q
 
       - name: Build Universal AppImage
         run: |

@@ -786,12 +786,7 @@ class MainWindow(QMainWindow):
         if hasattr(self, "update_periodic_timer") and self.update_periodic_timer.isActive():
             self.update_periodic_timer.stop()
 
-        if hasattr(self, "_periodic_worker") and self._periodic_worker and self._periodic_worker.isRunning():
-            try:
-                self._periodic_worker.quit()
-                self._periodic_worker.wait(300)
-            except Exception:
-                pass
-
+        # Nenhuma espera aqui: as threads de streaming são aposentadas (retire_thread) e as demais
+        # threads filhas desta janela são tratadas no encerramento do processo (app._finish).
         self.camera_grid.stop_all()
         super().closeEvent(event)

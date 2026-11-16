@@ -135,49 +135,78 @@ class CameraGridWidget(QWidget):
         self.layout.setSpacing(6)
 
     def set_cameras(self, cameras: List[CameraDevice]):
-        """Atualiza a lista de câmeras e reconstrói o grid."""
-        # Parar e limpar views antigas de forma segura
-        for view in list(self.camera_views.values()):
-            try:
-                view.selected.disconnect()
-                view.double_clicked.disconnect()
-                view.ptz_requested.disconnect()
-                view.snapshot_taken.disconnect()
-                view.fullscreen_requested.disconnect()
-                view.rename_requested.disconnect()
-            except Exception:
-                pass
-            view.stop()
-            view.close()
-            view.deleteLater()
-        self.camera_views.clear()
+        """
+        Atualiza a lista de câmeras e reconstrói o grid.
+
+        Views de câmeras que não mudaram são mantidas com o stream em execução; só as removidas
+        (ou reconfiguradas) são encerradas e só as novas são conectadas.
+        """
+        previous_views = self.camera_views
+        self.camera_views = {}
+
+        for cam in cameras:
+            if cam.id in self.camera_views:
+                continue
+            view = previous_views.get(cam.id)
+            if view is not None and self._view_is_current(view, cam):
+                del previous_views[cam.id]
+            else:
+                view = self._create_view(cam)
+            self.camera_views[cam.id] = view
+
+        for view in previous_views.values():
+            self._dispose_view(view)
 
         self.camera_devices = cameras
 
-        # Instanciar novos widgets de visualização
-        for cam in cameras:
-            view = CameraViewWidget(
-                camera=cam,
-                hw_accel=self.hw_accel,
-                rtsp_transport=self.rtsp_transport,
-                parent=self,
-            )
-            view.selected.connect(self._on_camera_selected)
-            view.double_clicked.connect(self._on_camera_double_clicked)
-            view.ptz_requested.connect(lambda cid: self.ptz_requested.emit(cid))
-            view.snapshot_taken.connect(lambda cid, fp: self.snapshot_taken.emit(cid, fp))
-            view.fullscreen_requested.connect(lambda cid: self.fullscreen_requested.emit(cid))
-            view.rename_requested.connect(lambda cid, name: self.camera_renamed.emit(cid, name))
-            self.camera_views[cam.id] = view
-
-        # Selecionar a primeira se houver
-        if cameras:
-            self.selected_camera_id = cameras[0].id
-            self.select_camera(cameras[0].id)
-        else:
-            self.selected_camera_id = None
+        # Manter a seleção atual se a câmera continuar cadastrada; senão, selecionar a primeira
+        if self.selected_camera_id not in self.camera_views:
+            self.selected_camera_id = cameras[0].id if cameras else None
+        if self.selected_camera_id:
+            self.select_camera(self.selected_camera_id)
 
         self.apply_layout(self.grid_layout_mode)
+
+    def _view_is_current(self, view: CameraViewWidget, camera: CameraDevice) -> bool:
+        """Indica se a view já exibe esta câmera com os mesmos parâmetros de conexão do grid."""
+        return (
+            view.camera.to_dict() == camera.to_dict()
+            and view.hw_accel == self.hw_accel
+            and view.rtsp_transport == self.rtsp_transport
+        )
+
+    def _create_view(self, camera: CameraDevice) -> CameraViewWidget:
+        view = CameraViewWidget(
+            camera=camera,
+            hw_accel=self.hw_accel,
+            rtsp_transport=self.rtsp_transport,
+            parent=self,
+        )
+        view.selected.connect(self._on_camera_selected)
+        view.double_clicked.connect(self._on_camera_double_clicked)
+        view.ptz_requested.connect(lambda cid: self.ptz_requested.emit(cid))
+        view.snapshot_taken.connect(lambda cid, fp: self.snapshot_taken.emit(cid, fp))
+        view.fullscreen_requested.connect(lambda cid: self.fullscreen_requested.emit(cid))
+        view.rename_requested.connect(lambda cid, name: self.camera_renamed.emit(cid, name))
+        return view
+
+    def _dispose_view(self, view: CameraViewWidget):
+        """Encerra o stream e descarta a view de forma segura."""
+        try:
+            view.selected.disconnect()
+            view.double_clicked.disconnect()
+            view.ptz_requested.disconnect()
+            view.snapshot_taken.disconnect()
+            view.fullscreen_requested.disconnect()
+            view.rename_requested.disconnect()
+        except Exception:
+            pass
+        view.stop()
+        view.close()
+        # Tirar do layout mantendo o grid como pai: assim apply_layout() não a transforma em janela
+        # órfã com destruição pendente, e ela é destruída com o grid se o event loop não rodar antes.
+        self.layout.removeWidget(view)
+        view.deleteLater()
 
     def set_layout_mode(self, mode: str):
         """Altera a disposição das câmeras (auto, 1x1, 2x2, 3x3)."""
