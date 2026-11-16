@@ -78,9 +78,9 @@ if [ -x "${APPDIR}/usr/bin/central-nvr" ]; then
     exec "${APPDIR}/usr/bin/central-nvr" "$@"
 elif [ -x "${APPDIR}/usr/bin/python3" ]; then
     exec "${APPDIR}/usr/bin/python3" -P -m central_nvr "$@"
-elif python3 -P -c "" 2>/dev/null; then
-    exec python3 -P -m central_nvr "$@"
 else
-    # Python do host anterior ao 3.11 (sem -P): o modo isolado também exclui o diretório atual
-    exec python3 -I -m central_nvr "$@"
+    # Sem interpretador embutido: usar o python3 do host. A opção -P só existe a partir do 3.11,
+    # então o diretório atual (entrada vazia que "python -c" põe em sys.path) é removido antes
+    # de qualquer import. O modo isolado (-I) não serve: ele ignoraria o PYTHONPATH do AppDir.
+    exec python3 -c 'import sys; sys.path[:] = [p for p in sys.path if p]; import runpy; runpy.run_module("central_nvr", run_name="__main__", alter_sys=True)' "$@"
 fi

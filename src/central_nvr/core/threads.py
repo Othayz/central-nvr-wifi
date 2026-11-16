@@ -46,15 +46,15 @@ def _release_thread(thread: QThread) -> None:
 
 
 def retire_running_threads_of(owner: QObject) -> None:
-    """Aposenta toda thread ainda em execução que seja descendente de owner."""
+    """
+    Aposenta toda thread ainda em execução que seja descendente de owner. Usado no encerramento
+    do processo para threads cujo dono não as parou: elas recebem requestInterruption() (as que
+    não o observam simplesmente terminam o que estavam fazendo) e deixam de ser destruídas com o dono.
+    """
     for thread in owner.findChildren(QThread):
         if thread.isRunning():
+            thread.requestInterruption()
             retire_thread(thread)
-
-
-def retired_thread_count() -> int:
-    """Quantidade de threads aposentadas que ainda não terminaram."""
-    return sum(1 for thread in _retired_threads if thread.isRunning())
 
 
 def drain_retired_threads(timeout_ms: int) -> bool:
@@ -68,7 +68,7 @@ def drain_retired_threads(timeout_ms: int) -> bool:
         if thread.wait(remaining_ms):
             _release_thread(thread)
 
-    still_running = retired_thread_count()
+    still_running = sum(1 for thread in _retired_threads if thread.isRunning())
     if still_running:
         logger.warning(f"{still_running} thread(s) de segundo plano não terminaram em {timeout_ms} ms.")
     return still_running == 0

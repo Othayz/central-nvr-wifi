@@ -659,9 +659,6 @@ def install_downloaded_package(
 
         return False, f"Formato não suportado para atualização: {file_obj.suffix}"
 
-    except PackageIntegrityError as e:
-        logger.error(str(e))
-        return False, str(e)
     except Exception as e:
         logger.error(f"Erro ao processar pacote AppImage: {e}")
         return False, str(e)

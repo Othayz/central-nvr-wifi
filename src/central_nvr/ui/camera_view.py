@@ -58,6 +58,7 @@ class CameraViewWidget(QFrame):
         self.connection_state = ConnectionState.DISCONNECTED
         self.status_message = "Desconectado"
         self.worker: Optional[StreamWorker] = None
+        self._restart_after: Optional[StreamWorker] = None  # sessão anterior aguardada por reconnect()
 
         self.setObjectName("cameraContainer")
         self.setFrameShape(QFrame.Shape.StyledPanel)
@@ -492,18 +493,43 @@ class CameraViewWidget(QFrame):
             except Exception:
                 pass
 
+        self._restart_after = None
         if self.worker:
             w = self.worker
             self.worker = None
-            for signal in (w.frame_received, w.stats_updated, w.state_changed, w.snapshot_saved, w.motion_detected):
+            for worker_signal in (w.frame_received, w.stats_updated, w.state_changed, w.snapshot_saved, w.motion_detected):
                 try:
-                    signal.disconnect()
+                    worker_signal.disconnect()
                 except (RuntimeError, TypeError):
                     pass
             # A thread pode estar bloqueada na rede por segundos: não esperar por ela (congelaria a
             # interface) nem deixá-la ser destruída junto com este widget (abortaria o processo).
             w.request_stop()
             retire_thread(w)
+
+    def reconnect(self):
+        """
+        Reabre o stream sem bloquear a interface e sem manter duas sessões RTSP na mesma câmera
+        (muitas câmeras Wi-Fi aceitam apenas uma): a nova conexão só começa quando a anterior encerra.
+        """
+        previous = self.worker
+        self.stop()
+        if previous is None or not previous.isRunning():
+            self._start_stream()
+            return
+        self._restart_after = previous
+        previous.finished.connect(self._on_previous_session_finished)
+        if previous.isFinished():  # encerrou antes de o sinal ser conectado
+            self._start_stream_after(previous)
+
+    def _on_previous_session_finished(self):
+        self._start_stream_after(self.sender())
+
+    def _start_stream_after(self, finished_session):
+        # stop() ou outro reconnect() depois do pedido cancelam este reinício
+        if self._restart_after is not None and finished_session is self._restart_after:
+            self._restart_after = None
+            self._start_stream()
 
     def closeEvent(self, event):
         self.stop()

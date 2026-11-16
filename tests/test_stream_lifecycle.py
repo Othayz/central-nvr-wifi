@@ -27,8 +27,9 @@ import central_nvr.core.stream_worker as stream_worker
 from central_nvr.core.camera import CameraDevice
 from central_nvr.core.threads import drain_retired_threads
 from central_nvr.ui.camera_grid import CameraGridWidget
+from central_nvr.ui.camera_view import CameraViewWidget
 
-# Roda o aplicativo real (central_nvr.app.main) com uma câmera cadastrada que nunca responde:
+# Roda o aplicativo real (central_nvr.app.main) com um Dispositivo Cadastrado que nunca responde:
 # a abertura do stream fica bloqueada, como em um host fora do ar. O operador remove a câmera
 # e depois fecha a janela.
 APP_SESSION_SCRIPT = textwrap.dedent("""
@@ -104,9 +105,9 @@ class RemoveUnresponsiveCameraTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
 
 
-def _demo_camera(cam_id: str) -> CameraDevice:
-    """Câmera com sinal de demonstração local (não usa rede). Cada chamada cria um objeto novo,
-    como acontece quando a janela principal recarrega os dispositivos da configuração."""
+def _local_signal_camera(cam_id: str) -> CameraDevice:
+    """Dispositivo com sinal de teste gerado localmente (demo://, sem rede). Cada chamada cria um
+    objeto novo, como acontece quando a janela principal recarrega os dispositivos da configuração."""
     return CameraDevice(id=cam_id, name=f"Câmera {cam_id}", ip="192.0.2.1", rtsp_url="demo://")
 
 
@@ -152,40 +153,108 @@ class CameraGridStreamLifecycleTest(unittest.TestCase):
         self.assertLess(elapsed, 0.5)
 
     def test_adding_or_removing_a_camera_keeps_other_streams_running(self):
-        self.grid.set_cameras([_demo_camera("a"), _demo_camera("b")])
+        self.grid.set_cameras([_local_signal_camera("a"), _local_signal_camera("b")])
         stream_a = self.grid.camera_views["a"].worker
 
-        self.grid.set_cameras([_demo_camera("a")])  # "b" removida
+        self.grid.set_cameras([_local_signal_camera("a")])  # "b" removida
         self.assertEqual(list(self.grid.camera_views), ["a"])
         self.assertIs(self.grid.camera_views["a"].worker, stream_a)
 
-        self.grid.set_cameras([_demo_camera("a"), _demo_camera("c")])  # "c" adicionada
+        self.grid.set_cameras([_local_signal_camera("a"), _local_signal_camera("c")])  # "c" adicionada
         self.assertEqual(list(self.grid.camera_views), ["a", "c"])
         self.assertIs(self.grid.camera_views["a"].worker, stream_a)
         self.assertTrue(stream_a.isRunning())
 
     def test_reconfigured_camera_gets_a_new_stream(self):
-        self.grid.set_cameras([_demo_camera("a"), _demo_camera("b")])
+        self.grid.set_cameras([_local_signal_camera("a"), _local_signal_camera("b")])
         stream_a = self.grid.camera_views["a"].worker
         stream_b = self.grid.camera_views["b"].worker
 
-        with_new_password = _demo_camera("a")
+        with_new_password = _local_signal_camera("a")
         with_new_password.password = "nova-senha"
-        self.grid.set_cameras([with_new_password, _demo_camera("b")])
+        self.grid.set_cameras([with_new_password, _local_signal_camera("b")])
 
         self.assertIsNot(self.grid.camera_views["a"].worker, stream_a)
         self.assertEqual(self.grid.camera_views["a"].worker.camera.password, "nova-senha")
         self.assertIs(self.grid.camera_views["b"].worker, stream_b)
 
     def test_changing_the_transport_setting_reconnects_the_streams(self):
-        self.grid.set_cameras([_demo_camera("a")])
+        self.grid.set_cameras([_local_signal_camera("a")])
         stream_a = self.grid.camera_views["a"].worker
 
         self.grid.rtsp_transport = "udp"  # como faz a janela principal ao salvar as Configurações
-        self.grid.set_cameras([_demo_camera("a")])
+        self.grid.set_cameras([_local_signal_camera("a")])
 
         self.assertIsNot(self.grid.camera_views["a"].worker, stream_a)
         self.assertEqual(self.grid.camera_views["a"].worker.rtsp_transport, "udp")
+
+    def test_changing_a_setting_unrelated_to_the_stream_keeps_it_running(self):
+        """Ex.: porta ONVIF ajustada pelo painel PTZ, ou renomeação: nada disso exige reabrir o RTSP."""
+        self.grid.set_cameras([_local_signal_camera("a")])
+        stream_a = self.grid.camera_views["a"].worker
+
+        updated = _local_signal_camera("a")
+        updated.port = 5000
+        updated.name = "Garagem"
+        self.grid.set_cameras([updated])
+
+        self.assertIs(self.grid.camera_views["a"].worker, stream_a)
+        self.assertIn("Garagem", self.grid.camera_views["a"].lbl_title.text())
+
+
+class ReconnectCameraTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
+
+    def test_reconnect_never_holds_two_sessions_on_the_same_camera(self):
+        """Câmeras Wi-Fi costumam aceitar uma única sessão RTSP: a nova só abre após a anterior encerrar."""
+        lock = threading.Lock()
+        sessions = {"open": 0, "peak": 0, "total": 0}
+        first_session_open = threading.Event()
+        release_first_session = threading.Event()
+
+        def camera_session(*args, **kwargs):
+            with lock:
+                sessions["open"] += 1
+                sessions["total"] += 1
+                sessions["peak"] = max(sessions["peak"], sessions["open"])
+                is_first = sessions["total"] == 1
+            try:
+                if is_first:
+                    first_session_open.set()
+                    release_first_session.wait(10)
+                else:
+                    time.sleep(0.05)
+                raise OSError("timeout")
+            finally:
+                with lock:
+                    sessions["open"] -= 1
+
+        self.addCleanup(release_first_session.set)
+        with patch.object(stream_worker.av, "open", camera_session):
+            view = CameraViewWidget(CameraDevice(id="wifi", name="Quintal", ip="192.0.2.20"))
+            self.assertTrue(first_session_open.wait(5))
+
+            view.reconnect()
+            time.sleep(0.3)  # tempo de sobra para uma segunda sessão abrir, se fosse o caso
+            sessions_while_first_was_open = sessions["total"]
+
+            release_first_session.set()
+            deadline = time.monotonic() + 5
+            while sessions["total"] < 2 and time.monotonic() < deadline:
+                self.app.processEvents()
+                time.sleep(0.01)
+
+            view.stop()
+            self.assertTrue(drain_retired_threads(10000))
+
+        view.deleteLater()
+        QCoreApplication.sendPostedEvents(view, QEvent.Type.DeferredDelete)
+
+        self.assertEqual(sessions_while_first_was_open, 1)
+        self.assertGreaterEqual(sessions["total"], 2, "o stream não foi reaberto após a sessão anterior encerrar")
+        self.assertEqual(sessions["peak"], 1)
 
 
 if __name__ == "__main__":

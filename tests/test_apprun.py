@@ -74,13 +74,13 @@ class AppRunSearchPathTest(unittest.TestCase):
 
     def test_library_path_has_no_empty_entries(self):
         """Entrada vazia em LD_LIBRARY_PATH faz o loader procurar bibliotecas no diretório atual."""
-        for host_value in (None, ":/opt/host/lib:"):
+        for host_value, host_entries in ((None, []), (":/opt/host/lib:", ["/opt/host/lib"])):
             with self.subTest(host_LD_LIBRARY_PATH=host_value):
                 host_env = {} if host_value is None else {"LD_LIBRARY_PATH": host_value}
                 entries = self._launch(**host_env)["LD_LIBRARY_PATH"].split(":")
                 self.assertNotIn("", entries)
                 self.assertEqual(entries[0], f"{self.appdir}/usr/lib")
-        self.assertIn("/opt/host/lib", entries)
+                self.assertEqual(entries[-len(host_entries):] if host_entries else [], host_entries)
 
     def test_host_pythonpath_is_not_inherited(self):
         """O interpretador embutido não carrega módulos apontados pelo PYTHONPATH do host."""
@@ -89,7 +89,7 @@ class AppRunSearchPathTest(unittest.TestCase):
         self.assertNotIn("", report["PYTHONPATH"].split(":"))
 
     def test_bundled_launcher_does_not_import_from_current_directory(self):
-        """O wrapper usr/bin/central-nvr (usado pelo AppRun quando presente) tem a mesma proteção."""
+        """O launcher usr/bin/central-nvr (usado pelo AppRun quando presente) tem a mesma proteção."""
         launcher = self.appdir / "usr" / "bin" / "central-nvr"
         shutil.copy(PACKAGING / "central-nvr-launcher.sh", launcher)
         os.chmod(launcher, 0o755)
@@ -99,6 +99,20 @@ class AppRunSearchPathTest(unittest.TestCase):
         self.assertNotIn("", report["sys_path"])
         self.assertNotIn(str(self.downloads), report["sys_path"])
         self.assertNotIn("/opt/host/python-modules", report["sys_path"])
+        self.assertFalse(report["argparse"].startswith(str(self.downloads)))
+
+    def test_host_python_fallback_does_not_import_from_current_directory(self):
+        """Sem interpretador embutido, o AppRun usa o python3 do host com a mesma proteção."""
+        (self.appdir / "usr" / "bin" / "python3").unlink()
+        host_bin = self.appdir.parent / "host-bin"
+        host_bin.mkdir()
+        os.symlink(sys.executable, host_bin / "python3")
+
+        report = self._launch(PATH=f"{host_bin}:{os.environ.get('PATH', '')}", PYTHONPATH="/opt/host/python-modules")
+
+        self.assertNotIn("", report["sys_path"])
+        self.assertNotIn(str(self.downloads), report["sys_path"])
+        self.assertIn(f"{self.appdir}/usr/src", report["sys_path"])
         self.assertFalse(report["argparse"].startswith(str(self.downloads)))
 
 

@@ -148,8 +148,10 @@ class CameraGridWidget(QWidget):
             if cam.id in self.camera_views:
                 continue
             view = previous_views.get(cam.id)
-            if view is not None and self._view_is_current(view, cam):
+            if view is not None and self._can_keep_stream(view, cam):
                 del previous_views[cam.id]
+                if view.camera.name != cam.name:
+                    view.update_camera_name(cam.name)
             else:
                 view = self._create_view(cam)
             self.camera_views[cam.id] = view
@@ -167,10 +169,10 @@ class CameraGridWidget(QWidget):
 
         self.apply_layout(self.grid_layout_mode)
 
-    def _view_is_current(self, view: CameraViewWidget, camera: CameraDevice) -> bool:
-        """Indica se a view já exibe esta câmera com os mesmos parâmetros de conexão do grid."""
+    def _can_keep_stream(self, view: CameraViewWidget, camera: CameraDevice) -> bool:
+        """Indica se o stream aberto pela view continua válido para esta câmera e para as opções do grid."""
         return (
-            view.camera.to_dict() == camera.to_dict()
+            view.camera.stream_settings() == camera.stream_settings()
             and view.hw_accel == self.hw_accel
             and view.rtsp_transport == self.rtsp_transport
         )

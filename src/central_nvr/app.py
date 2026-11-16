@@ -57,11 +57,11 @@ def setup_logging(debug: bool = False):
 SHUTDOWN_THREAD_TIMEOUT_MS = 8000
 
 
-def _finish(exit_code: int, *thread_owners) -> int:
+def _exit_code_after_background_threads(exit_code: int, *thread_owners) -> int:
     """
-    Encerra o processo sem destruir nenhuma thread Qt em execução (o que abortaria com SIGABRT).
-    Espera as threads de segundo plano; se alguma continuar presa na rede além do limite,
-    termina o processo diretamente, sem passar pela destruição dos objetos Qt.
+    Devolve exit_code depois de esperar as threads de segundo plano, para que nenhuma thread Qt
+    seja destruída em execução (o que abortaria com SIGABRT). Se alguma continuar presa na rede
+    além do limite, NÃO retorna: termina o processo com os._exit, sem a destruição dos objetos Qt.
     """
     from central_nvr.core.threads import drain_retired_threads, retire_running_threads_of
 
@@ -71,6 +71,8 @@ def _finish(exit_code: int, *thread_owners) -> int:
 
     if not drain_retired_threads(SHUTDOWN_THREAD_TIMEOUT_MS):
         logging.shutdown()
+        sys.stdout.flush()
+        sys.stderr.flush()
         os._exit(exit_code)
     return exit_code
 
@@ -141,13 +143,13 @@ def main() -> int:
         splash.exec()
         if not splash.should_open_main_window:
             logger.info("Encerrando inicialização (instalador acionado).")
-            return _finish(0, splash)
+            return _exit_code_after_background_threads(0, splash)
 
     # 2. Criar e exibir janela principal
     window = MainWindow(config_mgr=config_mgr)
     window.show()
 
-    return _finish(app.exec(), window, splash)
+    return _exit_code_after_background_threads(app.exec(), window, splash)
 
 
 if __name__ == "__main__":

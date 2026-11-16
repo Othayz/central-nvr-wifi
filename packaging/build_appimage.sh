@@ -78,7 +78,7 @@ mkdir -p "${APPDIR}/usr/src"
 rm -rf "${APPDIR}/usr/src/central_nvr"
 cp -r "${PROJECT_ROOT}/src/central_nvr" "${APPDIR}/usr/src/"
 
-# Instalar wrapper executável central-nvr
+# Instalar o launcher usr/bin/central-nvr
 cp "${PROJECT_ROOT}/packaging/central-nvr-launcher.sh" "${APPDIR}/usr/bin/central-nvr"
 chmod +x "${APPDIR}/usr/bin/central-nvr"
 
