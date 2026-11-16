@@ -16,6 +16,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -340,7 +341,14 @@ def download_asset(
         start_time = time.time()
 
         part_path = dest_path + ".part"
-        with open(part_path, "wb") as f:
+        # Criação exclusiva sem seguir symlinks: um .part pré-existente (resíduo ou link plantado)
+        # é removido em vez de ser reaproveitado como destino da escrita.
+        try:
+            os.unlink(part_path)
+        except FileNotFoundError:
+            pass
+        part_fd = os.open(part_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(part_fd, "wb") as f:
             for chunk in response.iter_content(chunk_size=65536):
                 if cancel_event and cancel_event.is_set():
                     logger.info("Download cancelado pelo usuário.")
@@ -549,6 +557,53 @@ StartupWMClass=central-nvr
         logger.debug(f"Erro ao registrar atalho desktop: {e}")
 
 
+class PackageIntegrityError(Exception):
+    """O pacote preparado para instalação não corresponde ao SHA-256 esperado."""
+
+
+def _require_sha256(path: Path, expected_sha256: str) -> None:
+    """Levanta PackageIntegrityError se o arquivo não corresponder ao SHA-256 esperado."""
+    if not verify_file_sha256(str(path), expected_sha256):
+        raise PackageIntegrityError(
+            f"Falha de integridade SHA-256: checksum divergente "
+            f"(esperado: {expected_sha256}, calculado: {compute_file_sha256(str(path))})."
+        )
+
+
+def _stage_verified_copy(source: Path, target_path: Path, expected_sha256: str) -> Path:
+    """
+    Copia o pacote para um temporário exclusivo ao lado do destino e valida o SHA-256 dessa cópia,
+    que é o mesmo arquivo que sofrerá os.replace. Verificar a origem e copiar depois deixaria uma
+    janela para o pacote ser trocado entre a verificação e a instalação.
+    """
+    fd, staged_name = tempfile.mkstemp(prefix=f"{target_path.name}.tmp.", dir=str(target_path.parent))
+    staged = Path(staged_name)
+    try:
+        with os.fdopen(fd, "wb") as out_f, open(source, "rb") as in_f:
+            shutil.copyfileobj(in_f, out_f)
+        _require_sha256(staged, expected_sha256)
+        os.chmod(staged, 0o755)
+        return staged
+    except BaseException:
+        staged.unlink(missing_ok=True)
+        raise
+
+
+def _replace_appimage_atomically(source: Path, target_path: Path, expected_sha256: str) -> None:
+    """Atomic Replacement: substitui target_path pela cópia verificada, preservando o anterior em .bak."""
+    backup_path = target_path.with_name(f"{target_path.name}.bak")
+    staged = _stage_verified_copy(source, target_path, expected_sha256)
+    try:
+        if target_path.exists():
+            shutil.copy2(target_path, backup_path)
+        os.replace(staged, target_path)
+    except Exception:
+        staged.unlink(missing_ok=True)
+        if backup_path.exists() and not target_path.exists():
+            os.replace(backup_path, target_path)
+        raise
+
+
 def install_downloaded_package(
     file_path: str,
     expected_sha256: Optional[str] = None,
@@ -571,60 +626,30 @@ def install_downloaded_package(
         return False, "Release sem checksum SHA-256 válido: instalação bloqueada por segurança."
 
     expected_hash = expected_sha256.strip()
-    if not verify_file_sha256(file_path, expected_hash):
-        actual_hash = compute_file_sha256(file_path)
-        return False, f"Falha de integridade SHA-256: checksum divergente (esperado: {expected_hash}, calculado: {actual_hash})."
-
-    file_obj = Path(file_path).resolve()
     filename_lower = file_obj.name.lower()
 
     try:
         # Formato Principal: AppImage universal
         if filename_lower.endswith(".appimage"):
-            os.chmod(file_obj, 0o755)
             running_appimage = os.environ.get("APPIMAGE")
 
             # Se estiver rodando a partir de um AppImage existente, realizar Atomic Replacement
             if running_appimage and os.path.exists(running_appimage):
                 target_path = Path(running_appimage).resolve()
-                temp_target = target_path.with_name(f"{target_path.name}.tmp.{os.getpid()}")
-                backup_path = target_path.with_name(f"{target_path.name}.bak")
-                try:
-                    shutil.copy2(file_obj, temp_target)
-                    os.chmod(temp_target, 0o755)
-                    shutil.copy2(target_path, backup_path)
-                    os.replace(temp_target, target_path)
-                except Exception:
-                    if temp_target.exists():
-                        temp_target.unlink()
-                    if backup_path.exists() and not target_path.exists():
-                        os.replace(backup_path, target_path)
-                    raise
+                _replace_appimage_atomically(file_obj, target_path, expected_hash)
                 return True, f"Central NVR WiFi atualizada com sucesso em {target_path}. Reinicie o aplicativo para usar a nova versão."
 
             # Caso contrário, instalar no diretório de binários do usuário (~/.local/bin)
             user_bin_dir = Path.home() / ".local" / "bin"
             user_bin_dir.mkdir(parents=True, exist_ok=True)
             target_path = user_bin_dir / "central-nvr.AppImage"
-            temp_target = target_path.with_name(f"{target_path.name}.tmp.{os.getpid()}")
-            backup_path = target_path.with_name(f"{target_path.name}.bak")
-            try:
-                shutil.copy2(file_obj, temp_target)
-                os.chmod(temp_target, 0o755)
-                if target_path.exists():
-                    shutil.copy2(target_path, backup_path)
-                os.replace(temp_target, target_path)
-            except Exception:
-                if temp_target.exists():
-                    temp_target.unlink()
-                if backup_path.exists() and not target_path.exists():
-                    os.replace(backup_path, target_path)
-                raise
+            _replace_appimage_atomically(file_obj, target_path, expected_hash)
             _ensure_desktop_entry_for_appimage(target_path)
             return True, f"Central NVR WiFi AppImage instalada com sucesso em {target_path}."
 
         # Formato Secundário: Tarball comprimido (.tar.gz / .tgz) com proteção Tar Slip (SEC-03)
         elif filename_lower.endswith((".tar.gz", ".tgz")):
+            _require_sha256(file_obj, expected_hash)
             target_base = Path.home() / ".local"
             target_base.mkdir(parents=True, exist_ok=True)
             import tarfile
@@ -634,6 +659,9 @@ def install_downloaded_package(
 
         return False, f"Formato não suportado para atualização: {file_obj.suffix}"
 
+    except PackageIntegrityError as e:
+        logger.error(str(e))
+        return False, str(e)
     except Exception as e:
         logger.error(f"Erro ao processar pacote AppImage: {e}")
         return False, str(e)

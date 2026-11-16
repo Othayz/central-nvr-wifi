@@ -2,6 +2,7 @@
 """Teste E2E local do fluxo de atualização (checksum -> download -> instalação)."""
 import hashlib
 import os
+import stat
 import sys
 import tempfile
 import time
@@ -130,6 +131,17 @@ class UpdateFlowTest(unittest.TestCase):
         self.assertIsNone(dlg.downloaded_file_path)
         leftovers = [f for _, _, fs in os.walk(tmp.name) for f in fs if f.endswith((".part", ".AppImage")) and f != "running.AppImage"]
         self.assertEqual(leftovers, [])
+
+    def test_download_goes_to_private_updates_dir(self):
+        """O pacote baixado fica no diretório privado (0700) do usuário, nunca em /tmp compartilhado (#15)."""
+        sums = f"{hashlib.sha256(PAYLOAD).hexdigest()}  {APP_NAME}\n".encode()
+        dlg, running, hits, tmp = self._run({APP_NAME: PAYLOAD, "sha256sums.txt": sums})
+        dlg._on_action_clicked()
+        self.assertTrue(_wait(self.app, lambda: dlg.downloaded_file_path is not None))
+
+        updates_dir = Path(tmp.name) / "central-nvr" / "updates"
+        self.assertEqual(Path(dlg.downloaded_file_path), updates_dir / APP_NAME)
+        self.assertEqual(stat.S_IMODE(updates_dir.stat().st_mode), 0o700)
 
     def test_startup_missing_checksum_redirects_browser(self):
         from central_nvr.ui.update_dialog import StartupUpdateDialog

@@ -6,7 +6,6 @@ Inclui StartupUpdateDialog (Modo Splash de Inicialização) e UpdateDialog (Modo
 import html
 import logging
 import os
-import tempfile
 from typing import Optional
 
 from PySide6.QtCore import QEventLoop, QObject, QSize, Qt, QTimer, QUrl
@@ -36,6 +35,7 @@ from central_nvr.core.updater import (
     ReleaseInfo,
     UpdateCheckWorker,
     find_best_asset_for_system,
+    get_updates_dir,
     install_downloaded_package,
 )
 
@@ -142,6 +142,14 @@ class BaseUpdateDialog(QDialog):
         except Exception:
             pass
         button.clicked.connect(self._open_release_page)
+
+    def _download_destination(self) -> str:
+        """
+        Caminho de destino do download no diretório privado de atualizações (0700).
+        Nunca usa /tmp: um diretório compartilhado permitiria a outro usuário local
+        plantar symlinks ou trocar o pacote entre a verificação e a instalação.
+        """
+        return os.path.join(str(get_updates_dir()), os.path.basename(self.best_asset.name))
 
     def _on_checksum_ready(self, sha: str):
         """Trata o recebimento bem-sucedido do hash SHA-256 da release."""
@@ -390,13 +398,9 @@ class StartupUpdateDialog(BaseUpdateDialog):
         self.btn_update.setEnabled(False)
         self.btn_update.setText("Baixando...")
 
-        from central_nvr.core.updater import get_updates_dir
-        dest_dir = get_updates_dir()
-        dest_file = os.path.join(str(dest_dir), self.best_asset.name)
-
         self.download_worker = AssetDownloadWorker(
             download_url=self.best_asset.download_url,
-            destination_path=dest_file,
+            destination_path=self._download_destination(),
             token=self.token,
             expected_size=self.best_asset.size,
             parent=self,
@@ -679,13 +683,9 @@ class UpdateDialog(BaseUpdateDialog):
         self.btn_action.setEnabled(False)
         self.btn_action.setText("Baixando...")
 
-        dest_dir = os.path.join(tempfile.gettempdir(), "central_nvr_updates")
-        os.makedirs(dest_dir, exist_ok=True)
-        dest_file = os.path.join(dest_dir, self.best_asset.name)
-
         self.download_worker = AssetDownloadWorker(
             download_url=self.best_asset.download_url,
-            destination_path=dest_file,
+            destination_path=self._download_destination(),
             token=self.token,
             expected_size=self.best_asset.size,
             parent=self,
