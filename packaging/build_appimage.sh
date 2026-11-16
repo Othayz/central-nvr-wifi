@@ -78,17 +78,8 @@ mkdir -p "${APPDIR}/usr/src"
 rm -rf "${APPDIR}/usr/src/central_nvr"
 cp -r "${PROJECT_ROOT}/src/central_nvr" "${APPDIR}/usr/src/"
 
-# Criar wrapper executável central-nvr
-cat <<'EOF' > "${APPDIR}/usr/bin/central-nvr"
-#!/bin/sh
-APPDIR="$(dirname "$(dirname "$(dirname "$(readlink -f "$0")")")")"
-SITE_PACKAGES="${APPDIR}/usr/lib/python3.12/site-packages"
-[ ! -d "$SITE_PACKAGES" ] && SITE_PACKAGES="${APPDIR}/usr/lib/python3/site-packages"
-
-export PYTHONHOME="${APPDIR}/usr"
-export PYTHONPATH="${APPDIR}/usr/src:${SITE_PACKAGES}:${PYTHONPATH}"
-exec "${APPDIR}/usr/bin/python3" -m central_nvr "$@"
-EOF
+# Instalar wrapper executável central-nvr
+cp "${PROJECT_ROOT}/packaging/central-nvr-launcher.sh" "${APPDIR}/usr/bin/central-nvr"
 chmod +x "${APPDIR}/usr/bin/central-nvr"
 
 # 4. Copiar metadados de Desktop, Ícones e AppStream
