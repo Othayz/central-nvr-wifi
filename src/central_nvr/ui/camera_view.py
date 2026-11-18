@@ -3,15 +3,14 @@ Widget de Viewport de Câmera Individual com OSD, Controles em Tempo Real e Reno
 """
 import datetime
 import html
-import os
 import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from PySide6.QtCore import QPoint, QRect, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QCursor, QFont, QImage, QPainter, QPen, QPixmap
+from PySide6.QtCore import QPoint, QRect, Qt, QTimer, Signal
+from PySide6.QtGui import QColor, QCursor, QFont, QImage, QPainter
 from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
@@ -72,7 +71,6 @@ class CameraViewWidget(QFrame):
     double_clicked = Signal(str)  # camera_id
     ptz_requested = Signal(str)  # camera_id
     snapshot_taken = Signal(str, str)  # (camera_id, filepath)
-    fullscreen_requested = Signal(str)  # camera_id
     rename_requested = Signal(str, str)  # (camera_id, new_name)
 
     def __init__(
@@ -339,7 +337,7 @@ class CameraViewWidget(QFrame):
         """Exibe menu de contexto com opções rápidas incluindo renomear câmera."""
         menu = QMenu(self)
 
-        act_rename = menu.addAction(f"✏️ Renomear Câmera...")
+        act_rename = menu.addAction("✏️ Renomear Câmera...")
         menu.addSeparator()
         act_snap = menu.addAction("📸 Tirar Foto / Snapshot")
         act_ptz = menu.addAction("🎮 Abrir Controle PTZ")

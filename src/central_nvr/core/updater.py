@@ -7,15 +7,12 @@ download seguro com validação SHA-256 e substituição atômica de executávei
 from dataclasses import dataclass, field
 import datetime
 import hashlib
-import json
 import logging
 import os
 from pathlib import Path
-import platform
 import re
 import shutil
 import subprocess
-import sys
 import tempfile
 import threading
 import time
@@ -599,7 +596,7 @@ Type=Application
 Name=Central NVR WiFi
 GenericName=NVR IP Camera Viewer
 Comment=Sistema de Gerenciamento, Descoberta ONVIF e Streaming RTSP de Baixa Latência
-Exec={exec_path} %U
+Exec={exec_path}
 Icon=central-nvr
 Terminal=false
 Categories=AudioVideo;Video;Network;Monitor;Security;

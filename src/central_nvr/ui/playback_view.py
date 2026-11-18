@@ -5,7 +5,6 @@ import datetime
 import logging
 import os
 import subprocess
-from pathlib import Path
 from typing import Optional
 
 from PySide6.QtCore import Qt, Signal

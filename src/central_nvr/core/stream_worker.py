@@ -2,7 +2,6 @@
 Worker de Streaming RTSP de Baixa Latência com suporte a VA-API / Aceleração de Hardware,
 Transporte Adaptativo (Auto-Fallback UDP/TCP), Métricas de QoS (Jitter/Perda) e Detecção de Movimento Integrada.
 """
-import datetime
 from enum import Enum
 import logging
 import math
@@ -213,9 +212,6 @@ class StreamWorker(QThread):
         self._frame_pending = False
         self._target_size: Optional[Tuple[int, int]] = None
         self._request_snapshot: Optional[str] = None
-        self._is_recording = False
-        self._recording_writer = None
-        self._recording_path = ""
 
         # Estatísticas e Métricas de QoS
         self.stats = StreamStats()

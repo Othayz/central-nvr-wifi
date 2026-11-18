@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
 authors = [
-    {name = "Othay", email = "developer@centralnvr.local"}
+    {name = "Othay"}
 ]
 keywords = ["nvr", "onvif", "rtsp", "ptz", "cctv", "camera", "pyside6", "linux"]
 classifiers = [

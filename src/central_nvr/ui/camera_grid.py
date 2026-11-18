@@ -113,7 +113,6 @@ class CameraGridWidget(QWidget):
     snapshot_taken = Signal(str, str)  # (camera_id, filepath)
     add_camera_requested = Signal()
     layout_mode_changed = Signal(str)  # "auto", "1x1", "2x2", "3x3"
-    fullscreen_requested = Signal(str)  # camera_id
     camera_renamed = Signal(str, str)  # (camera_id, new_name)
     camera_display_state_changed = Signal(str, str)  # (camera_id, "Ao Vivo" / "Sem sinal" / ...)
 
@@ -234,7 +233,6 @@ class CameraGridWidget(QWidget):
         view.double_clicked.connect(self._on_camera_double_clicked)
         view.ptz_requested.connect(lambda cid: self.ptz_requested.emit(cid))
         view.snapshot_taken.connect(lambda cid, fp: self.snapshot_taken.emit(cid, fp))
-        view.fullscreen_requested.connect(lambda cid: self.fullscreen_requested.emit(cid))
         view.rename_requested.connect(lambda cid, name: self.camera_renamed.emit(cid, name))
         view.display_state_changed.connect(self.camera_display_state_changed.emit)
         return view
@@ -250,7 +248,6 @@ class CameraGridWidget(QWidget):
             view.double_clicked.disconnect()
             view.ptz_requested.disconnect()
             view.snapshot_taken.disconnect()
-            view.fullscreen_requested.disconnect()
             view.rename_requested.disconnect()
             view.display_state_changed.disconnect()
         except Exception:

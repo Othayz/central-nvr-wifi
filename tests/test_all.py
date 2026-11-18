@@ -9,7 +9,7 @@ import tempfile
 import unittest
 import urllib.parse
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 # Adicionar src ao path de importação e isolar diretórios XDG dos testes
 root_path = Path(__file__).parent.parent
@@ -20,7 +20,7 @@ _test_xdg_temp = tempfile.TemporaryDirectory()
 os.environ["XDG_CONFIG_HOME"] = str(Path(_test_xdg_temp.name) / "config")
 os.environ["XDG_DATA_HOME"] = str(Path(_test_xdg_temp.name) / "data")
 
-from central_nvr.core.camera import CameraDevice, ConnectionState, StreamStats
+from central_nvr.core.camera import CameraDevice
 from central_nvr.core.config import (
     ConfigManager,
     get_config_dir,
@@ -31,8 +31,8 @@ from central_nvr.core.config import (
 )
 from central_nvr.core.onvif_client import OnvifClient
 from central_nvr.core.stream_worker import StreamWorker
-from central_nvr.scanner.discovery import NetworkScanner, get_local_ip_addresses
-from central_nvr.scanner.parser import detect_manufacturer, parse_ws_discovery_response, parse_ws_discovery_fallback
+from central_nvr.scanner.discovery import get_local_ip_addresses
+from central_nvr.scanner.parser import detect_manufacturer, parse_ws_discovery_response
 
 
 class TestScannerAndParser(unittest.TestCase):
@@ -637,7 +637,6 @@ class TestSecurityAuditRemediations(unittest.TestCase):
 
     def test_devices_json_password_sanitization(self):
         """SEC-01 & SEC-05: Valida que senhas são salvas no keyring e purgadas de devices.json."""
-        import json
         from pathlib import Path
         from central_nvr.core.config import ConfigManager
 
@@ -679,7 +678,6 @@ class TestSecurityAuditRemediations(unittest.TestCase):
 
     def test_github_pat_stored_in_keyring_and_omitted_from_settings(self):
         """SEC-04: Valida que GitHub PAT é armazenado no Keyring e omitido de settings.json."""
-        import json
         from pathlib import Path
         from central_nvr.core.config import ConfigManager
 
@@ -752,7 +750,7 @@ class TestSecurityAuditRemediations(unittest.TestCase):
                         with patch("central_nvr.core.config.get_keyring_password", side_effect=mock_get_pw):
                             with patch("central_nvr.core.config.set_keyring_pat", side_effect=mock_set_pat):
                                 with patch("central_nvr.core.config.get_keyring_pat", side_effect=mock_get_pat):
-                                    cfg = ConfigManager()
+                                    ConfigManager()  # a migração acontece no load()
 
                                     # Verificar se foram migrados para o keyring
                                     self.assertEqual(keyring_store.get("pat"), "ghp_LegacyTokenToBeMigrated")

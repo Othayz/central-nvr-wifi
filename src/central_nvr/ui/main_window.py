@@ -7,13 +7,12 @@ import logging
 import os
 from typing import List, Optional
 
-from PySide6.QtCore import QSize, Qt, QTimer
-from PySide6.QtGui import QAction, QIcon, QKeySequence
+from PySide6.QtCore import Qt, QTimer
+from PySide6.QtGui import QAction, QIcon
 from PySide6.QtWidgets import (
     QButtonGroup,
     QFrame,
     QHBoxLayout,
-    QHeaderView,
     QInputDialog,
     QLabel,
     QListWidget,
@@ -23,7 +22,6 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QSplitter,
-    QStatusBar,
     QTabWidget,
     QTreeWidget,
     QTreeWidgetItem,
@@ -33,14 +31,14 @@ from PySide6.QtWidgets import (
 
 from central_nvr import __version__
 from central_nvr.core.camera import DEFAULT_RTSP_TRANSPORT, CameraDevice
-from central_nvr.core.config import ConfigManager, get_data_dir
+from central_nvr.core.config import ConfigManager
 from central_nvr.ui.camera_grid import CameraGridWidget
 from central_nvr.ui.discovery_dialog import DiscoveryDialog
 from central_nvr.ui.playback_view import PlaybackWidget
 from central_nvr.ui.camera_view import ViewOptions
 from central_nvr.ui.ptz_controller import PTZControllerWidget
 from central_nvr.ui.settings_dialog import SettingsDialog
-from central_nvr.ui.styles import DARK_THEME_QSS, LIGHT_THEME_QSS, get_theme_qss
+from central_nvr.ui.styles import get_theme_qss
 from central_nvr.ui.update_dialog import UpdateDialog
 from central_nvr.core.updater import ReleaseInfo, UpdateCheckWorker
 
@@ -62,7 +60,6 @@ class MainWindow(QMainWindow):
 
         # Definir ícone da janela
         from pathlib import Path
-        from PySide6.QtGui import QIcon
         icon_path = Path(__file__).parent / "assets" / "central-nvr.png"
         if icon_path.exists():
             self.setWindowIcon(QIcon(str(icon_path)))
@@ -124,7 +121,6 @@ class MainWindow(QMainWindow):
         self.camera_grid.snapshot_taken.connect(self._on_snapshot_saved)
         self.camera_grid.add_camera_requested.connect(self._open_discovery_dialog)
         self.camera_grid.layout_mode_changed.connect(self._on_layout_mode_changed_by_grid)
-        self.camera_grid.fullscreen_requested.connect(self._on_camera_fullscreen_requested)
         self.camera_grid.camera_renamed.connect(self._on_camera_renamed)
         self.camera_grid.camera_display_state_changed.connect(self._on_camera_display_state_changed)
         right_vbox.addWidget(self.camera_grid, stretch=1)
@@ -381,7 +377,7 @@ class MainWindow(QMainWindow):
         self.lbl_sb_hw.setStyleSheet("color: #38BDF8; font-weight: 600; padding: 0 8px;")
         status_bar.addWidget(self.lbl_sb_hw)
 
-        self.lbl_sb_streams = QLabel(f"Câmeras Conectadas: {len(self.cameras)}")
+        self.lbl_sb_streams = QLabel(f"Câmeras Cadastradas: {len(self.cameras)}")
         self.lbl_sb_streams.setStyleSheet("color: #4ADE80; font-weight: 600; padding: 0 8px;")
         status_bar.addWidget(self.lbl_sb_streams)
 
@@ -594,7 +590,7 @@ class MainWindow(QMainWindow):
             self._load_cameras_from_config()
             self.camera_grid.set_cameras(self.cameras)
             self._populate_device_tree()
-            self.lbl_sb_streams.setText(f"Câmeras Conectadas: {len(self.cameras)}")
+            self.lbl_sb_streams.setText(f"Câmeras Cadastradas: {len(self.cameras)}")
             if not self.cameras:
                 self.ptz_panel.set_camera(None)
                 if hasattr(self, "recordings_panel"):
@@ -646,13 +642,6 @@ class MainWindow(QMainWindow):
         if hasattr(self, "layout_buttons") and mode.lower() in self.layout_buttons:
             self.layout_buttons[mode.lower()].setChecked(True)
         self._log_event("Layout", f"Grade alternada para {mode}")
-
-    def _on_camera_fullscreen_requested(self, camera_id: str):
-        """Abre a janela exclusiva de tela cheia para a câmera selecionada."""
-        self._select_camera_by_id(camera_id)
-        if hasattr(self, "camera_grid") and camera_id in self.camera_grid.camera_views:
-            view = self.camera_grid.camera_views[camera_id]
-            view._open_fullscreen_player()
 
     def _enter_grid_fullscreen(self):
         """Coloca todas as câmeras conectadas em tela cheia (ocultando sidebar, header e status bar)."""
@@ -727,15 +716,14 @@ class MainWindow(QMainWindow):
         self._load_cameras_from_config()
         self.camera_grid.set_cameras(self.cameras)
         self._populate_device_tree()
-        self.lbl_sb_streams.setText(f"Fluxos Ativos: {len(self.cameras)}")
+        self.lbl_sb_streams.setText(f"Câmeras Cadastradas: {len(self.cameras)}")
         self._log_event("Dispositivo", f"Câmera '{camera.name}' adicionada ao sistema.")
 
     def _set_theme(self, theme_name: str):
         """Aplica o tema selecionado (dark ou light) e salva nas preferências."""
         theme = (theme_name or "dark").lower()
         self.current_theme = theme
-        self.config_mgr.set("theme", theme)
-        self.config_mgr.save_settings()
+        self.config_mgr.set("theme", theme)  # set() já grava settings.json
         self.setStyleSheet(get_theme_qss(theme))
 
         if hasattr(self, "act_theme_dark"):
@@ -744,11 +732,6 @@ class MainWindow(QMainWindow):
             self.act_theme_light.setChecked(theme == "light")
 
         self._log_event("Aparência", f"Tema alterado para '{theme.capitalize()}'")
-
-    def _toggle_theme(self):
-        """Alterna entre Tema Claro e Tema Escuro."""
-        next_theme = "dark" if self.current_theme == "light" else "light"
-        self._set_theme(next_theme)
 
     def _open_settings_dialog(self):
         dialog = SettingsDialog(config_mgr=self.config_mgr, parent=self)

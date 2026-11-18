@@ -37,6 +37,11 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt pytest
 
+      - name: Lint (pyflakes via ruff)
+        run: |
+          pip install ruff
+          ruff check --select F src tests scripts
+
       - name: Run Full Test Suite
         env:
           QT_QPA_PLATFORM: offscreen

@@ -2,13 +2,19 @@
 """
 Script de diagnóstico de câmera IP / RTSP / ONVIF para Central NVR WiFi.
 Testa portas, rotas RTSP e autenticação diretamente.
+
+Uso:
+    python3 scripts/diagnose_camera.py <ip>
+
+A senha NÃO é aceita como argumento (ficaria visível em `ps`): é lida da variável de ambiente
+CENTRAL_NVR_CAMERA_PASSWORD ou digitada sem eco. O teste de RTSP roda no próprio processo com
+PyAV, então a URL com credenciais também não aparece na linha de comando de outro programa.
 """
+import getpass
+import os
 import socket
 import sys
-import subprocess
-import urllib.request
 import urllib.parse
-import urllib.error
 
 def test_port(ip, port, timeout=1.0):
     try:
@@ -70,46 +76,65 @@ def diagnose(ip, password=""):
             else:
                 auth = f"{auth_user}@"
         url = f"rtsp://{auth}{ip}:554/onvif1"
-        print(f"\n  🎯 CÂMERA DETECTADA NO CAMINHO: /onvif1")
-        print(f"  -> Testando combinações de protocolo para Yoosee...")
+        print("\n  🎯 CÂMERA DETECTADA NO CAMINHO: /onvif1")
+        print("  -> Testando combinações de protocolo para Yoosee...")
 
         tests = [
-            ("UDP (Padrão Yoosee)", ["-rtsp_transport", "udp", "-reorder_queue_size", "0"]),
-            ("TCP com Bypass de Mismatch", ["-rtsp_flags", "prefer_tcp"]),
-            ("TCP com fflags flexíveis", ["-rtsp_transport", "tcp", "-fflags", "+genpts+discardcorrupt"]),
-            ("UDP Multicast / Unicast", ["-rtsp_transport", "udp_multicast"]),
+            ("UDP (Padrão Yoosee)", {"rtsp_transport": "udp", "reorder_queue_size": "0"}),
+            ("TCP com Bypass de Mismatch", {"rtsp_flags": "prefer_tcp"}),
+            ("TCP com fflags flexíveis", {"rtsp_transport": "tcp", "fflags": "+genpts+discardcorrupt"}),
+            ("UDP Multicast / Unicast", {"rtsp_transport": "udp_multicast"}),
         ]
 
-        for desc, flags in tests:
+        try:
+            import av
+        except ImportError:
+            print("  ⚠️  PyAV não instalado (pip install av): teste de fluxo RTSP ignorado.")
+            return
+
+        for desc, options in tests:
             print(f"\n  [+] Tentando modo: {desc}...")
-            cmd = ["ffprobe", "-v", "warning"] + flags + [
-                "-analyzeduration", "5000000",
-                "-probesize", "5000000",
-                "-show_entries", "stream=codec_name,width,height,r_frame_rate",
-                "-of", "default=noprint_wrappers=1",
-                url
-            ]
+            opts = dict(options, analyzeduration="5000000", probesize="5000000")
             try:
-                result = subprocess.run(cmd, capture_output=True, text=True, timeout=8)
-                if result.returncode == 0 and ("codec_name" in result.stdout or "width" in result.stdout):
-                    print(f"     🎉🎉🎉 SUCESSO ABSOLUTO! O fluxo de vídeo respondeu perfeitamente:")
-                    for line in result.stdout.strip().split("\n"):
-                        if line:
-                            print(f"        👉 {line}")
-                    print(f"\n  🌟 CONFIGURAÇÃO VENCEDORA:")
+                with av.open(url, mode="r", options=opts, timeout=8.0) as container:
+                    video = next((st for st in container.streams if st.type == "video"), None)
+                    if video is None:
+                        print("     ⚠️  Conectou, mas sem trilha de vídeo.")
+                        continue
+                    ctx = video.codec_context
+                    print("     🎉🎉🎉 SUCESSO ABSOLUTO! O fluxo de vídeo respondeu perfeitamente:")
+                    print(f"        👉 codec_name={ctx.name}")
+                    print(f"        👉 width={ctx.width}")
+                    print(f"        👉 height={ctx.height}")
+                    print(f"        👉 r_frame_rate={video.average_rate}")
+                    print("\n  🌟 CONFIGURAÇÃO VENCEDORA:")
                     print(f"     URL:   rtsp://{user}:***@{ip}:554/onvif1")
                     print(f"     Modo:  {desc}")
-                    print(f"     Flags: {' '.join(flags)}")
+                    print(f"     Opções: {options}")
                     return
-                else:
-                    err = result.stderr.strip().replace("\n", " ")
-                    print(f"     ⚠️  Resposta: {err[:120] if err else 'Sem dados recebidos no tempo limite'}")
-            except subprocess.TimeoutExpired:
-                print(f"     ⏳ Aguardou 8s por I-frame (Timeout)")
+            except av.HTTPUnauthorizedError:
+                print("     ❌ Credenciais recusadas pela câmera (RTSP 401).")
+                return
+            except Exception as e:
+                err = str(e).replace("\n", " ")
+                print(f"     ⚠️  Resposta: {err[:120] if err else 'Sem dados recebidos no tempo limite'}")
 
     print("\n" + "=" * 60)
 
+def read_password() -> str:
+    """Senha da câmera sem passar pela linha de comando."""
+    env_pwd = os.environ.get("CENTRAL_NVR_CAMERA_PASSWORD")
+    if env_pwd is not None:
+        return env_pwd
+    if sys.stdin.isatty():
+        return getpass.getpass("Senha da câmera (Enter para nenhuma): ")
+    return ""
+
+
 if __name__ == "__main__":
+    if len(sys.argv) > 2:
+        print("A senha não é mais aceita como argumento (ficaria visível em `ps`).")
+        print("Use a variável CENTRAL_NVR_CAMERA_PASSWORD ou digite quando solicitado.")
+        sys.exit(2)
     target_ip = sys.argv[1] if len(sys.argv) > 1 else "192.168.1.2"
-    pwd = sys.argv[2] if len(sys.argv) > 2 else ""
-    diagnose(target_ip, pwd)
+    diagnose(target_ip, read_password())

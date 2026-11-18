@@ -86,10 +86,9 @@ def main() -> int:
     logger.info(f"Iniciando Central NVR WiFi v{__version__} no Linux...")
 
     try:
-        from PySide6.QtCore import Qt
         from PySide6.QtWidgets import QApplication
         from central_nvr.ui.main_window import MainWindow
-    except ImportError as e:
+    except ImportError:
         print("\n" + "=" * 70)
         print(" [Central NVR WiFi] Dependência PySide6 (Qt6) não encontrada!")
         print("=" * 70)
@@ -100,9 +99,6 @@ def main() -> int:
         print("   Fedora/RHEL:    sudo dnf install python3-pyside6")
         print("=" * 70 + "\n")
         return 1
-
-    # Configuração de High-DPI para monitores modernos
-    os.environ["QT_AUTO_SCREEN_SCALE_FACTOR"] = "1"
 
     # Inicializar aplicação Qt
     app = QApplication(sys.argv)

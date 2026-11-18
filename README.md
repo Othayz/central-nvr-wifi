@@ -10,7 +10,7 @@ Aplicativo desktop profissional para Linux projetado para descoberta de rede, st
 | :--- | :--- | :--- |
 | **Interface Gráfica (GUI)** | **PySide6 (Qt 6)** | Renderização acelerada por GPU, layouts responsivos dinâmicos (1x1, 2x2, 3x3), suporte nativo a monitores High-DPI e estilização limpa em Dark Mode. |
 | **Decodificação de Vídeo** | **PyAV / FFmpeg (VA-API)** | Decodificação direta de streams RTSP H.264 / H.265 via hardware Linux (Intel QuickSync, AMD Radeon via `/dev/dri/renderD128`) com buffer ultrabaixo (<150ms). |
-| **Descoberta de Rede** | **WS-Discovery Nativo (UDP Multicast)** | Envio RFC-compliant de sondas SOAP para `239.255.255.250:3702` (escopos ONVIF `NetworkVideoTransmitter`), combinado com scanner assíncrono de portas TCP (554, 80, 8080, 8899). |
+| **Descoberta de Rede** | **WS-Discovery Nativo (UDP Multicast)** | Envio RFC-compliant de sondas SOAP para `239.255.255.250:3702` (escopos ONVIF `NetworkVideoTransmitter`), combinado com sondagem de portas TCP (554, 8899, 37777 e 8000) em cada sub-rede local. |
 | **Controle ONVIF / PTZ** | **Cliente SOAP com WS-Security** | Implementação com autenticação `UsernameToken` (SHA-1 Password Digest e Nonce), resolução dinâmica de URLs RTSP e controle de Pan, Tilt, Zoom e Presets. |
 | **Distribuição Universal** | **AppImage** | Formato portátil autocontido compatível com qualquer distribuição Linux (Ubuntu, Debian, Fedora, Arch, openSUSE e sistemas imutáveis como SteamOS e Bazzite). |
 
@@ -28,21 +28,29 @@ Central NVR Wifi/
 │       ├── scanner/
 │       │   ├── __init__.py
 │       │   ├── discovery.py            # Descoberta WS-Discovery Multicast & Port Scanner
+│       │   ├── interfaces.py           # Interfaces IPv4 ativas e sub-redes a sondar
 │       │   └── parser.py               # Parser de envelopes XML SOAP / ProbeMatches
 │       ├── core/
 │       │   ├── __init__.py
 │       │   ├── camera.py               # Modelo de dados da Câmera, status e métricas
-│       │   ├── onvif_client.py         # Cliente ONVIF SOAP (Digest Auth, Media, PTZ)
-│       │   ├── stream_worker.py        # Thread de streaming de baixa latência (VA-API)
+│       │   ├── onvif_client.py         # Cliente ONVIF SOAP (WS-Security, Media, PTZ)
+│       │   ├── onvif_enrich.py         # Cadastro de câmera descoberta com dados do ONVIF
+│       │   ├── ptz_queue.py            # Fila serial de comandos PTZ por câmera
+│       │   ├── stream_worker.py        # Thread de streaming de baixa latência
+│       │   ├── threads.py              # Ciclo de vida de threads Qt de segundo plano
+│       │   ├── updater.py              # Verificação, download e instalação de atualizações
 │       │   └── config.py               # Persistência de configurações XDG (~/.config/central-nvr)
 │       └── ui/
 │           ├── __init__.py
 │           ├── main_window.py          # Janela Principal (Topbar, Sidebar, Grid, Timeline)
-│           ├── camera_grid.py          # Grid multi-câmeras responsivo (1x1, 2x2, 3x3)
-│           ├── camera_view.py          # Viewport individual com OSD (FPS, Latência, Status)
+│           ├── camera_grid.py          # Grid multi-câmeras responsivo com paginação
+│           ├── camera_view.py          # Viewport individual com OSD (FPS, Bitrate, Status)
+│           ├── fullscreen_view.py      # Tela cheia exclusiva de uma câmera
+│           ├── playback_view.py        # Painel de gravações e snapshots
 │           ├── ptz_controller.py       # Painel de controle PTZ (D-Pad, Zoom, Presets)
 │           ├── discovery_dialog.py     # Diálogo de varredura e adição de câmeras
 │           ├── settings_dialog.py      # Diálogo de preferências de hardware e rede
+│           ├── update_dialog.py        # Diálogos de verificação e instalação de atualizações
 │           ├── timeline_bar.py         # Linha do tempo de gravações e eventos
 │           └── styles.py               # Folha de estilos QSS Dark Mode moderna
 ├── packaging/
@@ -52,6 +60,11 @@ Central NVR Wifi/
 │   ├── AppRun                          # Launcher portátil com Host Delegation para VA-API
 │   ├── central-nvr-launcher.sh         # Launcher instalado em usr/bin/central-nvr dentro do AppDir
 │   └── build_appimage.sh               # Script de geração do pacote AppImage universal
+├── scripts/
+│   ├── create_release.sh               # Atualiza a versão e cria a tag de release
+│   └── diagnose_camera.py              # Diagnóstico de portas e RTSP de uma câmera
+├── tests/                              # Suíte de testes (pytest, Qt offscreen)
+├── docs/                               # ADRs e instruções para agentes
 ├── requirements.txt                    # Dependências do Python (desenvolvimento)
 ├── requirements.lock                   # Versões e hashes fixos usados no build de release
 ├── pyproject.toml                      # Metadados de empacotamento Python (PEP 517/621)

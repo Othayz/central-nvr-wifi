@@ -2,18 +2,16 @@
 Barra de Linha do Tempo (Timeline) para visualização de gravações e eventos de detecção de movimento.
 Inspirado na interface de referência da Central NVR.
 """
-import datetime
 import html
-from typing import List, Optional
+from typing import Optional
 
-from PySide6.QtCore import QPoint, QRectF, QSize, Qt, Signal
+from PySide6.QtCore import QPoint, QRectF, Qt
 from PySide6.QtGui import QBrush, QColor, QFont, QPainter, QPen
 from PySide6.QtWidgets import (
     QCheckBox,
     QFrame,
     QHBoxLayout,
     QLabel,
-    QPushButton,
     QVBoxLayout,
     QWidget,
 )
@@ -25,7 +23,6 @@ class TimelineBarWidget(QFrame):
     de vídeo gravado contínuo e eventos de detecção de movimento (Motion).
     """
 
-    time_scrubbed = Signal(datetime.time)
 
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent)

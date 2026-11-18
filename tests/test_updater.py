@@ -14,7 +14,6 @@ if str(root_src) not in sys.path:
 import unittest
 from unittest.mock import MagicMock, patch
 
-from PySide6.QtCore import QCoreApplication
 from PySide6.QtWidgets import QApplication
 
 app = QApplication.instance()
@@ -23,7 +22,6 @@ if app is None:
 
 from central_nvr.core.updater import (
     fetch_latest_release,
-    AssetDownloadWorker,
     ReleaseAsset,
     ReleaseInfo,
     UpdateCheckWorker,
