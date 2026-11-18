@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Teste E2E local do fluxo de atualização (checksum -> download -> instalação)."""
+import gc
 import hashlib
 import os
 import stat
@@ -66,6 +67,24 @@ class UpdateFlowTest(unittest.TestCase):
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])
 
+    def setUp(self):
+        # Os workers (QThread) alocam objetos Python e podem disparar a coleta de lixo cíclica na
+        # própria thread. Se ela recolher um diálogo de teste anterior, o destrutor C++ do widget
+        # roda fora da thread principal e o processo cai com segfault. Por isso o lixo antigo é
+        # coletado agora, na thread principal, e a coleta automática fica desligada enquanto
+        # houver workers vivos (religada no tearDown).
+        gc.collect()
+        gc.disable()
+        self.addCleanup(gc.enable)
+        self._dialogs = []
+
+    def tearDown(self):
+        for dlg in self._dialogs:
+            self._dispose_dialog(dlg)
+        self._dialogs.clear()
+        gc.enable()
+        gc.collect()  # na thread principal, com todos os workers já encerrados
+
     def _run(self, files, asset_size=len(PAYLOAD)):
         srv, hits = _make_server(files)
         self.addCleanup(srv.stop)
@@ -89,7 +108,17 @@ class UpdateFlowTest(unittest.TestCase):
             p.start()
             self.addCleanup(p.stop)
         dlg = UpdateDialog(release_info=rel)
+        self._dialogs.append(dlg)  # descartado no tearDown, com os workers já encerrados
         return dlg, running, hits, tmp
+
+    def _dispose_dialog(self, dlg):
+        dlg._cleanup_workers()
+        for worker in (dlg.checksum_worker, dlg.download_worker, dlg.check_worker):
+            if worker is not None:
+                worker.wait(5000)
+        dlg.close()
+        dlg.deleteLater()
+        self.app.processEvents()
 
     def test_valid_release_installs_with_backup(self):
         sums = f"{hashlib.sha256(PAYLOAD).hexdigest()}  {APP_NAME}\n".encode()

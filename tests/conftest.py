@@ -26,12 +26,14 @@ def pytest_sessionfinish(session, exitstatus):
 
     from PySide6.QtCore import QCoreApplication, QEvent
 
-    from central_nvr.core.threads import drain_retired_threads
+    from central_nvr.core.threads import drain_retired_threads, retire_running_threads_of
 
     app = QApplication.instance()
     if app is None:
         return
     for widget in app.topLevelWidgets():
+        # Mesmo tratamento do encerramento do app: thread filha ainda rodando não é destruída com a janela
+        retire_running_threads_of(widget)
         widget.close()
         widget.deleteLater()
     drain_retired_threads(10000)

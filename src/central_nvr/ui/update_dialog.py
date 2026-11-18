@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
 )
 
 from central_nvr import __version__
+from central_nvr.core.threads import retire_thread
 from central_nvr.core.updater import (
     AssetDownloadWorker,
     ChecksumFetchWorker,
@@ -160,7 +161,14 @@ class BaseUpdateDialog(QDialog):
             self._begin_download()
 
     def _cleanup_workers(self):
-        """Interrompe e aguarda a finalização segura de qualquer worker assíncrono ativo."""
+        """
+        Interrompe e aguarda a finalização segura de qualquer worker assíncrono ativo.
+
+        Os workers são filhos do diálogo: destruí-lo com uma thread ainda em execução aborta o
+        processo ("QThread: Destroyed while thread is still running"). Quem não terminar dentro
+        da espera curta é aposentado (retire_thread), que o desvincula do diálogo e o mantém vivo
+        até o run() retornar.
+        """
         checksum_worker = getattr(self, "checksum_worker", None)
         if checksum_worker and checksum_worker.isRunning():
             checksum_worker.wait(500)
@@ -180,6 +188,10 @@ class BaseUpdateDialog(QDialog):
                 download_worker.wait(500)
             except Exception:
                 pass
+
+        for worker in (checksum_worker, check_worker, download_worker):
+            if worker and worker.isRunning():
+                retire_thread(worker)
 
     def closeEvent(self, event):
         self._cleanup_workers()
