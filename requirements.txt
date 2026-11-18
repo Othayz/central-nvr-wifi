@@ -1,7 +1,7 @@
 # Central NVR WiFi - Python Dependencies
 # Interface Gráfica
 # PySide6 6.12.0 corrompe a contagem de referências de True a cada emit() em Python < 3.12
-PySide6>=6.5.0,<6.12; python_version < "3.12"
+PySide6>=6.5.0,<6.13; python_version < "3.12"
 PySide6>=6.5.0; python_version >= "3.12"
 
 # Processamento de Vídeo e Streaming RTSP
