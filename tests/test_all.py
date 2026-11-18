@@ -336,34 +336,6 @@ class TestWifiNvrArchitectureImprovements(unittest.TestCase):
         candidates_sub = cam.get_candidate_rtsp_urls(prefer_substream=True)
         self.assertEqual(candidates_sub[0], sub_url)
 
-    def test_onvif_profile_t_events(self):
-        """Valida o serviço de eventos ONVIF Profile T (PullMessages / Motion Detection)."""
-        client = OnvifClient(ip="192.168.1.100", port=80)
-        client.subscription_url = "http://192.168.1.100:80/onvif/subscription_1"
-
-        sample_event_xml = """<soap:Envelope xmlns:soap="http://www.w3.org/2003/05/soap-envelope"
-                                              xmlns:wsnt="http://docs.oasis-open.org/wsn/b-2">
-            <soap:Body>
-                <wsnt:NotificationMessage>
-                    <wsnt:Topic>tns1:RuleEngine/CellMotionDetector/Motion</wsnt:Topic>
-                    <wsnt:Message>
-                        <tt:Message PropertyOperation="Changed">
-                            <tt:Data>
-                                <tt:SimpleItem Name="State" Value="true"/>
-                            </tt:Data>
-                        </tt:Message>
-                    </wsnt:Message>
-                </wsnt:NotificationMessage>
-            </soap:Body>
-        </soap:Envelope>"""
-
-        client._send_soap_request = lambda url, body, action="": sample_event_xml
-
-        events = client.pull_messages(timeout_sec=2.0)
-        self.assertTrue(len(events) > 0)
-        self.assertTrue(events[0]["is_motion"])
-        self.assertTrue(events[0]["state"])
-
     def test_onvif_profile_g_edge_storage(self):
         """Valida a consulta a gravações salvas no armazenamento local da câmera (Cartão SD / Profile G)."""
         client = OnvifClient(ip="192.168.1.100", port=80)

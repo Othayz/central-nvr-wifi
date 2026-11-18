@@ -1,6 +1,11 @@
 """
-Cliente ONVIF nativo em Python com suporte a Profile S (Live/PTZ), Profile T (Eventos/Motion) e Profile G (Edge Storage).
+Cliente ONVIF nativo em Python com suporte a Profile S (Live/PTZ) e Profile G (Edge Storage).
 Inclui WS-Security OASIS PasswordDigest, validação estrita Anti-SSRF e escape XML de parâmetros.
+
+As respostas SOAP são interpretadas com `defusedxml.ElementTree`, comparando as tags pelo nome
+local (independe do prefixo de namespace usado pela câmera). Falhas de transporte, autenticação e
+SOAP Fault são devolvidas como exceções tipadas (OnvifError e subclasses), para que quem chama
+consiga diferenciar senha errada de câmera fora do ar ou recurso não suportado (Issue #28).
 """
 import base64
 import datetime
@@ -8,25 +13,104 @@ import hashlib
 import html
 import logging
 import os
-import re
 import urllib.parse
-import urllib.request
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional
+from xml.etree.ElementTree import Element, ParseError
 
-try:
-    import requests
-    HAS_REQUESTS = True
-except ImportError:
-    HAS_REQUESTS = False
+import defusedxml.ElementTree as SafeET
+import requests
+from defusedxml.common import DefusedXmlException
 
 logger = logging.getLogger(__name__)
 
 
+# =========================================================================
+# Erros tipados
+# =========================================================================
+
+class OnvifError(Exception):
+    """Falha ao falar com o dispositivo ONVIF."""
+
+
+class OnvifConnectionError(OnvifError):
+    """O dispositivo não aceitou a conexão (porta fechada, host inalcançável)."""
+
+
+class OnvifTimeoutError(OnvifError):
+    """O dispositivo não respondeu dentro do tempo limite."""
+
+
+class OnvifAuthError(OnvifError):
+    """Credenciais recusadas (HTTP 401 ou SOAP Fault NotAuthorized)."""
+
+
+class OnvifFaultError(OnvifError):
+    """O dispositivo respondeu com SOAP Fault (operação não suportada, argumento inválido...)."""
+
+
+class OnvifResponseError(OnvifError):
+    """Resposta inesperada: status HTTP de erro sem Fault, ou XML inválido."""
+
+
+# =========================================================================
+# Utilitários de XML
+# =========================================================================
+
+def _local(tag: Any) -> str:
+    """Nome local de uma tag ElementTree (`{ns}Nome` → `Nome`)."""
+    if not isinstance(tag, str):
+        return ""
+    return tag.rsplit("}", 1)[-1]
+
+
+def _iter_named(elem: Element, name: str) -> Iterator[Element]:
+    """Todos os descendentes (incluindo o próprio elemento) com o nome local informado."""
+    for el in elem.iter():
+        if _local(el.tag) == name:
+            yield el
+
+
+def _find_named(elem: Element, name: str) -> Optional[Element]:
+    return next(_iter_named(elem, name), None)
+
+
+def _child(elem: Element, name: str) -> Optional[Element]:
+    """Filho direto com o nome local informado."""
+    for el in elem:
+        if _local(el.tag) == name:
+            return el
+    return None
+
+
+def _text(elem: Optional[Element]) -> str:
+    if elem is None or elem.text is None:
+        return ""
+    return elem.text.strip()
+
+
+def _parse_xml(text: str) -> Element:
+    try:
+        return SafeET.fromstring(text)
+    except (ParseError, DefusedXmlException, ValueError) as e:
+        raise OnvifResponseError(f"Resposta XML inválida: {e}") from e
+
+
+def _fault_error(root: Element) -> Optional[OnvifError]:
+    """Converte um SOAP Fault em exceção tipada (ou None se não houver Fault)."""
+    fault = _find_named(root, "Fault")
+    if fault is None:
+        return None
+    codes = " ".join(_text(v) for v in _iter_named(fault, "Value"))
+    reason = _text(_find_named(fault, "Text")) or _text(_find_named(fault, "faultstring")) or "SOAP Fault"
+    if "NotAuthorized" in codes or "NotAuthorized" in reason:
+        return OnvifAuthError(f"Credenciais recusadas: {reason}")
+    return OnvifFaultError(f"{reason} ({codes})" if codes else reason)
+
+
 class OnvifClient:
     """
-    Cliente ONVIF SOAP completo para CFTV IP:
+    Cliente ONVIF SOAP para CFTV IP:
     - Profile S: Descoberta de perfis de mídia, resolução de URIs RTSP dinâmicas e controle PTZ contínuo/relativo/presets.
-    - Profile T: Inscrição de eventos (PullPoint) para detecção de movimento e alarmes nativos da câmera.
     - Profile G: Consulta a gravações salvas em armazenamento local (cartão SD / Edge Storage) e URLs de replay.
     """
 
@@ -43,15 +127,14 @@ class OnvifClient:
         self.username = username
         self.password = password
         self.timeout = timeout
-        
+
         self.device_service_url = f"http://{ip}:{port}/onvif/device_service"
         self.media_service_url = f"http://{ip}:{port}/onvif/media_service"
         self.ptz_service_url = f"http://{ip}:{port}/onvif/ptz_service"
         self.event_service_url = f"http://{ip}:{port}/onvif/event_service"
-        self.subscription_url = ""
         self.recording_service_url = f"http://{ip}:{port}/onvif/recording_service"
         self.replay_service_url = f"http://{ip}:{port}/onvif/replay_service"
-        
+
         self.profiles: List[Dict[str, Any]] = []
         self.active_profile_token: str = ""
         self.substream_profile_token: str = ""
@@ -59,7 +142,11 @@ class OnvifClient:
         self.has_ptz: bool = False
         self.has_events: bool = False
         self.has_edge_storage: bool = False
-        self._session = requests.Session() if HAS_REQUESTS else None
+        self._session = requests.Session()
+
+    # =========================================================================
+    # Validações Anti-SSRF
+    # =========================================================================
 
     def _validate_xaddr(self, xaddr: str) -> Optional[str]:
         """
@@ -83,6 +170,32 @@ class OnvifClient:
             logger.warning(f"Anti-SSRF: Erro ao validar XAddr '{xaddr}': {e}")
             return None
 
+    def _validate_media_uri(self, uri: str) -> Optional[str]:
+        """
+        Valida uma URI de mídia (GetStreamUri / GetReplayUri) antes de usá-la com credenciais:
+        o host precisa ser o IP configurado da câmera.
+        """
+        if not uri:
+            return None
+        try:
+            parsed = urllib.parse.urlparse(uri)
+        except ValueError:
+            return None
+        if parsed.scheme.lower() not in ("rtsp", "rtsps", "http", "https"):
+            logger.warning(f"URI de mídia rejeitada (esquema não suportado): {parsed.scheme}")
+            return None
+        if parsed.hostname != self.ip:
+            logger.warning(
+                f"Anti-SSRF: URI de mídia rejeitada por divergir do IP da câmera "
+                f"({parsed.hostname} != {self.ip})"
+            )
+            return None
+        return uri
+
+    # =========================================================================
+    # Transporte SOAP
+    # =========================================================================
+
     def _build_ws_security_header(self) -> str:
         """
         Gera o cabeçalho WS-Security com UsernameToken e Password Digest conforme WS-Security 1.0:
@@ -91,28 +204,22 @@ class OnvifClient:
         if not self.username:
             return ""
 
-        # Gerar Nonce aleatório de 16 bytes
         nonce_bytes = os.urandom(16)
         nonce_b64 = base64.b64encode(nonce_bytes).decode("ascii")
 
-        # Timestamp UTC ISO 8601
         created_str = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
         created_bytes = created_str.encode("utf-8")
-
-        # Senha codificada
         password_bytes = self.password.encode("utf-8")
 
-        # SHA-1(nonce + created + password)
         hasher = hashlib.sha1()
         hasher.update(nonce_bytes)
         hasher.update(created_bytes)
         hasher.update(password_bytes)
-        digest_bytes = hasher.digest()
-        password_digest = base64.b64encode(digest_bytes).decode("ascii")
+        password_digest = base64.b64encode(hasher.digest()).decode("ascii")
 
         escaped_user = html.escape(self.username)
         return f"""
-        <wsse:Security xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd" 
+        <wsse:Security xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd"
                        xmlns:wsu="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd">
             <wsse:UsernameToken>
                 <wsse:Username>{escaped_user}</wsse:Username>
@@ -122,17 +229,20 @@ class OnvifClient:
             </wsse:UsernameToken>
         </wsse:Security>"""
 
-    def _send_soap_request(self, service_url: str, body_xml: str, action: str = "") -> Optional[str]:
-        """Envia uma requisição SOAP HTTP POST ao endpoint ONVIF."""
+    def _send_soap_request(self, service_url: str, body_xml: str, action: str = "") -> str:
+        """
+        Envia uma requisição SOAP HTTP POST ao endpoint ONVIF e devolve o corpo da resposta (HTTP 200).
+        Lança OnvifConnectionError / OnvifTimeoutError / OnvifAuthError / OnvifFaultError /
+        OnvifResponseError conforme a falha.
+        """
         ws_sec = self._build_ws_security_header()
         envelope = f"""<?xml version="1.0" encoding="utf-8"?>
-<soap:Envelope xmlns:soap="http://www.w3.org/2003/05/soap-envelope" 
-               xmlns:tds="http://www.onvif.org/ver10/device/wsdl" 
-               xmlns:trt="http://www.onvif.org/ver10/media/wsdl" 
-               xmlns:tptz="http://www.onvif.org/ver20/ptz/wsdl" 
-               xmlns:tev="http://www.onvif.org/ver10/events/wsdl" 
-               xmlns:trc="http://www.onvif.org/ver10/recording/wsdl" 
-               xmlns:trp="http://www.onvif.org/ver10/replay/wsdl" 
+<soap:Envelope xmlns:soap="http://www.w3.org/2003/05/soap-envelope"
+               xmlns:tds="http://www.onvif.org/ver10/device/wsdl"
+               xmlns:trt="http://www.onvif.org/ver10/media/wsdl"
+               xmlns:tptz="http://www.onvif.org/ver20/ptz/wsdl"
+               xmlns:trc="http://www.onvif.org/ver10/recording/wsdl"
+               xmlns:trp="http://www.onvif.org/ver10/replay/wsdl"
                xmlns:tt="http://www.onvif.org/ver10/schema">
     <soap:Header>
         {ws_sec}
@@ -143,53 +253,68 @@ class OnvifClient:
 </soap:Envelope>"""
 
         content_type = f'application/soap+xml; charset=utf-8; action="{action}"' if action else "application/soap+xml; charset=utf-8"
-        headers = {
-            "Content-Type": content_type,
-        }
-
-        data_bytes = envelope.encode("utf-8")
+        headers = {"Content-Type": content_type}
 
         try:
-            if HAS_REQUESTS:
-                requester = self._session if self._session else requests
-                resp = requester.post(
-                    service_url,
-                    data=data_bytes,
-                    headers=headers,
-                    timeout=self.timeout,
-                )
-                if resp.status_code == 200:
-                    return resp.text
-                return resp.text if resp.text else None
-            else:
-                req = urllib.request.Request(service_url, data=data_bytes, headers=headers, method="POST")
-                with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                    return resp.read().decode("utf-8", errors="ignore")
-        except Exception as e:
-            logger.debug(f"Falha na comunicação SOAP com {service_url}: {e}")
-            return None
+            resp = self._session.post(
+                service_url,
+                data=envelope.encode("utf-8"),
+                headers=headers,
+                timeout=self.timeout,
+            )
+        except requests.exceptions.Timeout as e:
+            raise OnvifTimeoutError(f"Sem resposta de {service_url} em {self.timeout}s") from e
+        except requests.exceptions.ConnectionError as e:
+            raise OnvifConnectionError(f"Conexão recusada ou host inalcançável: {service_url}") from e
+        except requests.exceptions.RequestException as e:
+            raise OnvifError(f"Falha na comunicação SOAP com {service_url}: {e}") from e
+
+        if resp.status_code == 200:
+            return resp.text
+        if resp.status_code == 401:
+            raise OnvifAuthError(f"HTTP 401 em {service_url}: credenciais recusadas")
+
+        # 400/500 normalmente trazem um SOAP Fault no corpo
+        if resp.text:
+            try:
+                fault = _fault_error(_parse_xml(resp.text))
+            except OnvifResponseError:
+                fault = None
+            if fault is not None:
+                raise fault
+        raise OnvifResponseError(f"HTTP {resp.status_code} em {service_url}")
+
+    def _call(self, service_url: str, body_xml: str) -> Element:
+        """Envia a requisição e devolve a resposta já interpretada (lança OnvifError em falha)."""
+        root = _parse_xml(self._send_soap_request(service_url, body_xml))
+        fault = _fault_error(root)
+        if fault is not None:
+            raise fault
+        return root
+
+    # =========================================================================
+    # Device / Media
+    # =========================================================================
 
     def connect_and_initialize(self) -> bool:
         """
-        Conecta à câmera, recupera informações do dispositivo, capacidades,
-        perfis de mídia (Dual-Stream), suporte a PTZ, eventos e Edge Storage.
+        Conecta à câmera, recupera informações do dispositivo, capacidades e perfis de mídia.
+        Devolve False se o dispositivo não responder ONVIF ou não expuser nenhum perfil real.
         """
-        # 1. GetDeviceInformation
-        self.get_device_information()
-
-        # 2. GetCapabilities (Media, PTZ, Events, Recording, Replay)
-        self.get_capabilities()
-
-        # 3. GetProfiles (MainStream e SubStream)
-        profiles = self.get_profiles()
-        if profiles:
-            return True
-        return False
+        try:
+            try:
+                self.get_device_information()
+            except OnvifFaultError:
+                pass  # Opcional: algumas câmeras não implementam GetDeviceInformation
+            self.get_capabilities()
+            return bool(self.get_profiles())
+        except OnvifError as e:
+            logger.debug(f"ONVIF indisponível em {self.ip}:{self.port}: {e}")
+            return False
 
     def get_device_information(self) -> Dict[str, str]:
         """Obtém Fabricante, Modelo, Firmware e Número de Série."""
-        body = "<tds:GetDeviceInformation/>"
-        xml_resp = self._send_soap_request(self.device_service_url, body)
+        root = self._call(self.device_service_url, "<tds:GetDeviceInformation/>")
         info = {
             "manufacturer": "Genérico",
             "model": "ONVIF Device",
@@ -197,86 +322,73 @@ class OnvifClient:
             "serial_number": "",
             "hardware_id": "",
         }
-
-        if xml_resp:
-            for key, tag in [
-                ("manufacturer", "Manufacturer"),
-                ("model", "Model"),
-                ("firmware_version", "FirmwareVersion"),
-                ("serial_number", "SerialNumber"),
-                ("hardware_id", "HardwareId"),
-            ]:
-                match = re.search(rf"<[^:]*:{tag}[^>]*>(.*?)</[^:]*:{tag}>", xml_resp)
-                if match:
-                    info[key] = match.group(1).strip()
+        for key, tag in [
+            ("manufacturer", "Manufacturer"),
+            ("model", "Model"),
+            ("firmware_version", "FirmwareVersion"),
+            ("serial_number", "SerialNumber"),
+            ("hardware_id", "HardwareId"),
+        ]:
+            value = _text(_find_named(root, tag))
+            if value:
+                info[key] = value
 
         self.device_info = info
         return info
+
+    @staticmethod
+    def _service_xaddr(capabilities: Element, service: str) -> str:
+        """XAddr do primeiro bloco de capacidade com o nome informado (ex.: Media, PTZ)."""
+        for el in _iter_named(capabilities, service):
+            xaddr = _text(_child(el, "XAddr"))
+            if xaddr:
+                return xaddr
+        return ""
 
     def get_capabilities(self) -> Dict[str, str]:
         """Descobre os endpoints dos serviços Media, PTZ, Eventos e Gravação (Profile G)."""
         body = """<tds:GetCapabilities>
             <tds:Category>All</tds:Category>
         </tds:GetCapabilities>"""
-        xml_resp = self._send_soap_request(self.device_service_url, body)
-        caps = {}
+        root = self._call(self.device_service_url, body)
+        capabilities = _find_named(root, "Capabilities")
+        if capabilities is None:
+            raise OnvifResponseError("Resposta de GetCapabilities sem o bloco Capabilities")
 
-        if xml_resp:
-            # 1. Media Service
-            media_match = re.search(r"<[^:]*:Media[^>]*>.*?<[^:]*:XAddr[^>]*>(.*?)</[^:]*:XAddr>", xml_resp, re.DOTALL)
-            if media_match:
-                raw_media = media_match.group(1).strip()
-                validated_media = self._validate_xaddr(raw_media)
-                if validated_media:
-                    self.media_service_url = validated_media
-                    caps["media"] = self.media_service_url
+        caps: Dict[str, str] = {}
 
-            # 2. PTZ Service (Trata correção de endpoints do firmware Yoosee/Xiongmai)
-            ptz_match = re.search(r"<[^:]*:PTZ[^>]*>.*?<[^:]*:XAddr[^>]*>(.*?)</[^:]*:XAddr>", xml_resp, re.DOTALL)
-            if ptz_match:
-                raw_ptz = ptz_match.group(1).strip()
-                # Se a câmera retornou deviceio_service no lugar de ptz_service (bug de firmware Yoosee)
-                if "deviceio_service" in raw_ptz:
-                    raw_ptz = raw_ptz.replace("deviceio_service", "ptz_service")
-                validated_ptz = self._validate_xaddr(raw_ptz)
-                if validated_ptz:
-                    self.ptz_service_url = validated_ptz
-                    self.has_ptz = True
-                    caps["ptz"] = self.ptz_service_url
-                else:
-                    self.has_ptz = True
-            else:
-                self.ptz_service_url = f"http://{self.ip}:{self.port}/onvif/ptz_service"
-                self.has_ptz = True
+        media = self._validate_xaddr(self._service_xaddr(capabilities, "Media"))
+        if media:
+            self.media_service_url = media
+            caps["media"] = media
 
-            # 3. Events Service (Profile T)
-            events_match = re.search(r"<[^:]*:Events[^>]*>.*?<[^:]*:XAddr[^>]*>(.*?)</[^:]*:XAddr>", xml_resp, re.DOTALL)
-            if events_match:
-                raw_events = events_match.group(1).strip()
-                validated_events = self._validate_xaddr(raw_events)
-                if validated_events:
-                    self.event_service_url = validated_events
-                    self.has_events = True
-                    caps["events"] = self.event_service_url
+        # PTZ só é considerado presente com um XAddr válido (Issue #28)
+        raw_ptz = self._service_xaddr(capabilities, "PTZ")
+        # Bug de firmware Yoosee/Xiongmai: devolve deviceio_service no lugar de ptz_service
+        if "deviceio_service" in raw_ptz:
+            raw_ptz = raw_ptz.replace("deviceio_service", "ptz_service")
+        ptz = self._validate_xaddr(raw_ptz)
+        self.has_ptz = bool(ptz)
+        if ptz:
+            self.ptz_service_url = ptz
+            caps["ptz"] = ptz
 
-            # 4. Recording Service (Profile G)
-            rec_match = re.search(r"<[^:]*:Recording[^>]*>.*?<[^:]*:XAddr[^>]*>(.*?)</[^:]*:XAddr>", xml_resp, re.DOTALL)
-            if rec_match:
-                raw_rec = rec_match.group(1).strip()
-                validated_rec = self._validate_xaddr(raw_rec)
-                if validated_rec:
-                    self.recording_service_url = validated_rec
-                    self.has_edge_storage = True
-                    caps["recording"] = self.recording_service_url
+        events = self._validate_xaddr(self._service_xaddr(capabilities, "Events"))
+        if events:
+            self.event_service_url = events
+            self.has_events = True
+            caps["events"] = events
 
-            # 5. Replay Service (Profile G)
-            replay_match = re.search(r"<[^:]*:Replay[^>]*>.*?<[^:]*:XAddr[^>]*>(.*?)</[^:]*:XAddr>", xml_resp, re.DOTALL)
-            if replay_match:
-                raw_replay = replay_match.group(1).strip()
-                validated_replay = self._validate_xaddr(raw_replay)
-                if validated_replay:
-                    self.replay_service_url = validated_replay
-                    caps["replay"] = self.replay_service_url
+        recording = self._validate_xaddr(self._service_xaddr(capabilities, "Recording"))
+        if recording:
+            self.recording_service_url = recording
+            self.has_edge_storage = True
+            caps["recording"] = recording
+
+        replay = self._validate_xaddr(self._service_xaddr(capabilities, "Replay"))
+        if replay:
+            self.replay_service_url = replay
+            caps["replay"] = replay
 
         return caps
 
@@ -284,70 +396,61 @@ class OnvifClient:
         """
         Recupera e analisa os perfis de mídia de vídeo da câmera,
         classificando automaticamente entre MainStream (alta resolução) e SubStream (baixa resolução).
+        Devolve lista vazia se a câmera não expuser perfis (sem perfil fictício).
         """
-        body = "<trt:GetProfiles/>"
-        xml_resp = self._send_soap_request(self.media_service_url, body)
+        root = self._call(self.media_service_url, "<trt:GetProfiles/>")
         profiles = []
 
-        if xml_resp:
-            profile_blocks = re.findall(r'<[^:]*:Profiles\s+token="([^"]+)"[^>]*>(.*?)</[^:]*:Profiles>', xml_resp, re.DOTALL)
-            for token, block in profile_blocks:
-                name_match = re.search(r'<[^:]*:Name[^>]*>(.*?)</[^:]*:Name>', block)
-                name = name_match.group(1).strip() if name_match else token
-                
-                # Resolução
-                width_m = re.search(r'<[^:]*:Width[^>]*>(\d+)</[^:]*:Width>', block)
-                height_m = re.search(r'<[^:]*:Height[^>]*>(\d+)</[^:]*:Height>', block)
-                width = int(width_m.group(1)) if width_m else 0
-                height = int(height_m.group(1)) if height_m else 0
+        for prof in _iter_named(root, "Profiles"):
+            token = prof.get("token", "").strip()
+            if not token:
+                continue
+            name = _text(_child(prof, "Name")) or token
 
-                # Codec / Encoding
-                enc_m = re.search(r'<[^:]*:Encoding[^>]*>([^<]+)</[^:]*:Encoding>', block)
-                encoding = enc_m.group(1).strip() if enc_m else "H264"
+            encoder = _find_named(prof, "VideoEncoderConfiguration")
+            scope = encoder if encoder is not None else prof
+            width_s = _text(_find_named(scope, "Width"))
+            height_s = _text(_find_named(scope, "Height"))
+            width = int(width_s) if width_s.isdigit() else 0
+            height = int(height_s) if height_s.isdigit() else 0
+            encoding = _text(_find_named(scope, "Encoding")) or "H264"
 
-                # PTZ
-                has_ptz = "<tt:PTZConfiguration" in block or "PTZ" in block
-                if has_ptz:
-                    self.has_ptz = True
+            has_ptz = _find_named(prof, "PTZConfiguration") is not None
+            if has_ptz:
+                self.has_ptz = True
 
+            try:
                 stream_uri = self.get_stream_uri(token)
+            except OnvifFaultError as e:
+                logger.debug(f"GetStreamUri falhou para o perfil {token}: {e}")
+                stream_uri = None
 
-                profiles.append({
-                    "token": token,
-                    "name": name,
-                    "width": width,
-                    "height": height,
-                    "encoding": encoding,
-                    "has_ptz": has_ptz,
-                    "stream_uri": stream_uri or "",
-                })
-
-        if not profiles:
-            # Perfil padrão de fallback
             profiles.append({
-                "token": "Profile_1",
-                "name": "MainStream",
-                "width": 1920,
-                "height": 1080,
-                "encoding": "H264",
-                "has_ptz": self.has_ptz,
-                "stream_uri": "",
+                "token": token,
+                "name": name,
+                "width": width,
+                "height": height,
+                "encoding": encoding,
+                "has_ptz": has_ptz,
+                "stream_uri": stream_uri or "",
             })
 
-        # Classificar perfis por resolução decrescente (Maior = MainStream, Menor = SubStream)
         profiles_sorted = sorted(profiles, key=lambda p: p["width"] * p["height"], reverse=True)
         self.profiles = profiles_sorted
-        self.active_profile_token = profiles_sorted[0]["token"]
-
-        if len(profiles_sorted) > 1:
+        if profiles_sorted:
+            self.active_profile_token = profiles_sorted[0]["token"]
             self.substream_profile_token = profiles_sorted[-1]["token"]
         else:
-            self.substream_profile_token = self.active_profile_token
+            self.active_profile_token = ""
+            self.substream_profile_token = ""
 
         return profiles_sorted
 
     def get_stream_uri(self, profile_token: Optional[str] = None) -> Optional[str]:
-        """Obtém a URL RTSP dinâmica fornecida pela câmera para o perfil selecionado com sanitização de token."""
+        """
+        Obtém a URL RTSP fornecida pela câmera para o perfil selecionado.
+        Devolve None se a resposta não trouxer URI ou se o host divergir do IP da câmera.
+        """
         token = profile_token or self.active_profile_token or "Profile_1"
         escaped_token = html.escape(str(token))
         body = f"""<trt:GetStreamUri>
@@ -360,77 +463,8 @@ class OnvifClient:
             <trt:ProfileToken>{escaped_token}</trt:ProfileToken>
         </trt:GetStreamUri>"""
 
-        xml_resp = self._send_soap_request(self.media_service_url, body)
-        if xml_resp:
-            uri_match = re.search(r"<[^:]*:Uri[^>]*>(.*?)</[^:]*:Uri>", xml_resp)
-            if uri_match:
-                uri = uri_match.group(1).strip()
-                return uri
-
-        return None
-
-    # =========================================================================
-    # Profile T: Serviço de Eventos (Event Service / PullPoint / Motion Detection)
-    # =========================================================================
-
-    def create_pull_point_subscription(self) -> Optional[str]:
-        """Cria uma subscrição de eventos (PullPoint) para receber alarmes de movimento."""
-        body = """<tev:CreatePullPointSubscription>
-            <tev:InitialTerminationTime>PT300S</tev:InitialTerminationTime>
-        </tev:CreatePullPointSubscription>"""
-
-        xml_resp = self._send_soap_request(self.event_service_url, body)
-        if xml_resp:
-            addr_m = re.search(r'<[^:]*:Address[^>]*>(.*?)</[^:]*:Address>', xml_resp)
-            if addr_m:
-                sub_url = addr_m.group(1).strip()
-                val_url = self._validate_xaddr(sub_url)
-                if val_url:
-                    self.subscription_url = val_url
-                    return self.subscription_url
-
-        return None
-
-    def pull_messages(self, timeout_sec: float = 5.0) -> List[Dict[str, Any]]:
-        """
-        Consulta mensagens de eventos pendentes na subscrição PullPoint.
-        Detecta eventos de movimento (RuleEngine, CellMotion, MotionAlarm).
-        """
-        if not self.subscription_url:
-            self.create_pull_point_subscription()
-            if not self.subscription_url:
-                return []
-
-        body = f"""<tev:PullMessages>
-            <tev:Timeout>PT{int(timeout_sec)}S</tev:Timeout>
-            <tev:MessageLimit>10</tev:MessageLimit>
-        </tev:PullMessages>"""
-
-        xml_resp = self._send_soap_request(self.subscription_url, body)
-        events = []
-
-        if xml_resp:
-            # Buscar tópicos de notificação
-            topics = re.findall(r'<[^:]*:Topic[^>]*>(.*?)</[^:]*:Topic>', xml_resp)
-            # Buscar estados de valores booleanos
-            values = re.findall(r'Name="State"\s+Value="(true|false|1|0)"', xml_resp, re.IGNORECASE)
-            
-            for i, topic in enumerate(topics):
-                is_motion = "motion" in topic.lower() or "cellmotion" in topic.lower() or "ruleengine" in topic.lower()
-                state = False
-                if i < len(values):
-                    state = values[i].lower() in ("true", "1")
-                elif "motion" in xml_resp.lower() and "true" in xml_resp.lower():
-                    state = True
-
-                events.append({
-                    "topic": topic,
-                    "is_motion": is_motion,
-                    "state": state,
-                    "timestamp": datetime.datetime.now().isoformat(),
-                })
-
-        return events
+        root = self._call(self.media_service_url, body)
+        return self._validate_media_uri(_text(_find_named(root, "Uri")))
 
     # =========================================================================
     # Profile G: Edge Storage & Replay (Gravação Local no Cartão SD da Câmera)
@@ -438,29 +472,21 @@ class OnvifClient:
 
     def get_recording_summary(self) -> Dict[str, Any]:
         """Obtém resumo das gravações salvas no armazenamento local da câmera (cartão SD)."""
-        body = "<trc:GetRecordingSummary/>"
-        xml_resp = self._send_soap_request(self.recording_service_url, body)
-        summary = {
+        root = self._call(self.recording_service_url, "<trc:GetRecordingSummary/>")
+        summary: Dict[str, Any] = {
             "num_recordings": 0,
             "has_storage": False,
             "earliest_time": "",
             "latest_time": "",
         }
 
-        if xml_resp:
-            num_m = re.search(r'<[^:]*:NumberRecordings[^>]*>(\d+)</[^:]*:NumberRecordings>', xml_resp)
-            if num_m:
-                summary["num_recordings"] = int(num_m.group(1))
-                summary["has_storage"] = summary["num_recordings"] > 0
-                self.has_edge_storage = True
-
-            earliest_m = re.search(r'<[^:]*:DataFrom[^>]*>(.*?)</[^:]*:DataFrom>', xml_resp)
-            latest_m = re.search(r'<[^:]*:DataUntil[^>]*>(.*?)</[^:]*:DataUntil>', xml_resp)
-            if earliest_m:
-                summary["earliest_time"] = earliest_m.group(1).strip()
-            if latest_m:
-                summary["latest_time"] = latest_m.group(1).strip()
-
+        num = _text(_find_named(root, "NumberRecordings"))
+        if num.isdigit():
+            summary["num_recordings"] = int(num)
+            summary["has_storage"] = summary["num_recordings"] > 0
+            self.has_edge_storage = True
+        summary["earliest_time"] = _text(_find_named(root, "DataFrom"))
+        summary["latest_time"] = _text(_find_named(root, "DataUntil"))
         return summary
 
     def find_recordings(self, max_matches: int = 20) -> List[Dict[str, Any]]:
@@ -469,21 +495,21 @@ class OnvifClient:
             <trc:Scope>
                 <trc:IncludedSources/>
             </trc:Scope>
-            <trc:MaxMatches>{max_matches}</trc:MaxMatches>
+            <trc:MaxMatches>{int(max_matches)}</trc:MaxMatches>
         </trc:FindRecordings>"""
 
-        xml_resp = self._send_soap_request(self.recording_service_url, body)
+        root = self._call(self.recording_service_url, body)
         recordings = []
-
-        if xml_resp:
-            tokens = re.findall(r'<[^:]*:RecordingToken[^>]*>(.*?)</[^:]*:RecordingToken>', xml_resp)
-            for token in tokens:
+        for el in _iter_named(root, "RecordingToken"):
+            token = _text(el)
+            if not token:
+                continue
+            try:
                 replay_uri = self.get_replay_uri(token)
-                recordings.append({
-                    "token": token,
-                    "replay_uri": replay_uri or "",
-                })
-
+            except OnvifError as e:
+                logger.debug(f"GetReplayUri falhou para {token}: {e}")
+                replay_uri = None
+            recordings.append({"token": token, "replay_uri": replay_uri or ""})
         return recordings
 
     def get_replay_uri(self, recording_token: str) -> Optional[str]:
@@ -499,17 +525,19 @@ class OnvifClient:
             <trp:RecordingToken>{escaped_token}</trp:RecordingToken>
         </trp:GetReplayUri>"""
 
-        xml_resp = self._send_soap_request(self.replay_service_url, body)
-        if xml_resp:
-            uri_match = re.search(r"<[^:]*:Uri[^>]*>(.*?)</[^:]*:Uri>", xml_resp)
-            if uri_match:
-                return uri_match.group(1).strip()
-
-        return None
+        root = self._call(self.replay_service_url, body)
+        return self._validate_media_uri(_text(_find_named(root, "Uri")))
 
     # =========================================================================
     # Comandos PTZ (Pan, Tilt, Zoom)
+    # Devolvem True em caso de sucesso e lançam OnvifError em caso de falha.
     # =========================================================================
+
+    def _ptz_profile_token(self, profile_token: Optional[str]) -> str:
+        token = profile_token or self.active_profile_token
+        if not token and self.profiles:
+            token = self.profiles[0].get("token")
+        return html.escape(str(token or "IPCProfilesToken0"))
 
     def ptz_continuous_move(
         self,
@@ -527,13 +555,8 @@ class OnvifClient:
         timeout_sec: a câmera para sozinha após esse tempo se o Stop se perder; quem mantém o
         movimento deve reenviar o comando antes de expirar.
         """
-        token = profile_token or self.active_profile_token
-        if not token and self.profiles:
-            token = self.profiles[0].get("token")
-        token = token or "IPCProfilesToken0"
+        escaped_token = self._ptz_profile_token(profile_token)
 
-        escaped_token = html.escape(str(token))
-        
         velocity_elements = f'<tt:PanTilt x="{pan_speed:.2f}" y="{tilt_speed:.2f}" xmlns:tt="http://www.onvif.org/ver10/schema"/>'
         if abs(zoom_speed) > 0.01:
             velocity_elements += f'\n                <tt:Zoom x="{zoom_speed:.2f}" xmlns:tt="http://www.onvif.org/ver10/schema"/>'
@@ -546,25 +569,20 @@ class OnvifClient:
             <tptz:Timeout>PT{int(timeout_sec)}S</tptz:Timeout>
         </tptz:ContinuousMove>"""
 
-        xml_resp = self._send_soap_request(self.ptz_service_url, body)
-        return xml_resp is not None and "Fault" not in xml_resp
+        self._call(self.ptz_service_url, body)
+        return True
 
     def ptz_stop(self, profile_token: Optional[str] = None) -> bool:
         """Para imediatamente qualquer movimento de Pan, Tilt e Zoom com token escapado."""
-        token = profile_token or self.active_profile_token
-        if not token and self.profiles:
-            token = self.profiles[0].get("token")
-        token = token or "IPCProfilesToken0"
-
-        escaped_token = html.escape(str(token))
+        escaped_token = self._ptz_profile_token(profile_token)
         body = f"""<tptz:Stop>
             <tptz:ProfileToken>{escaped_token}</tptz:ProfileToken>
             <tptz:PanTilt>true</tptz:PanTilt>
             <tptz:Zoom>true</tptz:Zoom>
         </tptz:Stop>"""
 
-        xml_resp = self._send_soap_request(self.ptz_service_url, body)
-        return xml_resp is not None and "Fault" not in xml_resp
+        self._call(self.ptz_service_url, body)
+        return True
 
     def ptz_relative_move(
         self,
@@ -574,8 +592,7 @@ class OnvifClient:
         profile_token: Optional[str] = None,
     ) -> bool:
         """Executa um deslocamento relativo de posição com token escapado."""
-        token = profile_token or self.active_profile_token or "Profile_1"
-        escaped_token = html.escape(str(token))
+        escaped_token = self._ptz_profile_token(profile_token)
         body = f"""<tptz:RelativeMove>
             <tptz:ProfileToken>{escaped_token}</tptz:ProfileToken>
             <tptz:Translation>
@@ -584,55 +601,49 @@ class OnvifClient:
             </tptz:Translation>
         </tptz:RelativeMove>"""
 
-        xml_resp = self._send_soap_request(self.ptz_service_url, body)
-        return xml_resp is not None and "Fault" not in xml_resp
+        self._call(self.ptz_service_url, body)
+        return True
 
     def ptz_get_presets(self, profile_token: Optional[str] = None) -> List[Dict[str, str]]:
         """Retorna lista de posições pré-programadas (Presets) salvas na câmera."""
-        token = profile_token or self.active_profile_token or "Profile_1"
-        escaped_token = html.escape(str(token))
+        escaped_token = self._ptz_profile_token(profile_token)
         body = f"""<tptz:GetPresets>
             <tptz:ProfileToken>{escaped_token}</tptz:ProfileToken>
         </tptz:GetPresets>"""
 
-        xml_resp = self._send_soap_request(self.ptz_service_url, body)
+        root = self._call(self.ptz_service_url, body)
         presets = []
-
-        if xml_resp:
-            preset_blocks = re.findall(r'<[^:]*:Preset\s+token="([^"]+)"[^>]*>(.*?)</[^:]*:Preset>', xml_resp, re.DOTALL)
-            for ptoken, pblock in preset_blocks:
-                name_match = re.search(r'<[^:]*:Name[^>]*>(.*?)</[^:]*:Name>', pblock)
-                pname = name_match.group(1).strip() if name_match else f"Preset {ptoken}"
-                presets.append({"token": ptoken, "name": pname})
-
+        for preset in _iter_named(root, "Preset"):
+            ptoken = preset.get("token", "").strip()
+            if not ptoken:
+                continue
+            pname = _text(_child(preset, "Name")) or f"Preset {ptoken}"
+            presets.append({"token": ptoken, "name": pname})
         return presets
 
     def ptz_goto_preset(self, preset_token: str, profile_token: Optional[str] = None) -> bool:
         """Movimenta a câmera para a posição pré-programada (Preset) com tokens escapados."""
-        token = profile_token or self.active_profile_token or "Profile_1"
-        escaped_token = html.escape(str(token))
+        escaped_token = self._ptz_profile_token(profile_token)
         escaped_preset = html.escape(str(preset_token))
         body = f"""<tptz:GotoPreset>
             <tptz:ProfileToken>{escaped_token}</tptz:ProfileToken>
             <tptz:PresetToken>{escaped_preset}</tptz:PresetToken>
         </tptz:GotoPreset>"""
 
-        xml_resp = self._send_soap_request(self.ptz_service_url, body)
-        return xml_resp is not None and "Fault" not in xml_resp
+        self._call(self.ptz_service_url, body)
+        return True
 
     def ptz_set_preset(self, preset_name: str, profile_token: Optional[str] = None) -> Optional[str]:
-        """Salva a posição atual como um novo Preset com escape XML completo."""
-        token = profile_token or self.active_profile_token or "Profile_1"
-        escaped_token = html.escape(str(token))
+        """
+        Salva a posição atual como um novo Preset com escape XML completo.
+        Devolve o token criado, ou None se a resposta não trouxer token.
+        """
+        escaped_token = self._ptz_profile_token(profile_token)
         escaped_name = html.escape(str(preset_name))
         body = f"""<tptz:SetPreset>
             <tptz:ProfileToken>{escaped_token}</tptz:ProfileToken>
             <tptz:PresetName>{escaped_name}</tptz:PresetName>
         </tptz:SetPreset>"""
 
-        xml_resp = self._send_soap_request(self.ptz_service_url, body)
-        if xml_resp:
-            match = re.search(r'<[^:]*:PresetToken[^>]*>(.*?)</[^:]*:PresetToken>', xml_resp)
-            if match:
-                return match.group(1).strip()
-        return None
+        root = self._call(self.ptz_service_url, body)
+        return _text(_find_named(root, "PresetToken")) or None
