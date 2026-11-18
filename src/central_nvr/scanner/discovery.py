@@ -167,6 +167,7 @@ class NetworkScanner:
                         with self._lock:
                             if ip not in self._discovered_devices:
                                 device_info["source"] = "ONVIF (WS-Discovery)"
+                                device_info["method"] = "ws-discovery"
                                 device_info["status"] = "Online"
                                 device_info["rtsp_port"] = 554
                                 self._discovered_devices[ip] = device_info
@@ -239,6 +240,7 @@ class NetworkScanner:
                     "types": "RTSP Video Streamer",
                     "scopes": [],
                     "source": "Porta RTSP / CCTV",
+                    "method": "port-scan",
                     "status": "Online",
                     "rtsp_port": 554,
                 }

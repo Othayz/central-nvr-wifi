@@ -691,7 +691,7 @@ class MainWindow(QMainWindow):
         super().keyPressEvent(event)
 
     def _open_discovery_dialog(self):
-        dialog = DiscoveryDialog(parent=self)
+        dialog = DiscoveryDialog(parent=self, default_username=self.config_mgr.get("default_username", ""))
         dialog.device_added.connect(self._add_discovered_camera)
         dialog.exec()
 

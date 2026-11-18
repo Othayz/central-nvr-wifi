@@ -1,6 +1,7 @@
 """
 Diálogo de Descoberta de Rede (WS-Discovery ONVIF e Sondagem de Portas) e Adição de Câmeras.
 """
+import ipaddress
 from typing import Any, Dict, List, Optional
 
 from PySide6.QtCore import QObject, QThread, Qt, Signal
@@ -91,8 +92,10 @@ class DiscoveryDialog(QDialog):
 
     device_added = Signal(object)  # CameraDevice
 
-    def __init__(self, parent: Optional[QWidget] = None):
+    def __init__(self, parent: Optional[QWidget] = None, default_username: str = ""):
         super().__init__(parent)
+        # Configuração `default_username`; "admin" se o usuário nunca a definiu
+        self.default_username = default_username or "admin"
         self.setWindowTitle("Gerenciamento de Dispositivos e Descoberta de Rede")
         self.resize(780, 520)
         self.discovered_list: List[Dict[str, Any]] = []
@@ -155,7 +158,7 @@ class DiscoveryDialog(QDialog):
         cred_layout = QHBoxLayout(cred_box)
         
         cred_layout.addWidget(QLabel("Usuário:"))
-        self.txt_disc_user = QLineEdit("admin")
+        self.txt_disc_user = QLineEdit(self.default_username)
         cred_layout.addWidget(self.txt_disc_user)
 
         cred_layout.addWidget(QLabel("Senha:"))
@@ -214,7 +217,7 @@ class DiscoveryDialog(QDialog):
         self.txt_man_rtsp_path = QLineEdit("/onvif1")
         form.addRow("Caminho RTSP:", self.txt_man_rtsp_path)
 
-        self.txt_man_user = QLineEdit("admin")
+        self.txt_man_user = QLineEdit(self.default_username)
         form.addRow("Usuário:", self.txt_man_user)
 
         self.txt_man_pass = QLineEdit()
@@ -287,7 +290,10 @@ class DiscoveryDialog(QDialog):
         self.table.insertRow(row)
 
         chk_item = QTableWidgetItem()
-        chk_item.setCheckState(Qt.CheckState.Checked)
+        # Só respostas WS-Discovery vêm marcadas: um host achado apenas por porta aberta pode ser
+        # NAS, impressora ou outro equipamento, e receberia a senha digitada (Issue #30)
+        is_onvif = dev.get("method") == "ws-discovery"
+        chk_item.setCheckState(Qt.CheckState.Checked if is_onvif else Qt.CheckState.Unchecked)
         chk_item.setData(Qt.ItemDataRole.UserRole, dev)
         self.table.setItem(row, 0, chk_item)
 
@@ -414,6 +420,11 @@ class DiscoveryDialog(QDialog):
         ip = self.txt_man_ip.text().strip()
         if not ip:
             QMessageBox.warning(self, "Aviso", "O endereço IP é obrigatório.")
+            return
+        try:
+            ip = str(ipaddress.ip_address(ip))
+        except ValueError:
+            QMessageBox.warning(self, "Aviso", f"Endereço IP inválido: '{ip}'. Use o formato 192.168.1.10.")
             return
 
         preset = self.combo_preset.currentData()
