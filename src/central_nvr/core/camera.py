@@ -67,84 +67,82 @@ class CameraDevice:
     stats: StreamStats = field(default_factory=StreamStats)
     last_error: str = ""
 
+    # ------------------------------------------------------------------
+    # Montagem de URLs RTSP (Issue #18)
+    # ------------------------------------------------------------------
+
+    def _auth_prefix(self) -> str:
+        """
+        "usuario:senha@" com cada parte codificada por completo (`safe=""`): `/`, `@`, `:`, `#`, `?`
+        e `%` na senha não podem alterar a interpretação da URL.
+        """
+        username = self.username if self.username else ("admin" if self.password else "")
+        if not username:
+            return ""
+        auth = urllib.parse.quote(username, safe="")
+        if self.password:
+            auth += ":" + urllib.parse.quote(self.password, safe="")
+        return auth + "@"
+
+    @staticmethod
+    def _host_for_url(host: str) -> str:
+        """Endereços IPv6 vão entre colchetes na URL."""
+        if host and ":" in host and not host.startswith("["):
+            return f"[{host}]"
+        return host
+
+    def _build_url(self, path: str) -> str:
+        path = path if path.startswith("/") else f"/{path}"
+        return f"rtsp://{self._auth_prefix()}{self._host_for_url(self.ip)}:{self.rtsp_port}{path}"
+
     def _with_credentials(self, url: str) -> str:
         """Injeta usuário/senha numa URL RTSP explícita (ex.: devolvida pelo ONVIF) que não os tenha."""
         parsed = urllib.parse.urlparse(url)
-        if self.username and not parsed.username:
-            auth = urllib.parse.quote(self.username)
-            if self.password:
-                auth += f":{urllib.parse.quote(self.password)}"
-            netloc = f"{auth}@{parsed.hostname}"
-            if parsed.port:
-                netloc += f":{parsed.port}"
-            return urllib.parse.urlunparse((
-                parsed.scheme,
-                netloc,
-                parsed.path,
-                parsed.params,
-                parsed.query,
-                parsed.fragment
-            ))
-        return url
+        auth = self._auth_prefix()
+        if not auth or parsed.username:
+            return url
+        netloc = f"{auth}{self._host_for_url(parsed.hostname or '')}"
+        if parsed.port:
+            netloc += f":{parsed.port}"
+        return urllib.parse.urlunparse((
+            parsed.scheme,
+            netloc,
+            parsed.path,
+            parsed.params,
+            parsed.query,
+            parsed.fragment,
+        ))
 
     def get_full_rtsp_url(self) -> str:
         """Gera a URL RTSP completa com credenciais embutidas caso necessário."""
         if self.rtsp_url:
             return self._with_credentials(self.rtsp_url)
-
-        # Construir a partir dos campos individuais
-        username = self.username if self.username else ("admin" if self.password else "")
-        auth = ""
-        if username:
-            auth = urllib.parse.quote(username)
-            if self.password:
-                auth += f":{urllib.parse.quote(self.password)}"
-            auth += "@"
-
-        path = self.rtsp_path if self.rtsp_path.startswith("/") else f"/{self.rtsp_path}"
-        return f"rtsp://{auth}{self.ip}:{self.rtsp_port}{path}"
+        return self._build_url(self.rtsp_path)
 
     def get_substream_url(self) -> str:
         """Retorna a URL RTSP do Sub-Stream (baixa resolução para economia de banda Wi-Fi)."""
         if self.substream_url:
             return self._with_credentials(self.substream_url)
 
-        username = self.username if self.username else ("admin" if self.password else "")
-        auth = ""
-        if username:
-            auth = urllib.parse.quote(username)
-            if self.password:
-                auth += f":{urllib.parse.quote(self.password)}"
-            auth += "@"
-
         if self.substream_path:
-            path = self.substream_path if self.substream_path.startswith("/") else f"/{self.substream_path}"
-            return f"rtsp://{auth}{self.ip}:{self.rtsp_port}{path}"
+            return self._build_url(self.substream_path)
 
         # Heurística para sub-stream conforme fabricante
         mfg = self.manufacturer.lower()
         if "yoosee" in mfg or "/onvif1" in self.rtsp_path:
-            return f"rtsp://{auth}{self.ip}:{self.rtsp_port}/onvif2"
+            return self._build_url("/onvif2")
         elif "intelbras" in mfg or "dahua" in mfg:
-            return f"rtsp://{auth}{self.ip}:{self.rtsp_port}/cam/realmonitor?channel=1&subtype=1"
+            return self._build_url("/cam/realmonitor?channel=1&subtype=1")
         elif "hikvision" in mfg:
-            return f"rtsp://{auth}{self.ip}:{self.rtsp_port}/Streaming/Channels/102"
+            return self._build_url("/Streaming/Channels/102")
         elif "/11" in self.rtsp_path:
-            return f"rtsp://{auth}{self.ip}:{self.rtsp_port}/12"
+            return self._build_url("/12")
 
-        return f"rtsp://{auth}{self.ip}:{self.rtsp_port}/live/ch1"
+        return self._build_url("/live/ch1")
 
     def get_candidate_rtsp_urls(self, prefer_substream: bool = False) -> List[str]:
         """Retorna uma lista priorizada de URLs candidatas RTSP para câmeras populares."""
-        username = self.username if self.username else ("admin" if self.password else "")
-        auth = ""
-        if username:
-            auth = urllib.parse.quote(username)
-            if self.password:
-                auth += f":{urllib.parse.quote(self.password)}"
-            auth += "@"
-
-        urls = []
+        urls: List[str] = []
         if prefer_substream:
             sub_url = self.get_substream_url()
             if sub_url:
@@ -156,8 +154,7 @@ class CameraDevice:
 
         # Se o usuário configurou um path específico que não é o placeholder padrão
         if self.rtsp_path and self.rtsp_path not in ("/live/ch0", ""):
-            path = self.rtsp_path if self.rtsp_path.startswith("/") else f"/{self.rtsp_path}"
-            url_custom = f"rtsp://{auth}{self.ip}:{self.rtsp_port}{path}"
+            url_custom = self._build_url(self.rtsp_path)
             if url_custom not in urls:
                 urls.append(url_custom)
 
@@ -178,7 +175,7 @@ class CameraDevice:
         ]
 
         for p in common_paths:
-            candidate = f"rtsp://{auth}{self.ip}:{self.rtsp_port}{p}"
+            candidate = self._build_url(p)
             if candidate not in urls:
                 urls.append(candidate)
 
