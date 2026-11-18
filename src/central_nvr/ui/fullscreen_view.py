@@ -8,7 +8,7 @@ import re
 from pathlib import Path
 from typing import Optional
 
-from PySide6.QtCore import QPoint, QRect, Qt, QTimer
+from PySide6.QtCore import QPoint, QRect, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QImage, QPainter
 from PySide6.QtWidgets import (
     QHBoxLayout,
@@ -23,6 +23,8 @@ from central_nvr.core.config import get_data_dir
 
 
 class FullscreenPlayerWindow(QWidget):
+    closed = Signal()  # A view volta ao perfil de stream da grade (Issue #47)
+
     """
     Janela exclusiva sem bordas (Frameless Fullscreen) dedicada a uma única câmera.
     - Oculta controles OSD e cursor do mouse automaticamente após 2.5s de inatividade
@@ -376,3 +378,4 @@ class FullscreenPlayerWindow(QWidget):
         self.toast_timer.stop()
         self.setCursor(Qt.CursorShape.ArrowCursor)
         super().closeEvent(event)
+        self.closed.emit()

@@ -52,6 +52,12 @@ class CameraViewWidget(QFrame):
         self.hw_accel = hw_accel
         self.rtsp_transport = rtsp_transport
 
+        # Perfil de stream escolhido pela grade (Issue #47) e escolha manual pelo botão HD/SD,
+        # que prevalece até a próxima troca de layout
+        self._auto_prefer_sub = False
+        self._manual_override = False
+        self._manual_prefer_sub = False
+
         # Câmera fora da tela (Issue #25): pausada e, após este tempo, desconectada
         self._on_screen = True
         self._suspended = False
@@ -324,6 +330,10 @@ class CameraViewWidget(QFrame):
         from central_nvr.ui.fullscreen_view import FullscreenPlayerWindow
         if not hasattr(self, "_fullscreen_win") or self._fullscreen_win is None:
             self._fullscreen_win = FullscreenPlayerWindow(camera=self.camera, parent=None)
+            self._fullscreen_win.closed.connect(self._on_fullscreen_closed)
+        # Tela cheia de uma câmera: stream principal em resolução original (Issue #47)
+        if self.worker and not self._manual_override:
+            self.worker.set_prefer_substream(False)
         if self.current_frame:
             self._fullscreen_win.set_frame(
                 self.current_frame,
@@ -353,7 +363,7 @@ class CameraViewWidget(QFrame):
             if self._suspended:
                 self._start_stream()
             elif self.worker:
-                self.worker.resume()
+                self.worker.resume()  # o perfil HD/SD é reaplicado pela grade logo em seguida
         else:
             if self.worker:
                 self.worker.pause()
@@ -392,12 +402,46 @@ class CameraViewWidget(QFrame):
         if frame is not None:
             self._on_frame_received(frame)
 
+    # ------------------------------------------------------------------
+    # Perfil de stream automático (Issue #47)
+    # ------------------------------------------------------------------
+
+    def _fullscreen_open(self) -> bool:
+        fullscreen = getattr(self, "_fullscreen_win", None)
+        return fullscreen is not None and fullscreen.isVisible()
+
+    def apply_auto_stream_profile(self, prefer_substream: bool, layout_changed: bool):
+        """
+        Chamado pela grade: sub-stream nas miniaturas, principal no 1x1. Uma escolha manual pelo
+        botão HD/SD prevalece até a próxima troca de layout.
+        """
+        self._auto_prefer_sub = prefer_substream
+        if layout_changed:
+            self._manual_override = False
+        # Fora da tela a câmera está pausada: aplica quando voltar, sem reconectar à toa
+        if self._fullscreen_open() or not self._on_screen:
+            return
+        desired = self._manual_prefer_sub if self._manual_override else prefer_substream
+        if self.worker and self.worker.prefer_substream != desired:
+            self.worker.set_prefer_substream(desired)
+
+    def _on_fullscreen_closed(self):
+        # Volta ao perfil da grade (a escolha manual, se houver, continua valendo)
+        self._sync_target_size()
+        if self.worker and not self._manual_override:
+            self.worker.set_prefer_substream(self._auto_prefer_sub)
+
     def _start_stream(self):
         """Inicia a thread de captura e decodificação do fluxo RTSP."""
+        if self._manual_override:
+            prefer_sub = self._manual_prefer_sub
+        else:
+            prefer_sub = self._auto_prefer_sub and not self._fullscreen_open()
         self.worker = StreamWorker(
             camera=self.camera,
             hw_accel=self.hw_accel,
             rtsp_transport=self.rtsp_transport,
+            prefer_substream=prefer_sub,
             parent=self,
         )
         self._suspended = False
@@ -483,6 +527,8 @@ class CameraViewWidget(QFrame):
         if not self.worker:
             return
         new_pref = not self.worker.prefer_substream
+        self._manual_override = True
+        self._manual_prefer_sub = new_pref
         self.worker.set_prefer_substream(new_pref)
         # O rótulo só muda quando o novo stream conectar (_on_stream_variant)
         self.btn_stream_profile.setText("…")

@@ -137,6 +137,7 @@ class CameraGridWidget(QWidget):
         self.empty_slots: List[EmptySlotWidget] = []
         self._filler_cells: List[QFrame] = []
         self.current_page = 0
+        self._last_profile_key: Optional[tuple] = None
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -308,6 +309,20 @@ class CameraGridWidget(QWidget):
         self._apply_layout_impl(mode)
         self._update_page_bar()
         self._sync_on_screen()
+        self._apply_stream_profiles(mode)
+
+    def _apply_stream_profiles(self, mode: str):
+        """
+        Sub-stream nas miniaturas (mais de uma câmera na tela) e stream principal com uma só
+        (Issue #47). Uma troca de layout reaplica o automático por cima da escolha manual.
+        """
+        visible = [v for v in self.camera_views.values() if not v.isHidden()]
+        prefer_sub = len(visible) > 1
+        profile_key = (mode, len(visible))
+        layout_changed = profile_key != self._last_profile_key
+        self._last_profile_key = profile_key
+        for view in self.camera_views.values():
+            view.apply_auto_stream_profile(prefer_sub, layout_changed)
 
     def _sync_on_screen(self):
         for view in self.camera_views.values():
