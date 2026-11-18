@@ -48,7 +48,7 @@ jobs:
           QT_QPA_PLATFORM: offscreen
         run: |
           pip install pytest
-          python -m pytest tests/test_updater.py tests/test_update_flow.py tests/test_appstream.py tests/test_apprun.py tests/test_stream_lifecycle.py -q
+          python -m pytest tests -q
 
       - name: Build Universal AppImage
         run: |
@@ -76,7 +76,9 @@ jobs:
           fi
           ARCHIVE_NAME="central-nvr-${TAG_NAME}.tar.gz"
           mkdir -p dist
-          tar --exclude='./.git' --exclude='./build' --exclude='./dist' --exclude='./venv' -czf "dist/${ARCHIVE_NAME}" .
+          # git archive gera exatamente o conteúdo versionado do commit,
+          # sem __pycache__/, .pytest_cache/ ou resíduos do build.
+          git archive --format=tar.gz --prefix="central-nvr-${TAG_NAME}/" -o "dist/${ARCHIVE_NAME}" HEAD
           ls -la dist/
 
       - name: Verify Checksums
