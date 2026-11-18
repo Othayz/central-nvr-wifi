@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
 authors = [
-    {name = "Othay", email = "developer@centralnvr.local"}
+    {name = "Othay"}
 ]
 keywords = ["nvr", "onvif", "rtsp", "ptz", "cctv", "camera", "pyside6", "linux"]
 classifiers = [
@@ -30,12 +30,14 @@ classifiers = [
 ]
 
 dependencies = [
-    "PySide6>=6.5.0",
+    # PySide6 6.12.0 decrementa a contagem de referências de True a cada emit() em Python < 3.12
+    # (True não é imortal) e o processo aborta; o 6.11 não tem o problema
+    "PySide6>=6.5.0,<6.12; python_version < '3.12'",
+    "PySide6>=6.5.0; python_version >= '3.12'",
     "opencv-python-headless>=4.8.0",
     "av>=11.0.0",
     "numpy>=1.24.0",
     "requests>=2.31.0",
-    "zeep>=4.2.0",
     "pillow>=10.0.0",
     "keyring>=24.0.0",
     "defusedxml>=0.7.1",

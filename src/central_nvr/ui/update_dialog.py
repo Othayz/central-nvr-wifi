@@ -8,8 +8,8 @@ import logging
 import os
 from typing import Optional
 
-from PySide6.QtCore import QEventLoop, QObject, QSize, Qt, QTimer, QUrl
-from PySide6.QtGui import QDesktopServices, QFont, QIcon, QPixmap
+from PySide6.QtCore import Qt, QTimer, QUrl
+from PySide6.QtGui import QDesktopServices, QPixmap
 from PySide6.QtWidgets import (
     QDialog,
     QFrame,
@@ -18,15 +18,12 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
-    QScrollArea,
-    QSizePolicy,
     QTextBrowser,
     QVBoxLayout,
     QWidget,
 )
 
 from central_nvr import __version__
-from central_nvr.core.config import get_data_dir
 from central_nvr.core.updater import (
     AssetDownloadWorker,
     ChecksumFetchWorker,
@@ -37,9 +34,20 @@ from central_nvr.core.updater import (
     find_best_asset_for_system,
     get_updates_dir,
     install_downloaded_package,
+    preferred_download_url,
+    resolve_github_token,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _min_appimage_size() -> int:
+    """CENTRAL_NVR_MIN_APPIMAGE_SIZE como inteiro; valor ausente ou inválido vale 0 (sem mínimo)."""
+    try:
+        return max(0, int(os.environ.get("CENTRAL_NVR_MIN_APPIMAGE_SIZE", "0")))
+    except ValueError:
+        logger.warning("CENTRAL_NVR_MIN_APPIMAGE_SIZE inválido; ignorando o tamanho mínimo.")
+        return 0
 
 
 def _format_markdown_to_html(md_text: str) -> str:
@@ -99,14 +107,6 @@ class BaseUpdateDialog(QDialog):
             url = f"https://github.com/{self.repo}/releases"
         if url:
             QDesktopServices.openUrl(QUrl(url))
-
-    def _open_github(self):
-        """Alias para _open_release_page mantendo compatibilidade de API."""
-        self._open_release_page()
-
-    def _open_github_release(self):
-        """Alias para _open_release_page mantendo compatibilidade de API."""
-        self._open_release_page()
 
     def _block_missing_checksum(self):
         """Exibe diálogo de segurança e redireciona para a página da release no navegador."""
@@ -287,7 +287,7 @@ class StartupUpdateDialog(BaseUpdateDialog):
         self.btn_layout.setSpacing(10)
 
         self.btn_github = QPushButton("🔗 Ver no GitHub")
-        self.btn_github.clicked.connect(self._open_github_release)
+        self.btn_github.clicked.connect(self._open_release_page)
         self.btn_github.hide()
         self.btn_layout.addWidget(self.btn_github)
 
@@ -347,10 +347,6 @@ class StartupUpdateDialog(BaseUpdateDialog):
         self.btn_skip.show()
         self.btn_update.show()
 
-    def _open_github_release(self):
-        if self.release_info and self.release_info.html_url:
-            QDesktopServices.openUrl(QUrl(self.release_info.html_url))
-
     def _proceed_to_app(self):
         self.should_open_main_window = True
         self.accept()
@@ -398,10 +394,11 @@ class StartupUpdateDialog(BaseUpdateDialog):
         self.btn_update.setEnabled(False)
         self.btn_update.setText("Baixando...")
 
+        token = resolve_github_token(self.token)
         self.download_worker = AssetDownloadWorker(
-            download_url=self.best_asset.download_url,
+            download_url=preferred_download_url(self.best_asset, token),
             destination_path=self._download_destination(),
-            token=self.token,
+            token=token,
             expected_size=self.best_asset.size,
             parent=self,
         )
@@ -445,7 +442,7 @@ class StartupUpdateDialog(BaseUpdateDialog):
             self._execute_installation()
 
     def _on_download_failed(self, error_msg: str):
-        self.lbl_status.setText(f"❌ Erro no download: {error_msg}")
+        self.lbl_status.setText(f"❌ Erro no download: {html.escape(error_msg)}")
         self.lbl_status.setStyleSheet("font-size: 12px; font-weight: 700; color: #EF4444;")
         self.btn_skip.setEnabled(True)
         self.btn_update.setEnabled(True)
@@ -466,7 +463,7 @@ class StartupUpdateDialog(BaseUpdateDialog):
             self._block_missing_checksum()
             return
 
-        min_size = int(os.environ.get("CENTRAL_NVR_MIN_APPIMAGE_SIZE", "0"))
+        min_size = _min_appimage_size()
         success, msg = install_downloaded_package(
             self.downloaded_file_path,
             expected_sha256=expected_sha,
@@ -570,7 +567,7 @@ class UpdateDialog(BaseUpdateDialog):
         btn_layout.setSpacing(8)
 
         self.btn_github = QPushButton("🔗 Ver no GitHub")
-        self.btn_github.clicked.connect(self._open_github)
+        self.btn_github.clicked.connect(self._open_release_page)
         btn_layout.addWidget(self.btn_github)
 
         btn_layout.addStretch()
@@ -607,7 +604,7 @@ class UpdateDialog(BaseUpdateDialog):
         self.lbl_dialog_title.setStyleSheet("font-size: 16px; font-weight: 700; color: #16A34A;")
         self.lbl_version_status.setText(f"Instalada: v{__version__}  ➔  Disponível: v{release.version}")
 
-        asset_str = f"<p><b>Pacote recomendado:</b> <code>{self.best_asset.name}</code> ({self.best_asset.formatted_size})</p>" if self.best_asset else ""
+        asset_str = f"<p><b>Pacote recomendado:</b> <code>{html.escape(self.best_asset.name)}</code> ({self.best_asset.formatted_size})</p>" if self.best_asset else ""
         html_body = f"<b>Data de Lançamento:</b> {release.formatted_date}{asset_str}<hr style='border:0; border-top:1px solid #CBD5E1;'/>"
         html_body += _format_markdown_to_html(release.body)
         self.txt_changelog.setHtml(html_body)
@@ -631,11 +628,11 @@ class UpdateDialog(BaseUpdateDialog):
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
         first_line = err.splitlines()[0] if err else "Erro desconhecido"
-        self.lbl_status.setText(f"Não foi possível verificar atualizações: {first_line}")
+        self.lbl_status.setText(f"Não foi possível verificar atualizações: {html.escape(first_line)}")
         self.lbl_status.setStyleSheet("font-size: 12px; font-weight: 600; color: #EF4444;")
         self.btn_action.setEnabled(False)
 
-        formatted_err = err.replace("\n", "<br>")
+        formatted_err = html.escape(err).replace("\n", "<br>")
         self.txt_changelog.setHtml(f"""
         <div style='padding: 14px; font-family: sans-serif; color: #334155; line-height: 1.6;'>
             <h3 style='color: #DC2626; margin-top: 0;'>⚠️ Falha ao verificar atualizações</h3>
@@ -650,10 +647,6 @@ class UpdateDialog(BaseUpdateDialog):
             </ul>
         </div>
         """)
-
-    def _open_github(self):
-        url = self.release_info.html_url if self.release_info else f"https://github.com/{self.repo}/releases"
-        QDesktopServices.openUrl(QUrl(url))
 
     def _on_action_clicked(self):
         if not self.release_info or not self.best_asset:
@@ -683,10 +676,11 @@ class UpdateDialog(BaseUpdateDialog):
         self.btn_action.setEnabled(False)
         self.btn_action.setText("Baixando...")
 
+        token = resolve_github_token(self.token)
         self.download_worker = AssetDownloadWorker(
-            download_url=self.best_asset.download_url,
+            download_url=preferred_download_url(self.best_asset, token),
             destination_path=self._download_destination(),
-            token=self.token,
+            token=token,
             expected_size=self.best_asset.size,
             parent=self,
         )
@@ -720,7 +714,7 @@ class UpdateDialog(BaseUpdateDialog):
         self.btn_action.clicked.connect(self._install_package)
 
     def _on_download_failed(self, err: str):
-        self.lbl_status.setText(f"Falha no download: {err}")
+        self.lbl_status.setText(f"Falha no download: {html.escape(err)}")
         self.lbl_status.setStyleSheet("font-size: 12px; font-weight: 700; color: #EF4444;")
         self.btn_action.setEnabled(True)
         self.btn_action.setText("Tentar Novamente")
@@ -731,7 +725,7 @@ class UpdateDialog(BaseUpdateDialog):
             if not expected_sha:
                 self._block_missing_checksum()
                 return
-            min_size = int(os.environ.get("CENTRAL_NVR_MIN_APPIMAGE_SIZE", "0"))
+            min_size = _min_appimage_size()
             success, msg = install_downloaded_package(
                 self.downloaded_file_path,
                 expected_sha256=expected_sha,

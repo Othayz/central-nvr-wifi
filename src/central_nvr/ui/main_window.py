@@ -7,13 +7,12 @@ import logging
 import os
 from typing import List, Optional
 
-from PySide6.QtCore import QSize, Qt, QTimer
-from PySide6.QtGui import QAction, QIcon, QKeySequence
+from PySide6.QtCore import Qt, QTimer
+from PySide6.QtGui import QAction, QIcon
 from PySide6.QtWidgets import (
     QButtonGroup,
     QFrame,
     QHBoxLayout,
-    QHeaderView,
     QInputDialog,
     QLabel,
     QListWidget,
@@ -23,7 +22,6 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QSplitter,
-    QStatusBar,
     QTabWidget,
     QTreeWidget,
     QTreeWidgetItem,
@@ -32,14 +30,15 @@ from PySide6.QtWidgets import (
 )
 
 from central_nvr import __version__
-from central_nvr.core.camera import CameraDevice
-from central_nvr.core.config import ConfigManager, get_data_dir
+from central_nvr.core.camera import DEFAULT_RTSP_TRANSPORT, CameraDevice
+from central_nvr.core.config import ConfigManager
 from central_nvr.ui.camera_grid import CameraGridWidget
 from central_nvr.ui.discovery_dialog import DiscoveryDialog
 from central_nvr.ui.playback_view import PlaybackWidget
+from central_nvr.ui.camera_view import ViewOptions
 from central_nvr.ui.ptz_controller import PTZControllerWidget
 from central_nvr.ui.settings_dialog import SettingsDialog
-from central_nvr.ui.styles import DARK_THEME_QSS, LIGHT_THEME_QSS, get_theme_qss
+from central_nvr.ui.styles import get_theme_qss
 from central_nvr.ui.update_dialog import UpdateDialog
 from central_nvr.core.updater import ReleaseInfo, UpdateCheckWorker
 
@@ -61,7 +60,6 @@ class MainWindow(QMainWindow):
 
         # Definir ícone da janela
         from pathlib import Path
-        from PySide6.QtGui import QIcon
         icon_path = Path(__file__).parent / "assets" / "central-nvr.png"
         if icon_path.exists():
             self.setWindowIcon(QIcon(str(icon_path)))
@@ -110,10 +108,12 @@ class MainWindow(QMainWindow):
 
         # Grid Multi-Câmeras
         hw_accel = self.config_mgr.get("hw_accel", "vaapi")
-        rtsp_transport = self.config_mgr.get("rtsp_transport", "tcp")
+        rtsp_transport = self.config_mgr.get("rtsp_transport", DEFAULT_RTSP_TRANSPORT)
         self.camera_grid = CameraGridWidget(
             hw_accel=hw_accel,
             rtsp_transport=rtsp_transport,
+            hidden_timeout_min=float(self.config_mgr.get("hidden_camera_timeout_min", 5)),
+            view_options=ViewOptions.from_config(self.config_mgr),
             parent=self,
         )
         self.camera_grid.camera_selected.connect(self._on_camera_selected)
@@ -121,8 +121,8 @@ class MainWindow(QMainWindow):
         self.camera_grid.snapshot_taken.connect(self._on_snapshot_saved)
         self.camera_grid.add_camera_requested.connect(self._open_discovery_dialog)
         self.camera_grid.layout_mode_changed.connect(self._on_layout_mode_changed_by_grid)
-        self.camera_grid.fullscreen_requested.connect(self._on_camera_fullscreen_requested)
         self.camera_grid.camera_renamed.connect(self._on_camera_renamed)
+        self.camera_grid.camera_display_state_changed.connect(self._on_camera_display_state_changed)
         right_vbox.addWidget(self.camera_grid, stretch=1)
 
         self.splitter.addWidget(self.right_workspace)
@@ -334,6 +334,10 @@ class MainWindow(QMainWindow):
         # =====================================================================
         self.ptz_panel = PTZControllerWidget(parent=self)
         self.ptz_panel.command_executed.connect(self._log_event)
+        self.ptz_panel.command_failed.connect(
+            lambda cname, msg: self._log_event(f"PTZ (falha) {cname}", msg)
+        )
+        self.ptz_panel.onvif_port_detected.connect(self._on_onvif_port_detected)
         self.sidebar_tabs.addTab(self.ptz_panel, "Controle PTZ")
 
         # =====================================================================
@@ -373,7 +377,7 @@ class MainWindow(QMainWindow):
         self.lbl_sb_hw.setStyleSheet("color: #38BDF8; font-weight: 600; padding: 0 8px;")
         status_bar.addWidget(self.lbl_sb_hw)
 
-        self.lbl_sb_streams = QLabel(f"Câmeras Conectadas: {len(self.cameras)}")
+        self.lbl_sb_streams = QLabel(f"Câmeras Cadastradas: {len(self.cameras)}")
         self.lbl_sb_streams.setStyleSheet("color: #4ADE80; font-weight: 600; padding: 0 8px;")
         status_bar.addWidget(self.lbl_sb_streams)
 
@@ -425,11 +429,12 @@ class MainWindow(QMainWindow):
         nvr_root.setText(0, f"Central NVR ({len(self.cameras)} Câmeras)")
         nvr_root.setExpanded(True)
 
+        self._tree_items = {}
         for cam in self.cameras:
             cam_item = QTreeWidgetItem(nvr_root)
-            ptz_tag = " [PTZ]" if cam.has_ptz else ""
-            cam_item.setText(0, f"[Ao Vivo] {cam.name} ({cam.ip}){ptz_tag}")
             cam_item.setData(0, Qt.ItemDataRole.UserRole, cam.id)
+            self._tree_items[cam.id] = cam_item
+            self._render_tree_item(cam, self.camera_grid.display_state_of(cam.id))
 
         self._log_event("Sistema", f"{len(self.cameras)} câmera(s) carregada(s).")
 
@@ -478,6 +483,19 @@ class MainWindow(QMainWindow):
         elif action == act_del:
             self._remove_camera_by_id(cam_id)
 
+    def _render_tree_item(self, cam: CameraDevice, state: str):
+        """Item da árvore com o estado real da câmera, não "[Ao Vivo]" fixo (Issue #33)."""
+        item = getattr(self, "_tree_items", {}).get(cam.id)
+        if item is None:
+            return
+        ptz_tag = " [PTZ]" if cam.has_ptz else ""
+        item.setText(0, f"[{state}] {cam.name} ({cam.ip}){ptz_tag}")
+
+    def _on_camera_display_state_changed(self, camera_id: str, state: str):
+        cam = next((c for c in self.cameras if c.id == camera_id), None)
+        if cam:
+            self._render_tree_item(cam, state)
+
     def _on_camera_renamed(self, camera_id: str, new_name: str):
         """Atualiza o nome da câmera em todos os componentes do sistema e salva nas configurações."""
         cam = next((c for c in self.cameras if c.id == camera_id), None)
@@ -506,6 +524,13 @@ class MainWindow(QMainWindow):
         # 6. Registrar nos Logs e na Barra de Status
         self._log_event("Dispositivo", f"Câmera renomeada: '{old_name}' ➔ '{new_name}'")
         self.statusBar().showMessage(f"Câmera renomeada para '{new_name}' com sucesso!", 4000)
+
+    def _on_onvif_port_detected(self, camera_id: str, port: int):
+        """Persiste a porta ONVIF detectada pelo painel PTZ (o objeto da câmera já foi atualizado)."""
+        if self.config_mgr.update_device(camera_id, {"port": port}):
+            cam = next((c for c in self.cameras if c.id == camera_id), None)
+            name = cam.name if cam else camera_id
+            self._log_event("Dispositivo", f"Porta ONVIF de '{name}' detectada e salva: {port}")
 
     def _reconnect_selected_camera(self):
         """Reconecta a câmera selecionada ou todas caso nenhuma esteja selecionada."""
@@ -565,7 +590,7 @@ class MainWindow(QMainWindow):
             self._load_cameras_from_config()
             self.camera_grid.set_cameras(self.cameras)
             self._populate_device_tree()
-            self.lbl_sb_streams.setText(f"Câmeras Conectadas: {len(self.cameras)}")
+            self.lbl_sb_streams.setText(f"Câmeras Cadastradas: {len(self.cameras)}")
             if not self.cameras:
                 self.ptz_panel.set_camera(None)
                 if hasattr(self, "recordings_panel"):
@@ -601,6 +626,9 @@ class MainWindow(QMainWindow):
         item_text = f"[{ts}] {source}: {message}"
         item = QListWidgetItem(item_text)
         self.list_logs.addItem(item)
+        # Limite de itens: o app roda 24/7 e o log crescia sem fim (Issue #37)
+        while self.list_logs.count() > self.MAX_LOG_ITEMS:
+            self.list_logs.takeItem(0)
         self.list_logs.scrollToBottom()
 
     def _change_grid_layout(self, mode: str):
@@ -614,13 +642,6 @@ class MainWindow(QMainWindow):
         if hasattr(self, "layout_buttons") and mode.lower() in self.layout_buttons:
             self.layout_buttons[mode.lower()].setChecked(True)
         self._log_event("Layout", f"Grade alternada para {mode}")
-
-    def _on_camera_fullscreen_requested(self, camera_id: str):
-        """Abre a janela exclusiva de tela cheia para a câmera selecionada."""
-        self._select_camera_by_id(camera_id)
-        if hasattr(self, "camera_grid") and camera_id in self.camera_grid.camera_views:
-            view = self.camera_grid.camera_views[camera_id]
-            view._open_fullscreen_player()
 
     def _enter_grid_fullscreen(self):
         """Coloca todas as câmeras conectadas em tela cheia (ocultando sidebar, header e status bar)."""
@@ -680,8 +701,14 @@ class MainWindow(QMainWindow):
         super().keyPressEvent(event)
 
     def _open_discovery_dialog(self):
-        dialog = DiscoveryDialog(parent=self)
+        dialog = DiscoveryDialog(
+            parent=self,
+            default_username=self.config_mgr.get("default_username", ""),
+            discovery_timeout=float(self.config_mgr.get("ws_discovery_timeout", 3.0)),
+            enable_port_scan=bool(self.config_mgr.get("enable_port_scan", True)),
+        )
         dialog.device_added.connect(self._add_discovered_camera)
+        dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         dialog.exec()
 
     def _add_discovered_camera(self, camera: CameraDevice):
@@ -689,15 +716,14 @@ class MainWindow(QMainWindow):
         self._load_cameras_from_config()
         self.camera_grid.set_cameras(self.cameras)
         self._populate_device_tree()
-        self.lbl_sb_streams.setText(f"Fluxos Ativos: {len(self.cameras)}")
+        self.lbl_sb_streams.setText(f"Câmeras Cadastradas: {len(self.cameras)}")
         self._log_event("Dispositivo", f"Câmera '{camera.name}' adicionada ao sistema.")
 
     def _set_theme(self, theme_name: str):
         """Aplica o tema selecionado (dark ou light) e salva nas preferências."""
         theme = (theme_name or "dark").lower()
         self.current_theme = theme
-        self.config_mgr.set("theme", theme)
-        self.config_mgr.save_settings()
+        self.config_mgr.set("theme", theme)  # set() já grava settings.json
         self.setStyleSheet(get_theme_qss(theme))
 
         if hasattr(self, "act_theme_dark"):
@@ -707,84 +733,96 @@ class MainWindow(QMainWindow):
 
         self._log_event("Aparência", f"Tema alterado para '{theme.capitalize()}'")
 
-    def _toggle_theme(self):
-        """Alterna entre Tema Claro e Tema Escuro."""
-        next_theme = "dark" if self.current_theme == "light" else "light"
-        self._set_theme(next_theme)
-
     def _open_settings_dialog(self):
         dialog = SettingsDialog(config_mgr=self.config_mgr, parent=self)
+        dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         if dialog.exec():
             # Atualizar parâmetros de tema, hardware e reconectar
             theme = self.config_mgr.get("theme", "dark").lower()
             if theme != self.current_theme:
-                self.current_theme = theme
-                self.setStyleSheet(get_theme_qss(self.current_theme))
-                self._set_theme(theme)
+                self._set_theme(theme)  # aplica o QSS, atualiza o menu e registra no log
             hw_accel = self.config_mgr.get("hw_accel", "vaapi")
             self.lbl_sb_hw.setText(f"Aceleração: {hw_accel.upper()} (Ativo)")
             self.camera_grid.hw_accel = hw_accel
-            self.camera_grid.rtsp_transport = self.config_mgr.get("rtsp_transport", "auto")
+            self.camera_grid.rtsp_transport = self.config_mgr.get("rtsp_transport", DEFAULT_RTSP_TRANSPORT)
+            self.camera_grid.set_hidden_timeout(float(self.config_mgr.get("hidden_camera_timeout_min", 5)))
+            self.camera_grid.set_view_options(ViewOptions.from_config(self.config_mgr))
+            # Só reabre os streams cujas opções de conexão mudaram (transporte, GPU, buffer)
             self.camera_grid.set_cameras(self.cameras)
+            self._reconfigure_periodic_update_checker()
 
 
     def _setup_periodic_update_checker(self):
-        """Configura a verificação periódica em segundo plano (a cada 10 minutos)."""
+        """Configura a verificação periódica em segundo plano."""
         self._notified_version: Optional[str] = None
         self._periodic_worker: Optional[UpdateCheckWorker] = None
-        
-        enabled = self.config_mgr.get("periodic_update_check", True)
-        if not enabled:
-            return
-
-        interval_min = self.config_mgr.get("periodic_update_interval_min", 10)
-        interval_ms = max(1, interval_min) * 60 * 1000
-
         self.update_periodic_timer = QTimer(self)
         self.update_periodic_timer.timeout.connect(self._run_background_update_check)
-        self.update_periodic_timer.start(interval_ms)
+        self._reconfigure_periodic_update_checker()
+
+    MIN_UPDATE_INTERVAL_MIN = 60
+    MAX_LOG_ITEMS = 1000
+
+    def _reconfigure_periodic_update_checker(self):
+        """Aplica periodic_update_check / periodic_update_interval_min sem reiniciar o app (Issue #34)."""
+        self.update_periodic_timer.stop()
+        if not self.config_mgr.get("periodic_update_check", True):
+            return
+        interval_min = max(self.MIN_UPDATE_INTERVAL_MIN, int(self.config_mgr.get("periodic_update_interval_min", 60)))
+        self.update_periodic_timer.start(interval_min * 60 * 1000)
         logger.debug(f"Verificação periódica de atualizações ativa (intervalo: {interval_min} min).")
+
+    def start_background_update_check(self):
+        """Verificação de atualização na abertura, em segundo plano (Issue #37)."""
+        self._run_background_update_check()
 
     def _run_background_update_check(self):
         """Dispara consulta assíncrona ao GitHub em segundo plano."""
-        if hasattr(self, "_periodic_worker") and self._periodic_worker and self._periodic_worker.isRunning():
+        if self._periodic_worker is not None and self._periodic_worker.isRunning():
             logger.debug("Verificação de atualização anterior ainda ativa. Ignorando disparo.")
             return
         repo = self.config_mgr.get("github_repo", "Othayz/central-nvr-wifi")
         token = self.config_mgr.get("github_token", "").strip() or None
-        self._periodic_worker = UpdateCheckWorker(repo=repo, token=token, parent=self)
-        self._periodic_worker.update_available.connect(self._on_background_update_found)
-        self._periodic_worker.start()
+        worker = UpdateCheckWorker(repo=repo, token=token, parent=self)
+        worker.update_available.connect(self._on_background_update_found)
+        # Um worker por checagem: liberado ao terminar (antes acumulava 144 por dia)
+        worker.finished.connect(lambda w=worker: self._release_update_worker(w))
+        self._periodic_worker = worker
+        worker.start()
+
+    def _release_update_worker(self, worker):
+        if self._periodic_worker is worker:
+            self._periodic_worker = None
+        worker.deleteLater()
 
     def _on_background_update_found(self, release: ReleaseInfo):
-        """Abre o diálogo de atualização quando a checagem de 10 minutos encontra uma nova versão."""
-        if hasattr(self, "btn_sb_update"):
-            self.btn_sb_update.setText(f"⚡ Nova Versão v{release.version} Disponível!")
-            self.btn_sb_update.show()
-
-        self._log_event("Atualização", f"Nova versão v{release.version} encontrada no GitHub.")
-
-        # Notificar o usuário abrindo a janela de atualização (apenas uma vez por versão lançada)
+        """
+        Nova versão encontrada: avisa pelo botão da barra de status e pelo log, sem abrir diálogo
+        modal sobre o mosaico (Issue #37). O operador abre a atualização quando quiser.
+        """
+        self._pending_release = release
+        self.btn_sb_update.setText(f"⚡ Nova Versão v{release.version} Disponível!")
+        self.btn_sb_update.show()
         if self._notified_version != release.version:
             self._notified_version = release.version
-            repo = self.config_mgr.get("github_repo", "Othayz/central-nvr-wifi")
-            token = self.config_mgr.get("github_token", "").strip() or None
-            dialog = UpdateDialog(repo=repo, release_info=release, token=token, parent=self)
-            dialog.exec()
+            self._log_event("Atualização", f"Nova versão v{release.version} encontrada no GitHub.")
 
     def _open_update_dialog(self):
-        """Abre a janela de verificação de atualização sob demanda do usuário."""
+        """Abre a janela de atualização sob demanda do usuário."""
         repo = self.config_mgr.get("github_repo", "Othayz/central-nvr-wifi")
         token = self.config_mgr.get("github_token", "").strip() or None
-        dialog = UpdateDialog(repo=repo, token=token, parent=self)
+        dialog = UpdateDialog(repo=repo, release_info=getattr(self, "_pending_release", None),
+                              token=token, parent=self)
+        dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         dialog.exec()
 
     def closeEvent(self, event):
         """Encerra threads de forma graciosa ao fechar a janela."""
-        if hasattr(self, "update_periodic_timer") and self.update_periodic_timer.isActive():
+        if self.update_periodic_timer.isActive():
             self.update_periodic_timer.stop()
 
         # Nenhuma espera aqui: as threads de streaming são aposentadas (retire_thread) e as demais
         # threads filhas desta janela são tratadas no encerramento do processo (app.main).
         self.camera_grid.stop_all()
+        self.ptz_panel.shutdown()
         super().closeEvent(event)

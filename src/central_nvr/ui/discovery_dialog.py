@@ -1,6 +1,7 @@
 """
 Diálogo de Descoberta de Rede (WS-Discovery ONVIF e Sondagem de Portas) e Adição de Câmeras.
 """
+import ipaddress
 from typing import Any, Dict, List, Optional
 
 from PySide6.QtCore import QObject, QThread, Qt, Signal
@@ -27,6 +28,8 @@ from PySide6.QtWidgets import (
 )
 
 from central_nvr.core.camera import CameraDevice
+from central_nvr.core.onvif_enrich import FALLBACK_WARNING, enrich_from_onvif
+from central_nvr.core.threads import retire_thread
 from central_nvr.scanner.discovery import NetworkScanner
 
 
@@ -43,9 +46,15 @@ class ScannerWorker(QThread):
         self.enable_port_scan = enable_port_scan
         self.scanner = NetworkScanner()
 
+    @property
+    def warnings(self) -> List[str]:
+        """Avisos da última varredura (ex.: rede grande demais para sondar inteira)."""
+        return self.scanner.warnings
+
     def stop(self):
+        """Pede a parada sem bloquear: as sondas pendentes são canceladas (Issue #41)."""
+        self.requestInterruption()
         self.scanner.stop_scan()
-        self.wait(1000)
 
     def run(self):
         devices = self.scanner.scan_network(
@@ -57,6 +66,31 @@ class ScannerWorker(QThread):
         self.scan_finished.emit(devices)
 
 
+class OnvifEnrichWorker(QThread):
+    """Consulta o ONVIF de cada câmera a cadastrar, fora da thread da interface (Issue #45)."""
+
+    progress = Signal(int, int, str)   # (atual, total, nome)
+    finished_enrich = Signal(list)     # [(CameraDevice, aviso ou None)]
+
+    def __init__(self, cameras: List[CameraDevice], parent: Optional[QObject] = None):
+        super().__init__(parent)
+        self.cameras = cameras
+
+    def run(self):
+        results = []
+        total = len(self.cameras)
+        for i, camera in enumerate(self.cameras, 1):
+            if self.isInterruptionRequested():
+                return
+            self.progress.emit(i, total, camera.name)
+            try:
+                warning = enrich_from_onvif(camera)
+            except Exception as e:  # Nunca deixar a thread morrer sem resposta
+                warning = f"{FALLBACK_WARNING} ({e})"
+            results.append((camera, warning))
+        self.finished_enrich.emit(results)
+
+
 class DiscoveryDialog(QDialog):
     """
     Diálogo para descoberta automática via ONVIF WS-Discovery e adição manual de câmeras.
@@ -64,12 +98,19 @@ class DiscoveryDialog(QDialog):
 
     device_added = Signal(object)  # CameraDevice
 
-    def __init__(self, parent: Optional[QWidget] = None):
+    def __init__(self, parent: Optional[QWidget] = None, default_username: str = "",
+                 discovery_timeout: float = 4.0, enable_port_scan: bool = True):
         super().__init__(parent)
+        # Configurações ws_discovery_timeout / enable_port_scan (Issue #34)
+        self.discovery_timeout = float(discovery_timeout)
+        self.default_port_scan = bool(enable_port_scan)
+        # Configuração `default_username`; "admin" se o usuário nunca a definiu
+        self.default_username = default_username or "admin"
         self.setWindowTitle("Gerenciamento de Dispositivos e Descoberta de Rede")
         self.resize(780, 520)
         self.discovered_list: List[Dict[str, Any]] = []
         self.worker: Optional[ScannerWorker] = None
+        self.enrich_worker: Optional[OnvifEnrichWorker] = None
 
         self._setup_ui()
 
@@ -95,7 +136,7 @@ class DiscoveryDialog(QDialog):
         ctrl_layout.addWidget(self.btn_scan)
 
         self.chk_port_scan = QCheckBox("Sondagem de Portas RTSP/HTTP")
-        self.chk_port_scan.setChecked(True)
+        self.chk_port_scan.setChecked(self.default_port_scan)
         ctrl_layout.addWidget(self.chk_port_scan)
 
         ctrl_layout.addStretch()
@@ -127,7 +168,7 @@ class DiscoveryDialog(QDialog):
         cred_layout = QHBoxLayout(cred_box)
         
         cred_layout.addWidget(QLabel("Usuário:"))
-        self.txt_disc_user = QLineEdit("admin")
+        self.txt_disc_user = QLineEdit(self.default_username)
         cred_layout.addWidget(self.txt_disc_user)
 
         cred_layout.addWidget(QLabel("Senha:"))
@@ -186,7 +227,7 @@ class DiscoveryDialog(QDialog):
         self.txt_man_rtsp_path = QLineEdit("/onvif1")
         form.addRow("Caminho RTSP:", self.txt_man_rtsp_path)
 
-        self.txt_man_user = QLineEdit("admin")
+        self.txt_man_user = QLineEdit(self.default_username)
         form.addRow("Usuário:", self.txt_man_user)
 
         self.txt_man_pass = QLineEdit()
@@ -232,7 +273,7 @@ class DiscoveryDialog(QDialog):
     def _toggle_scan(self):
         """Inicia ou cancela a varredura."""
         if self.worker and self.worker.isRunning():
-            self.worker.stop()
+            self._stop_scan()
             self.btn_scan.setText("🔍 Iniciar Varredura de Rede")
             self.lbl_scan_status.setText("Varredura cancelada.")
             return
@@ -243,7 +284,7 @@ class DiscoveryDialog(QDialog):
         self.btn_scan.setText("⏹ Cancelar Varredura")
 
         self.worker = ScannerWorker(
-            timeout=4.0,
+            timeout=self.discovery_timeout,
             enable_port_scan=self.chk_port_scan.isChecked(),
             parent=self,
         )
@@ -259,7 +300,10 @@ class DiscoveryDialog(QDialog):
         self.table.insertRow(row)
 
         chk_item = QTableWidgetItem()
-        chk_item.setCheckState(Qt.CheckState.Checked)
+        # Só respostas WS-Discovery vêm marcadas: um host achado apenas por porta aberta pode ser
+        # NAS, impressora ou outro equipamento, e receberia a senha digitada (Issue #30)
+        is_onvif = dev.get("method") == "ws-discovery"
+        chk_item.setCheckState(Qt.CheckState.Checked if is_onvif else Qt.CheckState.Unchecked)
         chk_item.setData(Qt.ItemDataRole.UserRole, dev)
         self.table.setItem(row, 0, chk_item)
 
@@ -276,14 +320,20 @@ class DiscoveryDialog(QDialog):
     def _on_scan_finished(self, devices: List[Dict[str, Any]]):
         self.btn_scan.setText("🔍 Iniciar Varredura de Rede")
         self.progress_bar.setValue(100)
-        self.lbl_scan_status.setText(f"Varredura finalizada. {len(devices)} dispositivos encontrados.")
+        status = f"Varredura finalizada. {len(devices)} dispositivos encontrados."
+        warnings = self.worker.warnings if self.worker else []
+        if warnings:
+            status += "\n⚠ " + "\n⚠ ".join(warnings)
+        self.lbl_scan_status.setText(status)
 
     def _add_selected_devices(self):
-        """Adiciona todos os dispositivos marcados na tabela."""
+        """Adiciona os dispositivos marcados, consultando o ONVIF de cada um em segundo plano."""
+        if self.enrich_worker and self.enrich_worker.isRunning():
+            return
         user = self.txt_disc_user.text().strip() or "admin"
         pwd = self.txt_disc_pass.text()
 
-        count = 0
+        cameras: List[CameraDevice] = []
         for row in range(self.table.rowCount()):
             chk = self.table.item(row, 0)
             if chk and chk.checkState() == Qt.CheckState.Checked:
@@ -292,10 +342,11 @@ class DiscoveryDialog(QDialog):
                     continue
                 dev_port = dev_data.get("port", 80)
                 is_yoosee = (dev_port == 5000 or dev_data.get("manufacturer", "").lower() == "yoosee")
+                # Caminho deduzido: só é usado se a consulta ONVIF falhar
                 rtsp_path = "/onvif1" if is_yoosee else "/live/ch0"
                 mfg = "Yoosee" if is_yoosee else dev_data.get("manufacturer", "Genérico")
 
-                camera = CameraDevice(
+                cameras.append(CameraDevice(
                     id=f"cam_{dev_data['ip'].replace('.', '_')}",
                     name=dev_data.get("name", f"Câmera {dev_data['ip']}"),
                     ip=dev_data["ip"],
@@ -307,17 +358,42 @@ class DiscoveryDialog(QDialog):
                     manufacturer=mfg,
                     model=dev_data.get("model", "Câmera ONVIF"),
                     onvif_endpoint=dev_data.get("onvif_endpoint", ""),
-                    has_ptz=True,
+                    has_ptz=False,  # Definido pela resposta ONVIF
                     enabled=True,
-                )
-                self.device_added.emit(camera)
-                count += 1
+                ))
 
-        if count > 0:
-            QMessageBox.information(self, "Sucesso", f"{count} dispositivo(s) adicionado(s) com sucesso!")
-            self.accept()
-        else:
+        if not cameras:
             QMessageBox.warning(self, "Aviso", "Selecione ao menos um dispositivo para adicionar.")
+            return
+
+        self.btn_add_selected.setEnabled(False)
+        self.lbl_scan_status.setText("Consultando ONVIF dos dispositivos selecionados...")
+        self.enrich_worker = OnvifEnrichWorker(cameras, parent=self)
+        self.enrich_worker.progress.connect(self._on_enrich_progress)
+        self.enrich_worker.finished_enrich.connect(self._on_enrich_finished)
+        self.enrich_worker.start()
+
+    def _on_enrich_progress(self, current: int, total: int, name: str):
+        self.lbl_scan_status.setText(f"Consultando ONVIF ({current}/{total}): {name}")
+
+    def _on_enrich_finished(self, results: list):
+        worker, self.enrich_worker = self.enrich_worker, None
+        if worker is not None:
+            retire_thread(worker)  # Libera quando o run() terminar de retornar
+        self.btn_add_selected.setEnabled(True)
+        warnings = []
+        for camera, warning in results:
+            self.device_added.emit(camera)
+            if warning:
+                warnings.append(f"• {camera.name} ({camera.ip}): {warning}")
+
+        msg = f"{len(results)} dispositivo(s) adicionado(s)."
+        if warnings:
+            msg += "\n\nAtenção:\n" + "\n".join(warnings)
+            QMessageBox.warning(self, "Dispositivos adicionados com avisos", msg)
+        else:
+            QMessageBox.information(self, "Sucesso", msg)
+        self.accept()
 
     def _on_preset_changed(self, index: int):
         """Preenche automaticamente os campos de acordo com o modelo selecionado."""
@@ -359,6 +435,11 @@ class DiscoveryDialog(QDialog):
         if not ip:
             QMessageBox.warning(self, "Aviso", "O endereço IP é obrigatório.")
             return
+        try:
+            ip = str(ipaddress.ip_address(ip))
+        except ValueError:
+            QMessageBox.warning(self, "Aviso", f"Endereço IP inválido: '{ip}'. Use o formato 192.168.1.10.")
+            return
 
         preset = self.combo_preset.currentData()
         mfg = "Yoosee" if preset == "yoosee" else ("Intelbras" if preset == "intelbras" else ("Hikvision" if preset == "hikvision" else "Genérico"))
@@ -381,7 +462,36 @@ class DiscoveryDialog(QDialog):
         QMessageBox.information(self, "Sucesso", f"Câmera '{camera.name}' adicionada com sucesso!")
         self.accept()
 
+    def _cancel_enrich(self):
+        """Abandona a consulta ONVIF em andamento sem bloquear a interface."""
+        if self.enrich_worker and self.enrich_worker.isRunning():
+            self.enrich_worker.requestInterruption()
+            self.enrich_worker.finished_enrich.disconnect()
+            self.enrich_worker.progress.disconnect()
+            retire_thread(self.enrich_worker)
+            self.enrich_worker = None
+            self.btn_add_selected.setEnabled(True)
+
+    def _stop_scan(self):
+        """Encerra a varredura sem esperar as sondas em andamento (Issue #41)."""
+        worker, self.worker = self.worker, None
+        if worker is None:
+            return
+        for sig in (worker.device_found, worker.progress_updated, worker.scan_finished):
+            try:
+                sig.disconnect()
+            except (RuntimeError, TypeError):
+                pass
+        worker.stop()
+        retire_thread(worker)
+
+    def done(self, result: int):
+        # "Fechar", Esc e os fluxos de adição passam por aqui (não por closeEvent)
+        self._stop_scan()
+        self._cancel_enrich()
+        super().done(result)
+
     def closeEvent(self, event):
-        if self.worker and self.worker.isRunning():
-            self.worker.stop()
+        self._stop_scan()
+        self._cancel_enrich()
         super().closeEvent(event)

@@ -8,7 +8,7 @@ import re
 from pathlib import Path
 from typing import Optional
 
-from PySide6.QtCore import QPoint, QRect, Qt, QTimer
+from PySide6.QtCore import QRect, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QImage, QPainter
 from PySide6.QtWidgets import (
     QHBoxLayout,
@@ -23,6 +23,8 @@ from central_nvr.core.config import get_data_dir
 
 
 class FullscreenPlayerWindow(QWidget):
+    closed = Signal()  # A view volta ao perfil de stream da grade (Issue #47)
+
     """
     Janela exclusiva sem bordas (Frameless Fullscreen) dedicada a uma única câmera.
     - Oculta controles OSD e cursor do mouse automaticamente após 2.5s de inatividade
@@ -33,9 +35,10 @@ class FullscreenPlayerWindow(QWidget):
     - Pressione S para tirar foto/snapshot instantâneo do fluxo ao vivo.
     """
 
-    def __init__(self, camera: CameraDevice, parent: Optional[QWidget] = None):
+    def __init__(self, camera: CameraDevice, snapshot_dir: Optional[Path] = None, parent: Optional[QWidget] = None):
         super().__init__(parent, Qt.WindowType.Window | Qt.WindowType.FramelessWindowHint)
         self.camera = camera
+        self.snapshot_dir = Path(snapshot_dir) if snapshot_dir else get_data_dir() / "snapshots"
         self.current_frame: Optional[QImage] = None
         self.fps: float = 0.0
         self.bitrate_kbps: float = 0.0
@@ -257,7 +260,7 @@ class FullscreenPlayerWindow(QWidget):
     def _take_snapshot(self):
         """Salva snapshot direto do frame atual em alta qualidade com sanitização contra Path Traversal."""
         if self.current_frame and not self.current_frame.isNull():
-            snap_dir = get_data_dir() / "snapshots"
+            snap_dir = self.snapshot_dir
             snap_dir.mkdir(parents=True, exist_ok=True)
             ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
             safe_id = re.sub(r'[^a-zA-Z0-9_-]', '_', str(self.camera.id))
@@ -274,9 +277,23 @@ class FullscreenPlayerWindow(QWidget):
     def update_camera_name(self, new_name: str):
         """Atualiza dinamicamente o nome da câmera na visualização de tela cheia."""
         self.camera.name = new_name
-        self.lbl_title.setText(f"🔴 AO VIVO: {new_name} ({self.camera.ip})")
+        self._render_title()
         self.setWindowTitle(f"Central NVR - {new_name} (Tela Cheia)")
         self.update()
+
+    def set_live(self, live: bool, warning: str = ""):
+        """Estado da câmera vindo da view (Issue #33): sem sinal não pode exibir "AO VIVO"."""
+        self._live = live
+        self._signal_warning = warning
+        self._render_title()
+        self.update()
+
+    def _render_title(self):
+        if getattr(self, "_live", False):
+            self.lbl_title.setText(f"🔴 AO VIVO: {self.camera.name} ({self.camera.ip})")
+        else:
+            warning = getattr(self, "_signal_warning", "") or "Sem sinal"
+            self.lbl_title.setText(f"⚠ {warning.upper()}: {self.camera.name} ({self.camera.ip})")
 
     def set_frame(self, frame: QImage, fps: float = 0.0, bitrate: float = 0.0, codec: str = "", jitter_ms: float = 0.0):
         """Recebe novo frame e atualiza métricas de QoS no OSD."""
@@ -288,11 +305,25 @@ class FullscreenPlayerWindow(QWidget):
         if codec:
             self.codec = codec
         if frame and not frame.isNull():
-            w, h = frame.width(), frame.height()
-            bitrate_str = f" | {int(self.bitrate_kbps)} kbps" if self.bitrate_kbps > 0 else ""
-            jitter_str = f" | Jitter: {jitter_ms:.1f}ms" if jitter_ms > 0 else ""
-            self.lbl_metrics.setText(f"{w}x{h} | {self.fps:.1f} FPS{bitrate_str} | {self.codec}{jitter_str}")
+            # OSD conforme show_osd_timestamp / show_osd_fps / show_osd_bitrate (Issue #34)
+            opts = getattr(self, "_osd_options", None)
+            parts = []
+            if opts is None or opts.show_osd_timestamp:
+                parts.append(datetime.datetime.now().strftime("%H:%M:%S"))
+            parts.append(f"{frame.width()}x{frame.height()}")
+            if opts is None or opts.show_osd_fps:
+                parts.append(f"{self.fps:.1f} FPS")
+            if (opts is None or opts.show_osd_bitrate) and self.bitrate_kbps > 0:
+                parts.append(f"{int(self.bitrate_kbps)} kbps")
+            parts.append(self.codec)
+            if jitter_ms > 0:
+                parts.append(f"Jitter: {jitter_ms:.1f}ms")
+            self.lbl_metrics.setText(" | ".join(parts))
         self.update()
+
+    def set_osd_options(self, options):
+        """Opções de OSD vindas da view (ViewOptions)."""
+        self._osd_options = options
 
     def showEvent(self, event):
         """Ao abrir em tela cheia, exibe controles e inicia contagem regressiva para auto-hide."""
@@ -338,6 +369,11 @@ class FullscreenPlayerWindow(QWidget):
                 dest_y = (target_rect.height() - dest_h) // 2
                 dest_rect = QRect(dest_x, dest_y, dest_w, dest_h)
                 painter.drawImage(dest_rect, self.current_frame)
+                if not getattr(self, "_live", True) and getattr(self, "_signal_warning", ""):
+                    painter.fillRect(dest_rect, QColor(0, 0, 0, 170))
+                    painter.setPen(QColor("#F87171"))
+                    painter.setFont(QFont("Arial", 20, QFont.Weight.Bold))
+                    painter.drawText(dest_rect, Qt.AlignmentFlag.AlignCenter, f"⚠ {self._signal_warning}")
         else:
             painter.setPen(QColor("#64748B"))
             painter.setFont(QFont("Arial", 16))
@@ -376,3 +412,4 @@ class FullscreenPlayerWindow(QWidget):
         self.toast_timer.stop()
         self.setCursor(Qt.CursorShape.ArrowCursor)
         super().closeEvent(event)
+        self.closed.emit()

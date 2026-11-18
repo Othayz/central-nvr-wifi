@@ -1,0 +1,18 @@
+# Mantém atualizadas as versões fixadas por hash/SHA (Issue #20).
+# - pip: requirements.lock é gerado com
+#     pip-compile --generate-hashes --strip-extras --no-emit-index-url \
+#       --output-file requirements.lock pyproject.toml
+# - github-actions: actions referenciadas por SHA de commit (com a versão em comentário).
+version: 2
+updates:
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5

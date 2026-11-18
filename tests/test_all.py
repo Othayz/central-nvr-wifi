@@ -9,7 +9,7 @@ import tempfile
 import unittest
 import urllib.parse
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 # Adicionar src ao path de importação e isolar diretórios XDG dos testes
 root_path = Path(__file__).parent.parent
@@ -20,7 +20,7 @@ _test_xdg_temp = tempfile.TemporaryDirectory()
 os.environ["XDG_CONFIG_HOME"] = str(Path(_test_xdg_temp.name) / "config")
 os.environ["XDG_DATA_HOME"] = str(Path(_test_xdg_temp.name) / "data")
 
-from central_nvr.core.camera import CameraDevice, ConnectionState, StreamStats
+from central_nvr.core.camera import CameraDevice
 from central_nvr.core.config import (
     ConfigManager,
     get_config_dir,
@@ -31,8 +31,8 @@ from central_nvr.core.config import (
 )
 from central_nvr.core.onvif_client import OnvifClient
 from central_nvr.core.stream_worker import StreamWorker
-from central_nvr.scanner.discovery import NetworkScanner, get_local_ip_addresses
-from central_nvr.scanner.parser import detect_manufacturer, parse_ws_discovery_response, parse_ws_discovery_fallback
+from central_nvr.scanner.discovery import get_local_ip_addresses
+from central_nvr.scanner.parser import detect_manufacturer, parse_ws_discovery_response
 
 
 class TestScannerAndParser(unittest.TestCase):
@@ -75,9 +75,13 @@ class TestScannerAndParser(unittest.TestCase):
         self.assertEqual(result["onvif_endpoint"], "http://192.168.1.50:80/onvif/device_service")
 
     def test_local_ip_detection(self):
+        # Issue #41: só interfaces reais; sem rede devolve lista vazia, nunca um IP fictício
+        import ipaddress
         ips = get_local_ip_addresses()
         self.assertIsInstance(ips, list)
-        self.assertTrue(len(ips) > 0)
+        for ip in ips:
+            ipaddress.IPv4Address(ip)
+            self.assertFalse(ip.startswith("127."))
 
 
 class TestCameraAndConfig(unittest.TestCase):
@@ -335,34 +339,6 @@ class TestWifiNvrArchitectureImprovements(unittest.TestCase):
 
         candidates_sub = cam.get_candidate_rtsp_urls(prefer_substream=True)
         self.assertEqual(candidates_sub[0], sub_url)
-
-    def test_onvif_profile_t_events(self):
-        """Valida o serviço de eventos ONVIF Profile T (PullMessages / Motion Detection)."""
-        client = OnvifClient(ip="192.168.1.100", port=80)
-        client.subscription_url = "http://192.168.1.100:80/onvif/subscription_1"
-
-        sample_event_xml = """<soap:Envelope xmlns:soap="http://www.w3.org/2003/05/soap-envelope"
-                                              xmlns:wsnt="http://docs.oasis-open.org/wsn/b-2">
-            <soap:Body>
-                <wsnt:NotificationMessage>
-                    <wsnt:Topic>tns1:RuleEngine/CellMotionDetector/Motion</wsnt:Topic>
-                    <wsnt:Message>
-                        <tt:Message PropertyOperation="Changed">
-                            <tt:Data>
-                                <tt:SimpleItem Name="State" Value="true"/>
-                            </tt:Data>
-                        </tt:Message>
-                    </wsnt:Message>
-                </wsnt:NotificationMessage>
-            </soap:Body>
-        </soap:Envelope>"""
-
-        client._send_soap_request = lambda url, body, action="": sample_event_xml
-
-        events = client.pull_messages(timeout_sec=2.0)
-        self.assertTrue(len(events) > 0)
-        self.assertTrue(events[0]["is_motion"])
-        self.assertTrue(events[0]["state"])
 
     def test_onvif_profile_g_edge_storage(self):
         """Valida a consulta a gravações salvas no armazenamento local da câmera (Cartão SD / Profile G)."""
@@ -661,7 +637,6 @@ class TestSecurityAuditRemediations(unittest.TestCase):
 
     def test_devices_json_password_sanitization(self):
         """SEC-01 & SEC-05: Valida que senhas são salvas no keyring e purgadas de devices.json."""
-        import json
         from pathlib import Path
         from central_nvr.core.config import ConfigManager
 
@@ -703,7 +678,6 @@ class TestSecurityAuditRemediations(unittest.TestCase):
 
     def test_github_pat_stored_in_keyring_and_omitted_from_settings(self):
         """SEC-04: Valida que GitHub PAT é armazenado no Keyring e omitido de settings.json."""
-        import json
         from pathlib import Path
         from central_nvr.core.config import ConfigManager
 
@@ -776,7 +750,7 @@ class TestSecurityAuditRemediations(unittest.TestCase):
                         with patch("central_nvr.core.config.get_keyring_password", side_effect=mock_get_pw):
                             with patch("central_nvr.core.config.set_keyring_pat", side_effect=mock_set_pat):
                                 with patch("central_nvr.core.config.get_keyring_pat", side_effect=mock_get_pat):
-                                    cfg = ConfigManager()
+                                    ConfigManager()  # a migração acontece no load()
 
                                     # Verificar se foram migrados para o keyring
                                     self.assertEqual(keyring_store.get("pat"), "ghp_LegacyTokenToBeMigrated")

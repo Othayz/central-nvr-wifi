@@ -7,6 +7,8 @@ import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from central_nvr.core.camera import DEFAULT_RTSP_TRANSPORT
+
 try:
     import keyring
     HAS_KEYRING = True
@@ -187,10 +189,12 @@ class ConfigManager:
         "theme": "dark",
         "grid_layout": "auto",  # 1x1, 2x2, 3x3, 4x4
         "hw_accel": "vaapi",   # vaapi, auto, cpu, cuda
-        "rtsp_transport": "tcp", # tcp ou udp
+        "rtsp_transport": DEFAULT_RTSP_TRANSPORT,  # tcp, udp ou auto
         "buffer_size_ms": 150,
+        "enable_motion_detection": True,
         "auto_reconnect": True,
         "reconnect_interval_sec": 5,
+        "hidden_camera_timeout_min": 5,
         "default_username": "",
         "snapshot_dir": str(get_data_dir() / "snapshots"),
         "recordings_dir": str(get_data_dir() / "recordings"),
@@ -201,7 +205,7 @@ class ConfigManager:
         "show_osd_timestamp": True,
         "check_updates_on_startup": True,
         "periodic_update_check": True,
-        "periodic_update_interval_min": 10,
+        "periodic_update_interval_min": 60,
         "github_repo": "Othayz/central-nvr-wifi",
         "github_token": "",
     }
@@ -298,15 +302,22 @@ class ConfigManager:
                 return kr_pat
         return self.settings.get(key, default)
 
+    def _store(self, key: str, value: Any):
+        """Grava em memória; o token do GitHub vai para o keyring quando disponível."""
+        if key == "github_token" and is_keyring_available():
+            set_keyring_pat(str(value or "").strip())
+            self.settings["github_token"] = ""
+        else:
+            self.settings[key] = value
+
+    def update(self, values: Dict[str, Any]):
+        """Atualiza várias chaves e grava settings.json uma única vez (Issue #34)."""
+        for key, value in values.items():
+            self._store(key, value)
+        self.save_settings()
+
     def set(self, key: str, value: Any):
-        if key == "github_token":
-            val_str = str(value or "").strip()
-            if is_keyring_available():
-                set_keyring_pat(val_str)
-                self.settings["github_token"] = ""
-                self.save_settings()
-                return
-        self.settings[key] = value
+        self._store(key, value)
         self.save_settings()
 
     def add_or_update_device(self, device: Dict[str, Any]):
@@ -330,6 +341,17 @@ class ConfigManager:
         for dev in self.devices:
             if dev.get("id") == dev_id or dev.get("ip") == dev_id:
                 dev["name"] = new_name
+                updated = True
+        if updated:
+            self.save_devices()
+        return updated
+
+    def update_device(self, dev_id: str, fields: Dict[str, Any]) -> bool:
+        """Atualiza campos de um dispositivo existente (por ID) e persiste no disco."""
+        updated = False
+        for dev in self.devices:
+            if dev.get("id") == dev_id:
+                dev.update(fields)
                 updated = True
         if updated:
             self.save_devices()

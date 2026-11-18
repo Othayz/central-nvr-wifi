@@ -10,7 +10,7 @@ Aplicativo desktop profissional para Linux projetado para descoberta de rede, st
 | :--- | :--- | :--- |
 | **Interface Gráfica (GUI)** | **PySide6 (Qt 6)** | Renderização acelerada por GPU, layouts responsivos dinâmicos (1x1, 2x2, 3x3), suporte nativo a monitores High-DPI e estilização limpa em Dark Mode. |
 | **Decodificação de Vídeo** | **PyAV / FFmpeg (VA-API)** | Decodificação direta de streams RTSP H.264 / H.265 via hardware Linux (Intel QuickSync, AMD Radeon via `/dev/dri/renderD128`) com buffer ultrabaixo (<150ms). |
-| **Descoberta de Rede** | **WS-Discovery Nativo (UDP Multicast)** | Envio RFC-compliant de sondas SOAP para `239.255.255.250:3702` (escopos ONVIF `NetworkVideoTransmitter`), combinado com scanner assíncrono de portas TCP (554, 80, 8080, 8899). |
+| **Descoberta de Rede** | **WS-Discovery Nativo (UDP Multicast)** | Envio RFC-compliant de sondas SOAP para `239.255.255.250:3702` (escopos ONVIF `NetworkVideoTransmitter`), combinado com sondagem de portas TCP (554, 8899, 37777 e 8000) em cada sub-rede local. |
 | **Controle ONVIF / PTZ** | **Cliente SOAP com WS-Security** | Implementação com autenticação `UsernameToken` (SHA-1 Password Digest e Nonce), resolução dinâmica de URLs RTSP e controle de Pan, Tilt, Zoom e Presets. |
 | **Distribuição Universal** | **AppImage** | Formato portátil autocontido compatível com qualquer distribuição Linux (Ubuntu, Debian, Fedora, Arch, openSUSE e sistemas imutáveis como SteamOS e Bazzite). |
 
@@ -28,21 +28,29 @@ Central NVR Wifi/
 │       ├── scanner/
 │       │   ├── __init__.py
 │       │   ├── discovery.py            # Descoberta WS-Discovery Multicast & Port Scanner
+│       │   ├── interfaces.py           # Interfaces IPv4 ativas e sub-redes a sondar
 │       │   └── parser.py               # Parser de envelopes XML SOAP / ProbeMatches
 │       ├── core/
 │       │   ├── __init__.py
 │       │   ├── camera.py               # Modelo de dados da Câmera, status e métricas
-│       │   ├── onvif_client.py         # Cliente ONVIF SOAP (Digest Auth, Media, PTZ)
-│       │   ├── stream_worker.py        # Thread de streaming de baixa latência (VA-API)
+│       │   ├── onvif_client.py         # Cliente ONVIF SOAP (WS-Security, Media, PTZ)
+│       │   ├── onvif_enrich.py         # Cadastro de câmera descoberta com dados do ONVIF
+│       │   ├── ptz_queue.py            # Fila serial de comandos PTZ por câmera
+│       │   ├── stream_worker.py        # Thread de streaming de baixa latência
+│       │   ├── threads.py              # Ciclo de vida de threads Qt de segundo plano
+│       │   ├── updater.py              # Verificação, download e instalação de atualizações
 │       │   └── config.py               # Persistência de configurações XDG (~/.config/central-nvr)
 │       └── ui/
 │           ├── __init__.py
 │           ├── main_window.py          # Janela Principal (Topbar, Sidebar, Grid, Timeline)
-│           ├── camera_grid.py          # Grid multi-câmeras responsivo (1x1, 2x2, 3x3)
-│           ├── camera_view.py          # Viewport individual com OSD (FPS, Latência, Status)
+│           ├── camera_grid.py          # Grid multi-câmeras responsivo com paginação
+│           ├── camera_view.py          # Viewport individual com OSD (FPS, Bitrate, Status)
+│           ├── fullscreen_view.py      # Tela cheia exclusiva de uma câmera
+│           ├── playback_view.py        # Painel de gravações e snapshots
 │           ├── ptz_controller.py       # Painel de controle PTZ (D-Pad, Zoom, Presets)
 │           ├── discovery_dialog.py     # Diálogo de varredura e adição de câmeras
 │           ├── settings_dialog.py      # Diálogo de preferências de hardware e rede
+│           ├── update_dialog.py        # Diálogos de verificação e instalação de atualizações
 │           ├── timeline_bar.py         # Linha do tempo de gravações e eventos
 │           └── styles.py               # Folha de estilos QSS Dark Mode moderna
 ├── packaging/
@@ -52,7 +60,13 @@ Central NVR Wifi/
 │   ├── AppRun                          # Launcher portátil com Host Delegation para VA-API
 │   ├── central-nvr-launcher.sh         # Launcher instalado em usr/bin/central-nvr dentro do AppDir
 │   └── build_appimage.sh               # Script de geração do pacote AppImage universal
-├── requirements.txt                    # Dependências do Python
+├── scripts/
+│   ├── create_release.sh               # Atualiza a versão e cria a tag de release
+│   └── diagnose_camera.py              # Diagnóstico de portas e RTSP de uma câmera
+├── tests/                              # Suíte de testes (pytest, Qt offscreen)
+├── docs/                               # ADRs e instruções para agentes
+├── requirements.txt                    # Dependências do Python (desenvolvimento)
+├── requirements.lock                   # Versões e hashes fixos usados no build de release
 ├── pyproject.toml                      # Metadados de empacotamento Python (PEP 517/621)
 └── README.md                           # Documentação do projeto
 ```
@@ -120,12 +134,27 @@ chmod +x packaging/build_appimage.sh
 ```
 O pacote será gerado em `dist/Central_NVR_WiFi-<versão>-x86_64.AppImage`.
 
+O build confere o SHA-256 de tudo o que baixa (runtime CPython e `appimagetool`, com versões fixas no
+script) e instala as dependências Python de `requirements.lock` com `--require-hashes`. Para atualizar
+o lockfile depois de mudar as dependências em `pyproject.toml` (o Dependabot abre PRs semanais):
+```bash
+pip install pip-tools
+pip-compile --generate-hashes --strip-extras --no-emit-index-url --output-file requirements.lock pyproject.toml
+```
+
 ### Executando o AppImage
 Basta conceder permissão de execução e rodar:
 ```bash
 chmod +x dist/Central_NVR_WiFi-*-x86_64.AppImage
 ./dist/Central_NVR_WiFi-*-x86_64.AppImage
 ```
+
+### Atualização e volta à versão anterior
+A atualização baixa o novo AppImage, confere o SHA-256 da release, grava a cópia em disco (`fsync`) e
+substitui o arquivo atual em uma única operação (`os.replace`). A versão anterior fica ao lado, com a
+extensão `.bak`; para voltar a ela, feche o aplicativo e renomeie o `.bak` para o nome original. Se o
+AppImage estiver em um local sem permissão de escrita (por exemplo, `/opt`), a nova versão é instalada
+em `~/.local/bin/central-nvr.AppImage` e o atalho do menu passa a apontar para ela.
 
 ---
 

@@ -86,11 +86,9 @@ def main() -> int:
     logger.info(f"Iniciando Central NVR WiFi v{__version__} no Linux...")
 
     try:
-        from PySide6.QtCore import Qt
         from PySide6.QtWidgets import QApplication
         from central_nvr.ui.main_window import MainWindow
-        from central_nvr.ui.update_dialog import StartupUpdateDialog
-    except ImportError as e:
+    except ImportError:
         print("\n" + "=" * 70)
         print(" [Central NVR WiFi] Dependência PySide6 (Qt6) não encontrada!")
         print("=" * 70)
@@ -101,9 +99,6 @@ def main() -> int:
         print("   Fedora/RHEL:    sudo dnf install python3-pyside6")
         print("=" * 70 + "\n")
         return 1
-
-    # Configuração de High-DPI para monitores modernos
-    os.environ["QT_AUTO_SCREEN_SCALE_FACTOR"] = "1"
 
     # Inicializar aplicação Qt
     app = QApplication(sys.argv)
@@ -133,23 +128,16 @@ def main() -> int:
     if args.transport:
         config_mgr.set("rtsp_transport", args.transport)
 
-    # 1. Verificação de Atualização na Inicialização (Splash / Verificador)
-    should_check_updates = config_mgr.get("check_updates_on_startup", True) and not args.no_update_check
-    splash = None
-    if should_check_updates:
-        repo = config_mgr.get("github_repo", "Othayz/central-nvr-wifi")
-        token = config_mgr.get("github_token", "").strip() or None
-        splash = StartupUpdateDialog(repo=repo, token=token)
-        splash.exec()
-        if not splash.should_open_main_window:
-            logger.info("Encerrando inicialização (instalador acionado).")
-            return _exit_code_after_background_threads(0, splash)
-
-    # 2. Criar e exibir janela principal
+    # 1. A janela principal abre imediatamente: a abertura não depende do GitHub (Issue #37)
     window = MainWindow(config_mgr=config_mgr)
     window.show()
 
-    return _exit_code_after_background_threads(app.exec(), window, splash)
+    # 2. Verificação de atualização em segundo plano; se houver versão nova, o botão da barra de
+    #    status avisa, sem diálogo modal sobre o vídeo
+    if config_mgr.get("check_updates_on_startup", True) and not args.no_update_check:
+        window.start_background_update_check()
+
+    return _exit_code_after_background_threads(app.exec(), window)
 
 
 if __name__ == "__main__":

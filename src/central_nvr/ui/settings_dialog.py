@@ -8,6 +8,7 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDialog,
+    QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
     QGroupBox,
@@ -23,6 +24,7 @@ from PySide6.QtWidgets import (
 )
 
 from central_nvr import __version__
+from central_nvr.core.camera import DEFAULT_RTSP_TRANSPORT
 from central_nvr.core.config import ConfigManager
 from central_nvr.ui.update_dialog import UpdateDialog
 
@@ -92,6 +94,17 @@ class SettingsDialog(QDialog):
         self.spin_buffer.setValue(150)
         hw_form.addRow("Buffer de Baixa Latência:", self.spin_buffer)
 
+        # OSD (Issue #34)
+        self.chk_osd_timestamp = QCheckBox("Data/hora")
+        self.chk_osd_fps = QCheckBox("FPS")
+        self.chk_osd_bitrate = QCheckBox("Bitrate")
+        osd_row = QHBoxLayout()
+        for chk in (self.chk_osd_timestamp, self.chk_osd_fps, self.chk_osd_bitrate):
+            chk.setChecked(True)
+            osd_row.addWidget(chk)
+        osd_row.addStretch()
+        hw_form.addRow("Exibir no OSD:", osd_row)
+
         layout.addWidget(hw_group)
 
         # 2. Grupo Armazenamento
@@ -106,13 +119,9 @@ class SettingsDialog(QDialog):
         snap_layout.addWidget(btn_snap_browse)
         stor_form.addRow("Fotos / Snapshots:", snap_layout)
 
-        rec_layout = QHBoxLayout()
+        # "Gravações de Vídeo" fica oculto até existir gravação (Issue #32 / #34)
         self.txt_rec_dir = QLineEdit()
-        rec_layout.addWidget(self.txt_rec_dir)
-        btn_rec_browse = QPushButton("Procurar...")
-        btn_rec_browse.clicked.connect(self._browse_rec_dir)
-        rec_layout.addWidget(btn_rec_browse)
-        stor_form.addRow("Gravações de Vídeo:", rec_layout)
+        self.txt_rec_dir.setVisible(False)
 
         layout.addWidget(stor_group)
 
@@ -129,6 +138,31 @@ class SettingsDialog(QDialog):
         self.spin_reconn.setValue(5)
         conn_form.addRow("Intervalo de Reconexão:", self.spin_reconn)
 
+        self.chk_auto_reconnect = QCheckBox("Reconectar automaticamente quando a câmera cair")
+        self.chk_auto_reconnect.setChecked(True)
+        conn_form.addRow("", self.chk_auto_reconnect)
+
+        self.spin_discovery_timeout = QDoubleSpinBox()
+        self.spin_discovery_timeout.setRange(1.0, 30.0)
+        self.spin_discovery_timeout.setSingleStep(0.5)
+        self.spin_discovery_timeout.setSuffix(" s")
+        self.spin_discovery_timeout.setValue(3.0)
+        conn_form.addRow("Tempo de busca WS-Discovery:", self.spin_discovery_timeout)
+
+        self.chk_port_scan_default = QCheckBox("Sondar portas RTSP/HTTP na descoberta de rede")
+        self.chk_port_scan_default.setChecked(True)
+        conn_form.addRow("", self.chk_port_scan_default)
+
+        self.spin_hidden_timeout = QSpinBox()
+        self.spin_hidden_timeout.setRange(1, 240)
+        self.spin_hidden_timeout.setSuffix(" min")
+        self.spin_hidden_timeout.setValue(5)
+        self.spin_hidden_timeout.setToolTip(
+            "Câmeras fora da tela ficam pausadas (conexão mantida, sem decodificar) e são "
+            "desconectadas após este tempo, liberando banda do Wi-Fi."
+        )
+        conn_form.addRow("Desconectar câmeras fora da tela após:", self.spin_hidden_timeout)
+
         layout.addWidget(conn_group)
 
         # 4. Grupo Atualizações do Aplicativo (GitHub)
@@ -142,9 +176,10 @@ class SettingsDialog(QDialog):
         up_form.addRow(self.chk_periodic_update)
 
         self.spin_update_interval = QSpinBox()
-        self.spin_update_interval.setRange(2, 1440)
+        # Mínimo de 1 h: o app roda 24/7 e cada checagem consome a cota da API do GitHub (Issue #37)
+        self.spin_update_interval.setRange(60, 1440)
         self.spin_update_interval.setSuffix(" minutos")
-        self.spin_update_interval.setValue(10)
+        self.spin_update_interval.setValue(60)
         up_form.addRow("Intervalo de Checagem:", self.spin_update_interval)
 
         self.txt_github_repo = QLineEdit("Othayz/central-nvr-wifi")
@@ -206,7 +241,7 @@ class SettingsDialog(QDialog):
         if idx >= 0:
             self.combo_hw.setCurrentIndex(idx)
 
-        proto = self.config_mgr.get("rtsp_transport", "auto")
+        proto = self.config_mgr.get("rtsp_transport", DEFAULT_RTSP_TRANSPORT)
         idx_p = self.combo_proto.findData(proto)
         if idx_p >= 0:
             self.combo_proto.setCurrentIndex(idx_p)
@@ -217,31 +252,49 @@ class SettingsDialog(QDialog):
         self.txt_rec_dir.setText(self.config_mgr.get("recordings_dir", ""))
         self.txt_default_user.setText(self.config_mgr.get("default_username", "admin"))
         self.spin_reconn.setValue(self.config_mgr.get("reconnect_interval_sec", 5))
+        self.spin_hidden_timeout.setValue(int(self.config_mgr.get("hidden_camera_timeout_min", 5)))
+        self.chk_auto_reconnect.setChecked(bool(self.config_mgr.get("auto_reconnect", True)))
+        self.spin_discovery_timeout.setValue(float(self.config_mgr.get("ws_discovery_timeout", 3.0)))
+        self.chk_port_scan_default.setChecked(bool(self.config_mgr.get("enable_port_scan", True)))
+        self.chk_osd_timestamp.setChecked(bool(self.config_mgr.get("show_osd_timestamp", True)))
+        self.chk_osd_fps.setChecked(bool(self.config_mgr.get("show_osd_fps", True)))
+        self.chk_osd_bitrate.setChecked(bool(self.config_mgr.get("show_osd_bitrate", True)))
 
         # Valores de atualização
         self.chk_startup_update.setChecked(self.config_mgr.get("check_updates_on_startup", True))
         self.chk_periodic_update.setChecked(self.config_mgr.get("periodic_update_check", True))
-        self.spin_update_interval.setValue(self.config_mgr.get("periodic_update_interval_min", 10))
+        self.spin_update_interval.setValue(self.config_mgr.get("periodic_update_interval_min", 60))
         self.txt_github_repo.setText(self.config_mgr.get("github_repo", "Othayz/central-nvr-wifi"))
         self.txt_github_token.setText(self.config_mgr.get("github_token", ""))
 
-    def _save_values(self):
-        self.config_mgr.set("theme", self.combo_theme.currentData())
-        self.config_mgr.set("hw_accel", self.combo_hw.currentData())
-        self.config_mgr.set("rtsp_transport", self.combo_proto.currentData())
-        self.config_mgr.set("enable_motion_detection", self.chk_motion.isChecked())
-        self.config_mgr.set("buffer_size_ms", self.spin_buffer.value())
-        self.config_mgr.set("snapshot_dir", self.txt_snap_dir.text().strip())
-        self.config_mgr.set("recordings_dir", self.txt_rec_dir.text().strip())
-        self.config_mgr.set("default_username", self.txt_default_user.text().strip())
-        self.config_mgr.set("reconnect_interval_sec", self.spin_reconn.value())
+    def collect_values(self) -> dict:
+        """Valores da tela, prontos para gravar de uma vez com ConfigManager.update()."""
+        return {
+            "theme": self.combo_theme.currentData(),
+            "hw_accel": self.combo_hw.currentData(),
+            "rtsp_transport": self.combo_proto.currentData(),
+            "enable_motion_detection": self.chk_motion.isChecked(),
+            "buffer_size_ms": self.spin_buffer.value(),
+            "show_osd_timestamp": self.chk_osd_timestamp.isChecked(),
+            "show_osd_fps": self.chk_osd_fps.isChecked(),
+            "show_osd_bitrate": self.chk_osd_bitrate.isChecked(),
+            "snapshot_dir": self.txt_snap_dir.text().strip(),
+            "default_username": self.txt_default_user.text().strip(),
+            "reconnect_interval_sec": self.spin_reconn.value(),
+            "auto_reconnect": self.chk_auto_reconnect.isChecked(),
+            "ws_discovery_timeout": self.spin_discovery_timeout.value(),
+            "enable_port_scan": self.chk_port_scan_default.isChecked(),
+            "hidden_camera_timeout_min": self.spin_hidden_timeout.value(),
+            "check_updates_on_startup": self.chk_startup_update.isChecked(),
+            "periodic_update_check": self.chk_periodic_update.isChecked(),
+            "periodic_update_interval_min": self.spin_update_interval.value(),
+            "github_repo": self.txt_github_repo.text().strip() or "Othayz/central-nvr-wifi",
+            "github_token": self.txt_github_token.text().strip(),
+        }
 
-        # Salvar parâmetros de atualização
-        self.config_mgr.set("check_updates_on_startup", self.chk_startup_update.isChecked())
-        self.config_mgr.set("periodic_update_check", self.chk_periodic_update.isChecked())
-        self.config_mgr.set("periodic_update_interval_min", self.spin_update_interval.value())
-        self.config_mgr.set("github_repo", self.txt_github_repo.text().strip() or "Othayz/central-nvr-wifi")
-        self.config_mgr.set("github_token", self.txt_github_token.text().strip())
+    def _save_values(self):
+        # Uma única gravação de settings.json (antes eram ~14, uma por chave)
+        self.config_mgr.update(self.collect_values())
 
         QMessageBox.information(self, "Configurações", "Configurações salvas com sucesso!")
         self.accept()
@@ -250,11 +303,6 @@ class SettingsDialog(QDialog):
         path = QFileDialog.getExistingDirectory(self, "Selecionar Pasta de Snapshots", self.txt_snap_dir.text())
         if path:
             self.txt_snap_dir.setText(path)
-
-    def _browse_rec_dir(self):
-        path = QFileDialog.getExistingDirectory(self, "Selecionar Pasta de Gravações", self.txt_rec_dir.text())
-        if path:
-            self.txt_rec_dir.setText(path)
 
     def _check_updates_now(self):
         repo = self.txt_github_repo.text().strip() or "Othayz/central-nvr-wifi"

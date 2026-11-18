@@ -7,19 +7,17 @@ download seguro com validação SHA-256 e substituição atômica de executávei
 from dataclasses import dataclass, field
 import datetime
 import hashlib
-import json
 import logging
 import os
 from pathlib import Path
-import platform
 import re
 import shutil
 import subprocess
-import sys
 import tempfile
 import threading
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
 
 import requests
 from PySide6.QtCore import QObject, QThread, Signal
@@ -32,6 +30,9 @@ _SHA256_RE = re.compile(r"^[a-fA-F0-9]{64}$")
 
 DEFAULT_GITHUB_REPO = "Othayz/central-nvr-wifi"
 
+# O token do GitHub só é enviado a estes hosts, comparados pelo hostname (Issue #19)
+GITHUB_TOKEN_HOSTS = frozenset({"api.github.com", "github.com"})
+
 
 @dataclass
 class ReleaseAsset:
@@ -41,6 +42,9 @@ class ReleaseAsset:
     download_url: str
     content_type: str = ""
     created_at: str = ""
+    # URL de API do asset (/repos/<repo>/releases/assets/<id>): única que aceita o token
+    # para baixar de repositório privado, com Accept: application/octet-stream
+    api_url: str = ""
 
     @property
     def formatted_size(self) -> str:
@@ -78,52 +82,62 @@ class ReleaseInfo:
             return self.published_at[:10]
 
 
-def parse_release_version(tag_name: str, title: str = "") -> str:
-    """
-    Extrai a melhor versão semântica considerando tanto o título da release quanto a tag git.
-    Isso resolve divergências quando uma release é nomeada no GitHub (ex: 'v1.1')
-    enquanto a tag subjacente possui outro formato (ex: 'Central_NVR_WiFi_v1.0.0').
-    """
-    candidates = []
-    for s in [title, tag_name]:
-        if not s:
-            continue
-        m = re.search(r"(?:v|ver|version)?\s*([0-9]+(?:\.[0-9]+)+[a-zA-Z0-9_\-]*)", str(s), re.IGNORECASE)
-        if m:
-            ver_str = m.group(1)
-            candidates.append((parse_version(ver_str), ver_str))
-        else:
-            clean = re.sub(r"^[a-zA-Z_\-]+", "", str(s).strip())
-            if clean and clean[0].isdigit():
-                candidates.append((parse_version(clean), clean))
+_VERSION_IN_TAG_RE = re.compile(r"(\d+(?:\.\d+)+)([-+._]?[0-9A-Za-z][0-9A-Za-z.\-+_]*)?")
 
-    if candidates:
-        candidates.sort(key=lambda x: x[0], reverse=True)
-        return candidates[0][1]
 
-    return re.sub(r"^[a-zA-Z_\-]+", "", tag_name) or "1.0.0"
+def parse_release_version(tag_name: str) -> str:
+    """
+    Extrai a versão da release **somente da tag** (Issue #35). O título é texto livre (ex.:
+    "Suporte ao Ubuntu 24.04 (v1.2.2)") e não pode competir com a tag; o workflow de release já
+    garante que a tag é igual à versão do projeto.
+    """
+    m = _VERSION_IN_TAG_RE.search(str(tag_name or ""))
+    if m:
+        return m.group(1) + (m.group(2) or "")
+    return re.sub(r"^[a-zA-Z_\-]+", "", str(tag_name or "")) or "0.0.0"
+
+
+def _split_version(ver_str: str) -> Tuple[Tuple[int, ...], str]:
+    """Separa '1.3.0-rc2+build' em ((1, 3, 0), 'rc2'); metadados de build (+...) são ignorados."""
+    clean = re.sub(r"^[a-zA-Z_\-]+", "", str(ver_str or "").strip())
+    m = re.match(r"(\d+(?:\.\d+)*)(.*)$", clean)
+    if not m:
+        return (0, 0, 0), ""
+    release = tuple(int(x) for x in m.group(1).split("."))
+    suffix = m.group(2).split("+", 1)[0].lstrip("-._")
+    return release, suffix
 
 
 def parse_version(ver_str: str) -> Tuple[int, ...]:
     """
-    Converte uma string de versão (ex: 'v1.2.3', '1.0.0-beta', '2.1') em uma tupla comparável.
+    Componentes numéricos da versão (ex.: 'v1.2.3' → (1, 2, 3); '1.0.0-rc1' → (1, 0, 0)).
+    O sufixo de pré-release não entra aqui: veja version_key().
     """
-    if not ver_str:
-        return (0, 0, 0)
-    
-    clean_ver = re.sub(r"^[a-zA-Z_\-]+", "", str(ver_str).strip())
-    parts = []
-    for part in re.split(r"[.\-+]", clean_ver):
-        digits = re.findall(r"\d+", part)
-        if digits:
-            parts.append(int(digits[0]))
-        else:
-            break
-
+    release, _ = _split_version(ver_str)
+    parts = list(release)
     while len(parts) < 3:
         parts.append(0)
+    return tuple(parts)
 
-    return tuple(parts[:4])
+
+def is_prerelease(ver_str: str) -> bool:
+    """True para versões com sufixo de pré-release (1.3.0-beta, 1.3.0rc1...)."""
+    return bool(_split_version(ver_str)[1])
+
+
+def version_key(ver_str: str) -> Tuple[Any, ...]:
+    """
+    Chave de ordenação com a precedência do SemVer: a pré-release vem **antes** da versão final
+    (1.2.1-rc2 < 1.2.1; 1.3.0-beta < 1.3.0) e identificadores numéricos comparam como números
+    (rc2 < rc10).
+    """
+    release, suffix = _split_version(ver_str)
+    padded = tuple(release) + (0,) * max(0, 6 - len(release))
+    if not suffix:
+        return (padded, (1,))
+    ids = tuple((0, int(tok), "") if tok.isdigit() else (1, 0, tok.lower())
+                for tok in re.findall(r"\d+|[A-Za-z]+", suffix))
+    return (padded, (0,) + ids)
 
 
 def is_version_newer(current_ver: str, remote_ver: str) -> bool:
@@ -131,16 +145,7 @@ def is_version_newer(current_ver: str, remote_ver: str) -> bool:
     Compara a versão atual com a versão remota do GitHub.
     Retorna True se remote_ver for estritamente mais recente que current_ver.
     """
-    parsed_curr = parse_version(current_ver)
-    parsed_rem = parse_version(remote_ver)
-    return parsed_rem > parsed_curr
-
-
-def detect_system_package_format() -> str:
-    """
-    Retorna o formato padrão e universal de distribuição do projeto ('appimage').
-    """
-    return "appimage"
+    return version_key(remote_ver) > version_key(current_ver)
 
 
 def find_best_asset_for_system(assets: List[ReleaseAsset]) -> Optional[ReleaseAsset]:
@@ -160,6 +165,50 @@ def find_best_asset_for_system(assets: List[ReleaseAsset]) -> Optional[ReleaseAs
     return None
 
 
+def resolve_github_token(token: Optional[str] = None) -> Optional[str]:
+    """Token explícito, ou GITHUB_TOKEN do ambiente, ou `github_token` das configurações."""
+    if token and token.strip():
+        return token.strip()
+    env_token = os.environ.get("GITHUB_TOKEN", "").strip()
+    if env_token:
+        return env_token
+    try:
+        from central_nvr.core.config import ConfigManager
+        return ConfigManager().get("github_token", "").strip() or None
+    except Exception:
+        return None
+
+
+def github_auth_headers(url: str, token: Optional[str]) -> Dict[str, str]:
+    """
+    Cabeçalhos de autenticação para `url`: o token só vai para os hosts do GitHub, comparando o
+    hostname (nunca por substring da URL). Na URL de API de asset, pede o binário.
+    """
+    if not token:
+        return {}
+    try:
+        host = (urlparse(url).hostname or "").lower()
+    except ValueError:
+        return {}
+    if host not in GITHUB_TOKEN_HOSTS:
+        return {}
+    headers = {"Authorization": f"Bearer {token}"}
+    if host == "api.github.com" and "/releases/assets/" in urlparse(url).path:
+        headers["Accept"] = "application/octet-stream"
+    return headers
+
+
+def preferred_download_url(asset: "ReleaseAsset", token: Optional[str]) -> str:
+    """Com token, baixa pela URL de API (funciona em repositório privado); sem token, pela pública."""
+    if token and asset.api_url and (urlparse(asset.api_url).hostname or "").lower() == "api.github.com":
+        return asset.api_url
+    return asset.download_url
+
+
+# ETag e corpo da última resposta de /releases/latest, por URL (Issue #37)
+_ETAG_CACHE: Dict[str, Tuple[str, Dict[str, Any]]] = {}
+
+
 def fetch_latest_release(
     repo: str = DEFAULT_GITHUB_REPO,
     include_prereleases: bool = False,
@@ -170,14 +219,7 @@ def fetch_latest_release(
     Consulta a API pública do GitHub para obter a última release disponível.
     Suporta autenticação por token (PAT) para repositórios privados ou para contornar rate-limit.
     """
-    if not token:
-        token = os.environ.get("GITHUB_TOKEN", "").strip() or None
-        if not token:
-            try:
-                from central_nvr.core.config import ConfigManager
-                token = ConfigManager().get("github_token", "").strip() or None
-            except Exception:
-                token = None
+    token = resolve_github_token(token)
 
     headers = {
         "Accept": "application/vnd.github.v3+json",
@@ -189,7 +231,23 @@ def fetch_latest_release(
     url = f"https://api.github.com/repos/{repo}/releases/latest"
 
     try:
-        response = requests.get(url, headers=headers, timeout=timeout)
+        if include_prereleases:
+            # /releases/latest nunca devolve pré-releases: listar e escolher a maior versão
+            list_resp = requests.get(f"https://api.github.com/repos/{repo}/releases", headers=headers, timeout=timeout)
+            if list_resp.status_code == 200:
+                best = _pick_highest_release(list_resp.json(), include_prereleases=True)
+                if best is not None:
+                    return _parse_github_release_dict(best)
+
+        # Requisição condicional (Issue #37): 304 não conta na cota da API e evita baixar de novo
+        cached = _ETAG_CACHE.get(url)
+        conditional_headers = dict(headers)
+        if cached:
+            conditional_headers["If-None-Match"] = cached[0]
+        response = requests.get(url, headers=conditional_headers, timeout=timeout)
+
+        if response.status_code == 304 and cached:
+            return _parse_github_release_dict(cached[1])
 
         # 401: Token inválido
         if response.status_code == 401:
@@ -213,10 +271,9 @@ def fetch_latest_release(
 
             if list_resp.status_code == 200:
                 releases = list_resp.json()
-                if isinstance(releases, list) and len(releases) > 0:
-                    candidates = [r for r in releases if include_prereleases or not r.get("prerelease", False)]
-                    if candidates:
-                        return _parse_github_release_dict(candidates[0])
+                best = _pick_highest_release(releases, include_prereleases=include_prereleases)
+                if best is not None:
+                    return _parse_github_release_dict(best)
 
             # 2. Se a lista de releases também deu 404, verificar se o repositório ou tags existem
             tags_url = f"https://api.github.com/repos/{repo}/tags"
@@ -224,10 +281,14 @@ def fetch_latest_release(
 
             if tags_resp.status_code == 200:
                 tags = tags_resp.json()
-                if isinstance(tags, list) and len(tags) > 0:
-                    first_tag = tags[0]
-                    tag_name = first_tag.get("name", "v1.0.0")
-                    clean_v = re.sub(r"^[a-zA-Z_\-]+", "", tag_name)
+                # A ordem da API não é por versão nem por data: ordenar e ignorar pré-releases
+                versioned = [] if not isinstance(tags, list) else [
+                    (t.get("name", ""), parse_release_version(t.get("name", "")))
+                    for t in tags if isinstance(t, dict) and _VERSION_IN_TAG_RE.search(t.get("name", ""))
+                ]
+                versioned = [(name, ver) for name, ver in versioned if not is_prerelease(ver)]
+                if versioned:
+                    tag_name, clean_v = max(versioned, key=lambda nv: version_key(nv[1]))
                     return ReleaseInfo(
                         tag_name=tag_name,
                         version=clean_v,
@@ -265,6 +326,12 @@ def fetch_latest_release(
             raise RuntimeError(f"Consulta ao GitHub retornou status HTTP {response.status_code}.")
 
         data = response.json()
+        try:
+            etag = response.headers.get("ETag")
+        except AttributeError:
+            etag = None
+        if isinstance(etag, str) and etag:
+            _ETAG_CACHE[url] = (etag, data)
         return _parse_github_release_dict(data)
 
     except requests.exceptions.RequestException as e:
@@ -277,11 +344,25 @@ def fetch_latest_release(
         raise RuntimeError(f"Erro ao processar dados da release: {e}") from e
 
 
+def _pick_highest_release(releases: Any, include_prereleases: bool) -> Optional[Dict[str, Any]]:
+    """Release publicada (não rascunho) de maior versão; pré-releases só se permitidas."""
+    if not isinstance(releases, list):
+        return None
+    candidates = [
+        r for r in releases
+        if isinstance(r, dict) and not r.get("draft", False)
+        and (include_prereleases or not r.get("prerelease", False))
+    ]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda r: version_key(parse_release_version(r.get("tag_name", ""))))
+
+
 def _parse_github_release_dict(data: Dict[str, Any]) -> ReleaseInfo:
     """Extrai campos da estrutura de resposta JSON do GitHub."""
     tag_name = data.get("tag_name", "")
     title = data.get("name") or f"Versão {tag_name}"
-    clean_v = parse_release_version(tag_name, title)
+    clean_v = parse_release_version(tag_name)
     body = data.get("body") or "Nenhuma nota de versão fornecida."
     html_url = data.get("html_url", "")
     published_at = data.get("published_at", "")
@@ -296,6 +377,7 @@ def _parse_github_release_dict(data: Dict[str, Any]) -> ReleaseInfo:
                 download_url=item.get("browser_download_url", ""),
                 content_type=item.get("content_type", ""),
                 created_at=item.get("created_at", ""),
+                api_url=item.get("url", ""),
             )
         )
 
@@ -329,9 +411,7 @@ def download_asset(
     try:
         os.makedirs(os.path.dirname(os.path.abspath(dest_path)), exist_ok=True)
         headers = {"User-Agent": f"CentralNVR-Updater/{__version__}"}
-        if token and "api.github.com" in url:
-            headers["Authorization"] = f"Bearer {token}"
-            headers["Accept"] = "application/octet-stream"
+        headers.update(github_auth_headers(url, token))
 
         response = requests.get(url, stream=True, headers=headers, timeout=30)
         response.raise_for_status()
@@ -449,13 +529,15 @@ def get_expected_sha256_for_asset(
         if aname_low in ("sha256sums.txt", "sha256sums", "checksums.txt", "checksums", "sha256.txt"):
             checksum_asset = a
 
-    headers = {"User-Agent": f"CentralNVR-Updater/{__version__}"}
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
+    def _get(asset: ReleaseAsset):
+        url = preferred_download_url(asset, token)
+        headers = {"User-Agent": f"CentralNVR-Updater/{__version__}"}
+        headers.update(github_auth_headers(url, token))
+        return requests.get(url, headers=headers, timeout=10)
 
     if direct_sha_asset:
         try:
-            resp = requests.get(direct_sha_asset.download_url, headers=headers, timeout=10)
+            resp = _get(direct_sha_asset)
             if resp.status_code == 200:
                 m = re.search(r"([a-fA-F0-9]{64})", resp.text)
                 if m:
@@ -465,7 +547,7 @@ def get_expected_sha256_for_asset(
 
     if checksum_asset:
         try:
-            resp = requests.get(checksum_asset.download_url, headers=headers, timeout=10)
+            resp = _get(checksum_asset)
             if resp.status_code == 200:
                 for line in resp.text.splitlines():
                     if asset_name in line:
@@ -484,50 +566,18 @@ def get_expected_sha256_for_asset(
 
     return None
 
-def _extract_tar_members_to_local(tar, target_base):
-    from pathlib import Path
-    resolved_target = target_base.resolve()
-
-    for member in tar.getmembers():
-        # Rejeitar links simbólicos ou hard links que apontem para fora de target_base (SEC-03)
-        if member.issym() or member.islnk():
-            link_target = (target_base / member.linkname).resolve()
-            if not (link_target == resolved_target or str(link_target).startswith(str(resolved_target) + os.sep)):
-                logger.warning(f"Tentativa de Symlink/Hardlink Traversal bloqueada: {member.name} -> {member.linkname}")
-                continue
-
-        rel_parts = Path(member.name).parts
-        if len(rel_parts) > 1 and rel_parts[0] in (".", "/"):
-            rel_parts = rel_parts[1:]
-        if len(rel_parts) > 0 and rel_parts[0] == "usr":
-            rel_parts = rel_parts[1:]
-        if not rel_parts:
-            continue
-
-        try:
-            dest_path = target_base.joinpath(*rel_parts).resolve()
-        except Exception as e:
-            logger.warning(f"Caminho inválido no pacote de atualização ({member.name}): {e}")
-            continue
-
-        # SEC-03: Validar contenção canônica estrita para prevenir Tar Slip
-        if not (dest_path == resolved_target or str(dest_path).startswith(str(resolved_target) + os.sep)):
-            logger.warning(f"Tentativa de Path Traversal bloqueada: {member.name} -> {dest_path}")
-            continue
-
-        if member.isdir():
-            dest_path.mkdir(parents=True, exist_ok=True)
-        elif member.isfile():
-            dest_path.parent.mkdir(parents=True, exist_ok=True)
-            f_in = tar.extractfile(member)
-            if f_in is not None:
-                with open(dest_path, "wb") as out_f:
-                    shutil.copyfileobj(f_in, out_f)
-            if member.mode:
-                try:
-                    os.chmod(dest_path, member.mode)
-                except Exception:
-                    pass
+def desktop_exec_path(path: Path) -> str:
+    """
+    Caminho como argumento de `Exec=` conforme a Desktop Entry Specification (Issue #38):
+    entre aspas, com `"`, `` ` ``, `$` e `\\` escapados; depois o escape de string do arquivo
+    (`\\` → `\\\\`) e `%` → `%%` (códigos de campo).
+    """
+    raw = str(path)
+    if any(c in raw for c in "\n\r\t"):
+        raise ValueError("Caminho do AppImage contém caractere de controle")
+    quoted = raw.replace("\\", "\\\\").replace('"', '\\"').replace("`", "\\`").replace("$", "\\$")
+    quoted = quoted.replace("\\", "\\\\").replace("%", "%%")
+    return f'"{quoted}"'
 
 
 def _ensure_desktop_entry_for_appimage(appimage_path: Path):
@@ -535,13 +585,18 @@ def _ensure_desktop_entry_for_appimage(appimage_path: Path):
     apps_dir = Path.home() / ".local" / "share" / "applications"
     apps_dir.mkdir(parents=True, exist_ok=True)
     desktop_file = apps_dir / "central-nvr.desktop"
+    try:
+        exec_path = desktop_exec_path(appimage_path)
+    except ValueError as e:
+        logger.warning(f"Entrada .desktop não criada: {e}")
+        return
     content = f"""[Desktop Entry]
 Version=1.0
 Type=Application
 Name=Central NVR WiFi
 GenericName=NVR IP Camera Viewer
 Comment=Sistema de Gerenciamento, Descoberta ONVIF e Streaming RTSP de Baixa Latência
-Exec="{appimage_path}" %U
+Exec={exec_path}
 Icon=central-nvr
 Terminal=false
 Categories=AudioVideo;Video;Network;Monitor;Security;
@@ -570,6 +625,16 @@ def _require_sha256(path: Path, expected_sha256: str) -> None:
         )
 
 
+def _fsync_path(path: Path) -> None:
+    """Força os dados (ou a entrada de diretório) para o disco."""
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) if path.is_dir() else os.O_RDONLY
+    fd = os.open(str(path), flags)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 def _stage_verified_copy(source: Path, target_path: Path, expected_sha256: str) -> Path:
     """
     Copia o pacote para um temporário exclusivo ao lado do destino e valida o SHA-256 dessa cópia,
@@ -581,6 +646,10 @@ def _stage_verified_copy(source: Path, target_path: Path, expected_sha256: str) 
     try:
         with os.fdopen(fd, "wb") as out_f, open(source, "rb") as in_f:
             shutil.copyfileobj(in_f, out_f)
+            # Dados no disco antes do os.replace: sem isto, numa queda de energia o rename pode
+            # persistir antes do conteúdo e deixar um AppImage truncado (Issue #38)
+            out_f.flush()
+            os.fsync(out_f.fileno())
         _require_sha256(staged, expected_sha256)
         os.chmod(staged, 0o755)
         return staged
@@ -596,12 +665,27 @@ def _replace_appimage_atomically(source: Path, target_path: Path, expected_sha25
     try:
         if target_path.exists():
             shutil.copy2(target_path, backup_path)
+            _fsync_path(backup_path)
         os.replace(staged, target_path)
+        _fsync_path(target_path.parent)  # Persiste o rename
     except Exception:
         staged.unlink(missing_ok=True)
         if backup_path.exists() and not target_path.exists():
             os.replace(backup_path, target_path)
         raise
+
+
+def _user_bin_target() -> Path:
+    user_bin_dir = Path.home() / ".local" / "bin"
+    user_bin_dir.mkdir(parents=True, exist_ok=True)
+    return user_bin_dir / "central-nvr.AppImage"
+
+
+def _rollback_hint(target_path: Path) -> str:
+    backup = target_path.with_name(f"{target_path.name}.bak")
+    if backup.exists():
+        return f" A versão anterior foi preservada em {backup} (para voltar: renomeie-a para {target_path.name})."
+    return ""
 
 
 def install_downloaded_package(
@@ -613,11 +697,15 @@ def install_downloaded_package(
     Instala ou atualiza o binário portátil AppImage com verificação de integridade SHA-256 (SEC-07).
     Executa substituição atômica no arquivo AppImage atual (Atomic Replacement) ou instala
     em ~/.local/bin/central-nvr.AppImage sem requerer privilégios de root (pkexec).
+    O AppImage é o formato único de distribuição (ADR-0001): outros formatos são recusados.
     """
     if not os.path.exists(file_path):
         return False, "Arquivo de instalação não encontrado no disco."
 
     file_obj = Path(file_path).resolve()
+    if not file_obj.name.lower().endswith(".appimage"):
+        return False, f"Formato não suportado para atualização: {file_obj.suffix or file_obj.name} (somente .AppImage)."
+
     if min_size > 0 and file_obj.stat().st_size < min_size:
         return False, f"Pacote com tamanho anômalo ({file_obj.stat().st_size} B). O tamanho mínimo esperado é de {min_size} B."
 
@@ -626,47 +714,46 @@ def install_downloaded_package(
         return False, "Release sem checksum SHA-256 válido: instalação bloqueada por segurança."
 
     expected_hash = expected_sha256.strip()
-    filename_lower = file_obj.name.lower()
 
     try:
-        # Formato Principal: AppImage universal
-        if filename_lower.endswith(".appimage"):
-            running_appimage = os.environ.get("APPIMAGE")
+        running_appimage = os.environ.get("APPIMAGE")
 
-            # Se estiver rodando a partir de um AppImage existente, realizar Atomic Replacement
-            if running_appimage and os.path.exists(running_appimage):
-                target_path = Path(running_appimage).resolve()
-                _replace_appimage_atomically(file_obj, target_path, expected_hash)
-                return True, f"Central NVR WiFi atualizada com sucesso em {target_path}. Reinicie o aplicativo para usar a nova versão."
+        # Rodando a partir de um AppImage existente: Atomic Replacement no próprio arquivo
+        if running_appimage and os.path.exists(running_appimage):
+            target_path = Path(running_appimage).resolve()
+            if os.access(target_path.parent, os.W_OK):
+                try:
+                    _replace_appimage_atomically(file_obj, target_path, expected_hash)
+                    return True, (
+                        f"Central NVR WiFi atualizada com sucesso em {target_path}. "
+                        f"Reinicie o aplicativo para usar a nova versão.{_rollback_hint(target_path)}"
+                    )
+                except PackageIntegrityError:
+                    raise
+                except OSError as e:
+                    logger.warning(f"Destino {target_path} não gravável ({e}); instalando em ~/.local/bin.")
+            else:
+                logger.warning(f"Diretório de {target_path} somente leitura; instalando em ~/.local/bin.")
 
-            # Caso contrário, instalar no diretório de binários do usuário (~/.local/bin)
-            user_bin_dir = Path.home() / ".local" / "bin"
-            user_bin_dir.mkdir(parents=True, exist_ok=True)
-            target_path = user_bin_dir / "central-nvr.AppImage"
-            _replace_appimage_atomically(file_obj, target_path, expected_hash)
-            _ensure_desktop_entry_for_appimage(target_path)
-            return True, f"Central NVR WiFi AppImage instalada com sucesso em {target_path}."
+            # Destino somente leitura (/opt, mídia montada): instala no diretório do usuário
+            fallback = _user_bin_target()
+            _replace_appimage_atomically(file_obj, fallback, expected_hash)
+            _ensure_desktop_entry_for_appimage(fallback)
+            return True, (
+                f"Não foi possível gravar em {target_path.parent} (somente leitura). "
+                f"A nova versão foi instalada em {fallback} e o atalho do menu aponta para ela."
+                f"{_rollback_hint(fallback)}"
+            )
 
-        # Formato Secundário: Tarball comprimido (.tar.gz / .tgz) com proteção Tar Slip (SEC-03)
-        elif filename_lower.endswith((".tar.gz", ".tgz")):
-            _require_sha256(file_obj, expected_hash)
-            target_base = Path.home() / ".local"
-            target_base.mkdir(parents=True, exist_ok=True)
-            import tarfile
-            with tarfile.open(file_obj, "r:*") as tar:
-                _extract_tar_members_to_local(tar, target_base)
-            return True, "Central NVR WiFi instalada com sucesso em ~/.local."
-
-        return False, f"Formato não suportado para atualização: {file_obj.suffix}"
+        # Caso contrário, instalar no diretório de binários do usuário (~/.local/bin)
+        target_path = _user_bin_target()
+        _replace_appimage_atomically(file_obj, target_path, expected_hash)
+        _ensure_desktop_entry_for_appimage(target_path)
+        return True, f"Central NVR WiFi AppImage instalada com sucesso em {target_path}.{_rollback_hint(target_path)}"
 
     except Exception as e:
         logger.error(f"Erro ao processar pacote AppImage: {e}")
         return False, str(e)
-
-
-def install_package_to_user_local(file_path: str, expected_sha256: Optional[str] = None) -> Tuple[bool, str]:
-    """Alias para install_downloaded_package, mantendo compatibilidade de API."""
-    return install_downloaded_package(file_path, expected_sha256=expected_sha256)
 
 
 # =============================================================================
@@ -790,7 +877,7 @@ class ChecksumFetchWorker(QThread):
         self.token = token
 
     def run(self):
-        h = resolve_checksum_or_none(self.release_info, self.asset_name, self.token)
+        h = resolve_checksum_or_none(self.release_info, self.asset_name, resolve_github_token(self.token))
         if h:
             self.checksum_ready.emit(h)
         else:

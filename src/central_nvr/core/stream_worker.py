@@ -2,12 +2,11 @@
 Worker de Streaming RTSP de Baixa Latência com suporte a VA-API / Aceleração de Hardware,
 Transporte Adaptativo (Auto-Fallback UDP/TCP), Métricas de QoS (Jitter/Perda) e Detecção de Movimento Integrada.
 """
-import datetime
 from enum import Enum
 import logging
 import math
-import re
 import os
+import random
 import threading
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -22,7 +21,7 @@ except ImportError:
 
 # Tentar importar PySide6
 try:
-    from PySide6.QtCore import QObject, QThread, Signal
+    from PySide6.QtCore import QObject, Qt, QThread, Signal
     from PySide6.QtGui import QImage
     HAS_PYSIDE = True
 except ImportError:
@@ -64,15 +63,30 @@ except ImportError:
         def copy(self):
             return self
 
-from central_nvr.core.camera import CameraDevice, ConnectionState, StreamStats
+from central_nvr.core.camera import DEFAULT_RTSP_TRANSPORT, CameraDevice, ConnectionState, StreamStats
 
 logger = logging.getLogger(__name__)
 
 def sanitize_rtsp_url(url: str) -> str:
-    """Ofusca credenciais em URLs RTSP para gravação segura em logs."""
+    """
+    Ofusca a senha em URLs RTSP para gravação segura em logs.
+
+    Usa o último `@` do trecho após o esquema como fim das credenciais: assim a senha é mascarada
+    mesmo se contiver `/`, `:` ou `@` sem codificação. Na dúvida, mascara a mais (nunca a menos).
+    """
     if not url:
         return ""
-    return re.sub(r":([^:@/]+)@", ":****@", url)
+    scheme, sep, rest = url.partition("://")
+    if not sep:
+        return url
+    at = rest.rfind("@")
+    if at == -1:
+        return url
+    userinfo, hostpart = rest[:at], rest[at + 1:]
+    if ":" not in userinfo:
+        return url  # Só usuário, sem senha
+    user = userinfo.split(":", 1)[0]
+    return f"{scheme}://{user}:****@{hostpart}"
 
 # Tentar importar bibliotecas de decodificação de vídeo
 HAS_AV = False
@@ -103,6 +117,28 @@ def is_vaapi_supported() -> bool:
         return False
 
 
+class StreamOutcome(Enum):
+    """Resultado de uma tentativa de stream (Issue #27)."""
+    NOT_CONNECTED = "not_connected"   # não abriu ou não entregou nenhum frame
+    AUTH_FAILED = "auth_failed"       # credenciais recusadas (RTSP 401)
+    ENDED = "ended"                   # transmitiu e terminou (câmera fechou, queda no meio)
+    STOPPED = "stopped"               # parada pedida pela aplicação
+    RESTART = "restart"               # troca HD/SD pedida: reconectar já, sem espera (Issue #26)
+    PAUSED = "paused"                 # câmera fora da tela com backend que não lê sem decodificar
+
+
+def _pyav_socket_timeout_option() -> Dict[str, str]:
+    """
+    Timeout de E/S do demuxer RTSP: `stimeout` foi removido no FFmpeg 5 (libavformat 59) e
+    substituído por `timeout`; nas versões antigas, `timeout` significaria modo listen.
+    """
+    try:
+        lavf_major = av.library_versions.get("libavformat", (0,))[0]
+    except Exception:
+        lavf_major = 0
+    return {"timeout": "5000000"} if lavf_major >= 59 else {"stimeout": "5000000"}
+
+
 class TransportMode(str, Enum):
     AUTO_UDP = "Auto (UDP)"
     AUTO_TCP_FALLBACK = "Auto (TCP Fallback)"
@@ -130,35 +166,52 @@ class StreamWorker(QThread):
     - Suporte a Dual-Stream (MainStream para alta resolução / SubStream para economia de banda Wi-Fi).
     """
 
-    frame_received = Signal(QImage)
+    # "Último frame vence" (Issue #25): o worker sobrescreve um slot e avisa uma única vez até a
+    # interface consumir com take_latest_frame(); frames não lidos são descartados, sem fila.
+    frame_available = Signal()
     stats_updated = Signal(object)  # StreamStats
     state_changed = Signal(object, str)  # (ConnectionState, message)
     snapshot_saved = Signal(str)  # filepath
     motion_detected = Signal(str, bool)  # (camera_id, is_motion)
+    # (sub-stream em uso, sub-stream pedido): emitido quando a transmissão começa (Issue #26)
+    stream_variant = Signal(bool, bool)
 
     def __init__(
         self,
         camera: CameraDevice,
         hw_accel: str = "vaapi",
-        rtsp_transport: str = "auto",
+        rtsp_transport: str = DEFAULT_RTSP_TRANSPORT,
         buffer_size_ms: int = 150,
         prefer_substream: bool = False,
+        reconnect_interval_sec: float = 5.0,  # mesmo padrão de ConfigManager
+        auto_reconnect: bool = True,
+        motion_detection: bool = True,
         parent: Optional[QObject] = None,
     ):
         super().__init__(parent)
         self.camera = camera
         self.hw_accel = hw_accel
-        self.rtsp_transport = rtsp_transport or getattr(camera, "rtsp_transport", "auto")
+        self.rtsp_transport = rtsp_transport or getattr(camera, "rtsp_transport", DEFAULT_RTSP_TRANSPORT)
+        # Lido a cada frame: pode ser alterado com o stream aberto (Issue #34)
+        self.motion_detection = bool(motion_detection)
         self.buffer_size_ms = buffer_size_ms
         self.prefer_substream = prefer_substream
+        self.reconnect_interval_sec = max(0.5, float(reconnect_interval_sec or 3.0))
+        self.auto_reconnect = bool(auto_reconnect)
         
         self._is_running = False
         self._stop_requested = False
+        self._connected_once = False
+        self._switch_requested = False
+        self._current_url = ""
         self._is_paused = False
+        self._await_keyframe = False
+        self._paused_announced = False
+        self._frame_lock = threading.Lock()
+        self._latest_frame: Optional[QImage] = None
+        self._frame_pending = False
+        self._target_size: Optional[Tuple[int, int]] = None
         self._request_snapshot: Optional[str] = None
-        self._is_recording = False
-        self._recording_writer = None
-        self._recording_path = ""
 
         # Estatísticas e Métricas de QoS
         self.stats = StreamStats()
@@ -185,126 +238,211 @@ class StreamWorker(QThread):
         self.wait(1000)
 
     def pause(self):
+        """
+        Câmera fora da tela (Issue #25): no PyAV a conexão continua aberta e os pacotes são lidos e
+        descartados sem decodificar; no OpenCV (que não lê sem decodificar) a conexão é encerrada.
+        """
         self._is_paused = True
 
     def resume(self):
+        """Volta a decodificar a partir do próximo keyframe (evita imagem corrompida)."""
+        self._await_keyframe = True
         self._is_paused = False
 
+    @property
+    def is_paused(self) -> bool:
+        return self._is_paused
+
+    def set_target_size(self, width: int, height: int):
+        """Tamanho em que o frame será exibido; 0 = resolução original (ex.: tela cheia aberta)."""
+        self._target_size = (int(width), int(height)) if width > 0 and height > 0 else None
+
+    def take_latest_frame(self) -> Optional[QImage]:
+        """Chamado pela interface: devolve o frame mais recente e libera o próximo aviso."""
+        with self._frame_lock:
+            frame = self._latest_frame
+            self._latest_frame = None
+            self._frame_pending = False
+        return frame
+
+    def _publish_frame(self, q_img: QImage):
+        with self._frame_lock:
+            self._latest_frame = q_img
+            notify = not self._frame_pending
+            self._frame_pending = True
+        if notify:
+            self.frame_available.emit()
+
+    def _update_pause_state(self):
+        """Anuncia transições de pausa a partir da thread do worker."""
+        if self._is_paused and not self._paused_announced:
+            self._paused_announced = True
+            self.state_changed.emit(ConnectionState.PAUSED, "Pausada (fora da tela)")
+        elif not self._is_paused and self._paused_announced:
+            self._paused_announced = False
+            self.state_changed.emit(ConnectionState.STREAMING, "Ao Vivo")
+
     def set_prefer_substream(self, prefer: bool):
-        """Alterna a preferência de stream (MainStream vs SubStream) e reinicia a conexão se necessário."""
+        """
+        Alterna a preferência de stream (MainStream vs SubStream) e reconecta com a nova preferência:
+        o stream atual é encerrado e a lista de URLs candidatas é recalculada (Issue #26).
+        """
         if self.prefer_substream != prefer:
             self.prefer_substream = prefer
+            # O caminho memorizado era o da preferência anterior
+            self.camera.resolved_stream = None
+            self._switch_requested = True
+
+    def _keep_reading(self) -> bool:
+        return self._is_running and not self._switch_requested
+
+    def _announce_streaming(self, message: str):
+        """Estado AO VIVO + qual stream de fato conectou (o rótulo HD/SD segue este sinal)."""
+        self.state_changed.emit(ConnectionState.STREAMING, message)
+        is_sub = bool(self._current_url) and self._current_url == self.camera.get_substream_url()
+        self.stream_variant.emit(is_sub, self.prefer_substream)
 
     def take_snapshot(self, output_path: str):
         """Solicita a gravação do próximo frame como imagem no disco."""
         self._request_snapshot = output_path
+
+    # ------------------------------------------------------------------
+    # Laço de conexão e reconexão (Issue #27)
+    # ------------------------------------------------------------------
+
+    MAX_BACKOFF_SEC = 60.0
+    # Um stream que durou pelo menos isto zera o backoff
+    STABLE_STREAM_SEC = 30.0
+
+    def _backoff_delay(self, failures: int) -> float:
+        """Intervalo configurado × 2^(falhas-1), limitado a 60 s, com jitter de ±20%."""
+        base = self.reconnect_interval_sec * (2 ** max(0, failures - 1))
+        base = min(base, max(self.MAX_BACKOFF_SEC, self.reconnect_interval_sec))
+        return base * random.uniform(0.8, 1.2)
+
+    def _wait(self, seconds: float):
+        """Espera responsiva: interrompida assim que a parada é pedida."""
+        deadline = time.monotonic() + seconds
+        while self._is_running and time.monotonic() < deadline:
+            time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
+
+    def _transports(self) -> List[str]:
+        user_transport = (self.rtsp_transport or DEFAULT_RTSP_TRANSPORT).lower()
+        return ["tcp", "udp"] if user_transport == "tcp" else ["udp", "tcp"]
+
+    def _backends(self) -> List[Tuple[str, Callable[..., StreamOutcome]]]:
+        backends = []
+        if HAS_AV:
+            backends.append(("PyAV", self._run_pyav_stream))
+        if HAS_CV2:
+            backends.append(("OpenCV", self._run_opencv_stream))
+        return backends
 
     def run(self):
         # Uma parada pedida antes de a thread começar a executar não pode ser desfeita aqui
         self._is_running = not self._stop_requested
         self.state_changed.emit(ConnectionState.CONNECTING, "Iniciando conexão RTSP...")
 
-        is_demo = self.camera.rtsp_url.startswith("demo://")
-        candidate_urls = ["demo://"] if is_demo else self.camera.get_candidate_rtsp_urls(prefer_substream=self.prefer_substream)
+        if self.camera.rtsp_url.startswith("demo://"):
+            self.stats.transport_mode = TransportMode.DEMO.value
+            self._run_test_pattern_stream()
+            self.state_changed.emit(ConnectionState.DISCONNECTED, "Desconectado")
+            return
 
-        # Definir sequência de transportes (UDP prioritário para câmeras Wi-Fi com Failover TCP)
-        user_transport = (self.rtsp_transport or "auto").lower()
-        if user_transport == "tcp":
-            transports = ["tcp", "udp"]
-        elif user_transport == "udp":
-            transports = ["udp", "tcp"]
-        else:
-            transports = ["udp", "tcp"]
-
+        failures = 0
         while self._is_running:
-            success = False
-
-            # Fase 1: Priorizar PyAV (libav / FFmpeg) com suporte total a H.265/HEVC e medição de bitrate real
-            if HAS_AV:
-                success = self._attempt_stream_backend(
-                    "PyAV", self._run_pyav_stream, candidate_urls, transports, user_transport
-                )
-
-            # Fase 2: Se PyAV não estiver disponível ou falhar, tentar OpenCV como fallback resiliente
-            if not success and HAS_CV2 and self._is_running:
-                success = self._attempt_stream_backend(
-                    "OpenCV", self._run_opencv_stream, candidate_urls, transports, user_transport
-                )
-
-            # Se falhar todas as URLs candidatas e transportes, marcar como Offline / Erro
-            if not success and self._is_running:
-                logger.debug(f"Falha ao conectar RTSP para {self.camera.name}. Tentando reconectar...")
-                self.state_changed.emit(ConnectionState.ERROR, "Câmera Offline / Sem Conexão")
-                self.stats.fps = 0.0
-                self.stats.bitrate_kbps = 0.0
-                self.stats.latency_ms = 0.0
-                self.stats.jitter_ms = 0.0
-                self.stats_updated.emit(self.stats)
-
-                # Aguardar intervalo de reconexão de forma responsiva (3s)
-                for _ in range(30):
-                    if not self._is_running:
-                        break
-                    time.sleep(0.1)
-
-            if not self._is_running or is_demo:
+            started = time.monotonic()
+            outcome = self._connect_once()
+            if not self._is_running or outcome == StreamOutcome.STOPPED:
                 break
+
+            if outcome == StreamOutcome.PAUSED:
+                self._update_pause_state()
+                while self._is_running and self._is_paused:
+                    time.sleep(0.1)
+                continue
+
+            if outcome == StreamOutcome.RESTART or self._switch_requested:
+                self._switch_requested = False
+                self.state_changed.emit(ConnectionState.CONNECTING, "Trocando de stream (HD/SD)...")
+                continue
+
+            if outcome == StreamOutcome.AUTH_FAILED:
+                # Repetir só aumentaria o risco de bloqueio por tentativas na câmera
+                self.camera.last_error = "Credenciais inválidas"
+                self.state_changed.emit(ConnectionState.ERROR, "Credenciais inválidas — verifique usuário e senha")
+                break
+
+            if outcome == StreamOutcome.ENDED and time.monotonic() - started >= self.STABLE_STREAM_SEC:
+                failures = 0
+            failures += 1
+            self._reset_stats()
+
+            if not self.auto_reconnect:
+                self.state_changed.emit(ConnectionState.ERROR, "Conexão perdida (reconexão automática desativada)")
+                break
+
+            delay = self._backoff_delay(failures)
+            if outcome == StreamOutcome.ENDED:
+                self.state_changed.emit(ConnectionState.RECONNECTING, f"Conexão encerrada — reconectando em {delay:.0f}s")
+            else:
+                logger.debug(f"Falha ao conectar RTSP para {self.camera.name}. Nova tentativa em {delay:.1f}s")
+                self.state_changed.emit(ConnectionState.ERROR, f"Câmera Offline / Sem Conexão — nova tentativa em {delay:.0f}s")
+            self._wait(delay)
 
         self.state_changed.emit(ConnectionState.DISCONNECTED, "Desconectado")
 
-    def _attempt_stream_backend(
-        self,
-        backend_name: str,
-        runner_fn: Callable[[str, str], bool],
-        candidate_urls: List[str],
-        transports: List[str],
-        user_transport: str,
-    ) -> bool:
-        """Executa tentativas de conexão de fluxo para URLs candidatas e transportes configurados."""
-        for stream_url in candidate_urls:
-            if not self._is_running:
-                return False
+    def _reset_stats(self):
+        self.stats.fps = 0.0
+        self.stats.bitrate_kbps = 0.0
+        self.stats.latency_ms = 0.0
+        self.stats.jitter_ms = 0.0
+        self.stats_updated.emit(self.stats)
 
-            if stream_url.startswith("demo://"):
-                self.stats.transport_mode = TransportMode.DEMO.value
-                self._run_test_pattern_stream()
-                return True
+    def _connect_once(self) -> StreamOutcome:
+        """
+        Uma rodada de conexão. Se algo já funcionou nesta sessão, tenta só aquilo; senão, busca
+        em todos os caminhos candidatos × transportes × backends, parando em erro de autenticação.
+        """
+        candidate_urls = self.camera.get_candidate_rtsp_urls(prefer_substream=self.prefer_substream)
+        backends = dict(self._backends())
 
-            for trans in transports:
-                if not self._is_running:
-                    return False
+        resolved = self.camera.resolved_stream
+        if resolved and resolved[0] in backends and resolved[1] in candidate_urls:
+            backend_name, url, transport = resolved
+            return self._try_stream(backend_name, backends[backend_name], url, transport)
 
-                if backend_name == "PyAV":
-                    if user_transport == "auto":
-                        trans_label = (
-                            TransportMode.AUTO_UDP.value
-                            if trans == "udp"
-                            else TransportMode.AUTO_TCP_FALLBACK.value
-                        )
-                    else:
-                        trans_label = (
-                            TransportMode.UDP.value
-                            if trans == "udp"
-                            else TransportMode.TCP.value
-                        )
-                else:
-                    trans_label = (
-                        TransportMode.OPENCV_UDP.value
-                        if trans == "udp"
-                        else TransportMode.OPENCV_TCP.value
-                    )
+        for backend_name, runner in backends.items():
+            for url in candidate_urls:
+                for transport in self._transports():
+                    if not self._is_running:
+                        return StreamOutcome.STOPPED
+                    outcome = self._try_stream(backend_name, runner, url, transport)
+                    if outcome != StreamOutcome.NOT_CONNECTED:
+                        return outcome
+        return StreamOutcome.NOT_CONNECTED
 
-                self.stats.transport_mode = trans_label
-                logger.info(
-                    f"Conectando RTSP {backend_name} ({self.camera.name}) via {trans_label}: {sanitize_rtsp_url(stream_url)}"
-                )
+    def _try_stream(self, backend_name: str, runner: Callable[..., StreamOutcome], url: str,
+                    transport: str) -> StreamOutcome:
+        self.stats.transport_mode = self._transport_label(backend_name, transport)
+        logger.info(
+            f"Conectando RTSP {backend_name} ({self.camera.name}) via {self.stats.transport_mode}: "
+            f"{sanitize_rtsp_url(url)}"
+        )
+        self._current_url = url
+        outcome = runner(url, transport=transport)
+        if outcome == StreamOutcome.ENDED or (outcome == StreamOutcome.STOPPED and self._connected_once):
+            self.camera.resolved_stream = (backend_name, url, transport)
+        return outcome
 
-                if runner_fn(stream_url, transport=trans):
-                    return True
+    def _transport_label(self, backend_name: str, transport: str) -> str:
+        if backend_name == "OpenCV":
+            return TransportMode.OPENCV_UDP.value if transport == "udp" else TransportMode.OPENCV_TCP.value
+        if (self.rtsp_transport or DEFAULT_RTSP_TRANSPORT).lower() == "auto":
+            return TransportMode.AUTO_UDP.value if transport == "udp" else TransportMode.AUTO_TCP_FALLBACK.value
+        return TransportMode.UDP.value if transport == "udp" else TransportMode.TCP.value
 
-        return False
-
-    def _run_pyav_stream(self, stream_url: str, transport: str = "udp") -> bool:
+    def _run_pyav_stream(self, stream_url: str, transport: str = "udp") -> StreamOutcome:
         """Consome o fluxo utilizando PyAV (libav / FFmpeg) com suporte nativo a H.265 (HEVC) e UDP."""
         container_options = {
             "rtsp_transport": transport,
@@ -313,15 +451,19 @@ class StreamWorker(QThread):
             "fflags": "nobuffer+genpts+discardcorrupt",
             "flags": "low_delay",
             "max_delay": str(self.buffer_size_ms * 1000),
-            "stimeout": "5000000",
+            **_pyav_socket_timeout_option(),
         }
 
         container = None
+        frames_seen = 0
         try:
-            container = av.open(stream_url, mode="r", options=container_options, timeout=5.0)
+            try:
+                container = av.open(stream_url, mode="r", options=container_options, timeout=5.0)
+            except av.HTTPUnauthorizedError:
+                return StreamOutcome.AUTH_FAILED
             video_stream = next((s for s in container.streams if s.type == "video"), None)
             if not video_stream:
-                return False
+                return StreamOutcome.NOT_CONNECTED
 
             video_stream.thread_type = "AUTO"
             raw_codec = video_stream.codec_context.name.upper()
@@ -336,18 +478,28 @@ class StreamWorker(QThread):
 
             vaapi_ok = (self.hw_accel == "vaapi" and is_vaapi_supported())
             self.stats.hw_accel_active = vaapi_ok
-            self.state_changed.emit(ConnectionState.STREAMING, f"Ao Vivo ({self.stats.codec} {self.stats.transport_mode})")
+            self._announce_streaming(f"Ao Vivo ({self.stats.codec} {self.stats.transport_mode})")
 
             self._last_frame_ts = time.time()
 
             for packet in container.demux(video_stream):
-                if not self._is_running:
+                if not self._keep_reading():
                     break
+
+                self._update_pause_state()
+                if self._is_paused:
+                    # Continua lendo para manter a sessão RTSP viva, mas sem decodificar
+                    self._await_keyframe = True
+                    continue
+                if self._await_keyframe:
+                    if not getattr(packet, "is_keyframe", True):
+                        continue
+                    self._await_keyframe = False
 
                 self._bytes_count += packet.size or 0
 
                 for frame in packet.decode():
-                    if not self._is_running:
+                    if not self._keep_reading():
                         break
 
                     now = time.time()
@@ -361,11 +513,13 @@ class StreamWorker(QThread):
                     self.stats.height = h
 
                     self._process_and_emit_frame(img_rgb, w, h, delta_ms)
+                    frames_seen += 1
+                    self._connected_once = True
 
-            return True
+            return self._end_outcome(frames_seen)
         except Exception as e:
             logger.debug(f"PyAV stream error for {self.camera.name} via {transport}: {e}")
-            return False
+            return self._end_outcome(frames_seen)
         finally:
             if container is not None:
                 try:
@@ -373,9 +527,12 @@ class StreamWorker(QThread):
                 except Exception:
                     pass
 
-    def _run_opencv_stream(self, stream_url: str, transport: str = "udp") -> bool:
+    def _run_opencv_stream(self, stream_url: str, transport: str = "udp") -> StreamOutcome:
         """Consome o fluxo utilizando OpenCV VideoCapture como fallback resiliente."""
+        if self._is_paused:
+            return StreamOutcome.PAUSED  # Não abre conexão para uma câmera fora da tela
         cap = None
+        frames_seen = 0
         try:
             with _opencv_lock:
                 # buffer_size de 2MB (2048000 bytes) para evitar descarte de pacotes UDP em rajadas de I-Frames
@@ -390,7 +547,7 @@ class StreamWorker(QThread):
                 cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
             if not cap.isOpened():
-                return False
+                return StreamOutcome.NOT_CONNECTED
 
             if hasattr(cv2, "CAP_PROP_HW_ACCELERATION") and hasattr(cv2, "VIDEO_ACCELERATION_VAAPI"):
                 if self.hw_accel == "vaapi" and is_vaapi_supported():
@@ -408,10 +565,12 @@ class StreamWorker(QThread):
             else:
                 self.stats.codec = VideoCodec.H264.value
 
-            self.state_changed.emit(ConnectionState.STREAMING, f"Ao Vivo (OpenCV {self.stats.transport_mode})")
+            self._announce_streaming(f"Ao Vivo (OpenCV {self.stats.transport_mode})")
             self._last_frame_ts = time.time()
 
-            while self._is_running:
+            while self._keep_reading():
+                if self._is_paused:
+                    return StreamOutcome.PAUSED  # OpenCV não lê sem decodificar: encerra a conexão
                 ret, frame = cap.read()
                 if not ret:
                     break
@@ -430,17 +589,27 @@ class StreamWorker(QThread):
                 self._bytes_count += max(2000, (w * h * 3) // 200)
 
                 self._process_and_emit_frame(frame_rgb, w, h, delta_ms)
+                frames_seen += 1
+                self._connected_once = True
 
-            return True
+            return self._end_outcome(frames_seen)
         except Exception as e:
             logger.debug(f"OpenCV stream error for {self.camera.name} via {transport}: {e}")
-            return False
+            return self._end_outcome(frames_seen)
         finally:
             if cap is not None:
                 try:
                     cap.release()
                 except Exception:
                     pass
+
+    def _end_outcome(self, frames_seen: int) -> StreamOutcome:
+        """Fim do laço de leitura: parada pedida, queda depois de transmitir, ou nunca transmitiu."""
+        if not self._is_running:
+            return StreamOutcome.STOPPED
+        if self._switch_requested:
+            return StreamOutcome.RESTART
+        return StreamOutcome.ENDED if frames_seen > 0 else StreamOutcome.NOT_CONNECTED
 
     def _run_test_pattern_stream(self):
         """
@@ -514,7 +683,8 @@ class StreamWorker(QThread):
         # Detecção de Movimento Leve (Edge-AI / Motion Tracking)
         self._evaluate_motion(rgb_array, width, height)
 
-        # Criar QImage para a UI Qt
+        # Criar QImage para a UI Qt, já reduzida ao tamanho de exibição (Issue #25): o
+        # redimensionamento sai da thread da interface e o frame entregue ocupa menos memória
         bytes_per_line = 3 * width
         q_img = QImage(
             rgb_array.data,
@@ -522,9 +692,20 @@ class StreamWorker(QThread):
             height,
             bytes_per_line,
             QImage.Format.Format_RGB888
-        ).copy()
+        )
+        target = self._target_size
+        if target and (width > target[0] or height > target[1]):
+            q_img = q_img.scaled(
+                target[0], target[1],
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+        else:
+            q_img = q_img.copy()  # Desvincula do buffer do numpy
 
-        self.frame_received.emit(q_img)
+        self._publish_frame(q_img)
+        # Instante do último frame entregue: base do watchdog de stream travado (Issue #33)
+        self.stats.last_frame_time = time.time()
 
         # Atualizar estatísticas de desempenho e QoS
         self._frame_count += 1
@@ -556,6 +737,13 @@ class StreamWorker(QThread):
     def _evaluate_motion(self, rgb_array: Any, width: int, height: int):
         """Avalia variação entre frames em sub-amostragem (64x36) para detecção de movimento eficiente."""
         if not HAS_NUMPY or rgb_array is None:
+            return
+        if not self.motion_detection:
+            if self._motion_active:
+                self._motion_active = False
+                self._motion_cooldown = 0
+                self.motion_detected.emit(self.camera.id, False)
+            self._prev_sample_matrix = None
             return
 
         self._motion_eval_counter += 1
