@@ -75,9 +75,13 @@ class TestScannerAndParser(unittest.TestCase):
         self.assertEqual(result["onvif_endpoint"], "http://192.168.1.50:80/onvif/device_service")
 
     def test_local_ip_detection(self):
+        # Issue #41: só interfaces reais; sem rede devolve lista vazia, nunca um IP fictício
+        import ipaddress
         ips = get_local_ip_addresses()
         self.assertIsInstance(ips, list)
-        self.assertTrue(len(ips) > 0)
+        for ip in ips:
+            ipaddress.IPv4Address(ip)
+            self.assertFalse(ip.startswith("127."))
 
 
 class TestCameraAndConfig(unittest.TestCase):

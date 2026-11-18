@@ -47,8 +47,9 @@ class ScannerWorker(QThread):
         self.scanner = NetworkScanner()
 
     def stop(self):
+        """Pede a parada sem bloquear: as sondas pendentes são canceladas (Issue #41)."""
+        self.requestInterruption()
         self.scanner.stop_scan()
-        self.wait(1000)
 
     def run(self):
         devices = self.scanner.scan_network(
@@ -267,7 +268,7 @@ class DiscoveryDialog(QDialog):
     def _toggle_scan(self):
         """Inicia ou cancela a varredura."""
         if self.worker and self.worker.isRunning():
-            self.worker.stop()
+            self._stop_scan()
             self.btn_scan.setText("🔍 Iniciar Varredura de Rede")
             self.lbl_scan_status.setText("Varredura cancelada.")
             return
@@ -314,7 +315,11 @@ class DiscoveryDialog(QDialog):
     def _on_scan_finished(self, devices: List[Dict[str, Any]]):
         self.btn_scan.setText("🔍 Iniciar Varredura de Rede")
         self.progress_bar.setValue(100)
-        self.lbl_scan_status.setText(f"Varredura finalizada. {len(devices)} dispositivos encontrados.")
+        status = f"Varredura finalizada. {len(devices)} dispositivos encontrados."
+        warnings = self.worker.scanner.warnings if self.worker else []
+        if warnings:
+            status += "\n⚠ " + "\n⚠ ".join(warnings)
+        self.lbl_scan_status.setText(status)
 
     def _add_selected_devices(self):
         """Adiciona os dispositivos marcados, consultando o ONVIF de cada um em segundo plano."""
@@ -462,13 +467,26 @@ class DiscoveryDialog(QDialog):
             self.enrich_worker = None
             self.btn_add_selected.setEnabled(True)
 
+    def _stop_scan(self):
+        """Encerra a varredura sem esperar as sondas em andamento (Issue #41)."""
+        worker, self.worker = self.worker, None
+        if worker is None:
+            return
+        for sig in (worker.device_found, worker.progress_updated, worker.scan_finished):
+            try:
+                sig.disconnect()
+            except (RuntimeError, TypeError):
+                pass
+        worker.stop()
+        retire_thread(worker)
+
     def done(self, result: int):
-        # "Fechar" e Esc passam por aqui (não por closeEvent)
+        # "Fechar", Esc e os fluxos de adição passam por aqui (não por closeEvent)
+        self._stop_scan()
         self._cancel_enrich()
         super().done(result)
 
     def closeEvent(self, event):
-        if self.worker and self.worker.isRunning():
-            self.worker.stop()
+        self._stop_scan()
         self._cancel_enrich()
         super().closeEvent(event)

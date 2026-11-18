@@ -13,7 +13,7 @@ except ImportError:
     class DefusedXmlException(Exception):
         pass
     HAS_DEFUSEDXML = False
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -29,133 +29,144 @@ NAMESPACES = {
 }
 
 
-def parse_ws_discovery_response(xml_data: str, source_ip: str = "") -> Optional[Dict[str, any]]:
+def _local_name(tag) -> str:
+    return tag.split("}")[-1] if isinstance(tag, str) and "}" in tag else (tag if isinstance(tag, str) else "")
+
+
+def _match_fields(elem) -> Tuple[str, str, str]:
+    """XAddrs, Scopes e Types dentro de um elemento (um ProbeMatch ou o documento inteiro)."""
+    xaddrs_raw = scopes_raw = types_raw = ""
+    for child in elem.iter():
+        tag_name = _local_name(child.tag)
+        if tag_name == "XAddrs" and child.text and not xaddrs_raw:
+            xaddrs_raw = child.text.strip()
+        elif tag_name == "Scopes" and child.text and not scopes_raw:
+            scopes_raw = child.text.strip()
+        elif tag_name == "Types" and child.text and not types_raw:
+            types_raw = child.text.strip()
+    return xaddrs_raw, scopes_raw, types_raw
+
+
+def parse_ws_discovery_matches(xml_data: str, source_ip: str = "") -> List[Dict[str, Any]]:
     """
-    Realiza o parse de uma mensagem de resposta ProbeMatches do WS-Discovery.
-    Extrai XAddrs, Scopes, Tipos de Serviço, IP, Porta, Fabricante e Modelo.
-    Valida que os endpoints XAddrs correspondam ao source_ip para prevenir Blind SSRF.
+    Interpreta uma resposta ProbeMatches do WS-Discovery e devolve **um dispositivo por ProbeMatch**
+    (Issue #41): um NVR ou gateway pode responder por vários canais na mesma mensagem.
+    Valida que os XAddrs correspondam ao source_ip para prevenir Blind SSRF.
     """
     if not xml_data or "<" not in xml_data:
-        return None
+        return []
+
+    # SEC-06: Defesa contra DoS / Billion Laughs / XXE (rejeição de DTD e declarações de entidade)
+    if "<!DOCTYPE" in xml_data or "<!ENTITY" in xml_data:
+        logger.warning("Ataque DTD/Entity XML bloqueado no WS-Discovery (Billion Laughs / XXE).")
+        return []
 
     try:
-        # SEC-06: Defesa contra DoS / Billion Laughs / XXE (rejeição de DTD e declarações de entidade)
-        if "<!DOCTYPE" in xml_data or "<!ENTITY" in xml_data:
-            logger.warning("Ataque DTD/Entity XML bloqueado no WS-Discovery (Billion Laughs / XXE).")
-            return None
-
-        # Remover declarações de namespace prefixados desconhecidos para parsing robusto
-        cleaned_xml = re.sub(r'xmlns(:\w+)?="[^"]+"', '', xml_data, count=0)
-        # Parseando o XML original com ElementTree
-        try:
-            root = SafeET.fromstring(xml_data)
-        except DefusedXmlException as e:
-            logger.warning(f"Ataque XML bloqueado no WS-Discovery (DefusedXmlException): {e}")
-            return None
-
-        # Procurar elemento ProbeMatches em qualquer profundidade
-        probe_matches = []
-        for elem in root.iter():
-            if elem.tag.endswith("ProbeMatch") or elem.tag.endswith("ProbeMatches"):
-                probe_matches.append(elem)
-
-        xaddrs_raw = ""
-        scopes_raw = ""
-        types_raw = ""
-
-        for elem in root.iter():
-            tag_name = elem.tag.split("}")[-1] if "}" in elem.tag else elem.tag
-            if tag_name == "XAddrs" and elem.text:
-                xaddrs_raw = elem.text.strip()
-            elif tag_name == "Scopes" and elem.text:
-                scopes_raw = elem.text.strip()
-            elif tag_name == "Types" and elem.text:
-                types_raw = elem.text.strip()
-
-        # Extrair endpoints XAddrs (URLs dos serviços ONVIF)
-        endpoints = [x.strip() for x in xaddrs_raw.split() if x.strip().startswith("http")]
-        
-        # Determinar IP e Porta primários com validação Anti-SSRF
-        ip = source_ip
-        port = 80
-        primary_endpoint = ""
-
-        if endpoints:
-            valid_endpoints = []
-            for ep in endpoints:
-                parsed_url = urllib.parse.urlparse(ep)
-                # Se source_ip foi fornecido pelo socket de rede, validar correspondência
-                if source_ip and parsed_url.hostname and parsed_url.hostname != source_ip:
-                    logger.warning(
-                        f"Anti-SSRF: Endpoint XAddr divergente descartado no discovery "
-                        f"({parsed_url.hostname} != {source_ip})"
-                    )
-                    continue
-                valid_endpoints.append(ep)
-
-            if valid_endpoints:
-                primary_endpoint = valid_endpoints[0]
-                parsed_url = urllib.parse.urlparse(primary_endpoint)
-                if parsed_url.hostname:
-                    ip = parsed_url.hostname
-                if parsed_url.port:
-                    port = parsed_url.port
-                elif parsed_url.scheme == "https":
-                    port = 443
-            elif source_ip:
-                primary_endpoint = f"http://{source_ip}:80/onvif/device_service"
-            else:
-                primary_endpoint = endpoints[0]
-                parsed_url = urllib.parse.urlparse(primary_endpoint)
-                if parsed_url.hostname:
-                    ip = parsed_url.hostname
-                if parsed_url.port:
-                    port = parsed_url.port
-
-        # Parsear Scopes ONVIF (onvif://www.onvif.org/name/..., /hardware/..., /location/...)
-        name = "Câmera IP ONVIF"
-        hardware = "Generic ONVIF Device"
-        location = ""
-        scopes_list = scopes_raw.split()
-
-        for scope in scopes_list:
-            decoded_scope = urllib.parse.unquote(scope)
-            if "/name/" in decoded_scope:
-                name = decoded_scope.split("/name/")[-1].replace("_", " ")
-            elif "/hardware/" in decoded_scope:
-                hardware = decoded_scope.split("/hardware/")[-1].replace("_", " ")
-            elif "/location/" in decoded_scope:
-                location = decoded_scope.split("/location/")[-1].replace("_", " ")
-            elif "/Profile/" in decoded_scope:
-                pass
-
-        # Se não encontramos nome descritivo nos scopes, gerar a partir do IP
-        if name == "Câmera IP ONVIF" and ip:
-            name = f"Câmera ONVIF ({ip})"
-
-        # Inferir fabricante a partir do hardware ou nome
-        manufacturer = detect_manufacturer(hardware + " " + name + " " + scopes_raw)
-
-        return {
-            "ip": ip,
-            "port": port,
-            "name": name,
-            "model": hardware,
-            "manufacturer": manufacturer,
-            "location": location,
-            "onvif_endpoint": primary_endpoint or f"http://{ip}:{port}/onvif/device_service",
-            "endpoints": endpoints,
-            "types": types_raw,
-            "scopes": scopes_list,
-            "raw_xml": xml_data,
-        }
-
+        root = SafeET.fromstring(xml_data)
+    except DefusedXmlException as e:
+        logger.warning(f"Ataque XML bloqueado no WS-Discovery (DefusedXmlException): {e}")
+        return []
     except Exception:
-        # Fallback usando Regex caso o XML esteja malformado
-        return parse_ws_discovery_fallback(xml_data, source_ip)
+        # XML malformado/truncado: extração mínima por regex
+        fallback = parse_ws_discovery_fallback(xml_data, source_ip)
+        return [fallback] if fallback else []
+
+    matches = [el for el in root.iter() if _local_name(el.tag) == "ProbeMatch"]
+    scopes = matches or [root]
+    devices = []
+    for elem in scopes:
+        xaddrs_raw, scopes_raw, types_raw = _match_fields(elem)
+        devices.append(_device_from_fields(xaddrs_raw, scopes_raw, types_raw, source_ip, xml_data))
+    return devices
 
 
-def parse_ws_discovery_fallback(xml_data: str, source_ip: str = "") -> Optional[Dict[str, any]]:
+def parse_ws_discovery_response(xml_data: str, source_ip: str = "") -> Optional[Dict[str, Any]]:
+    """Primeiro dispositivo da resposta (compatibilidade); veja parse_ws_discovery_matches."""
+    devices = parse_ws_discovery_matches(xml_data, source_ip)
+    return devices[0] if devices else None
+
+
+def _device_from_fields(xaddrs_raw: str, scopes_raw: str, types_raw: str, source_ip: str,
+                        xml_data: str) -> Dict[str, Any]:
+    """Monta o dicionário do dispositivo a partir dos campos de um ProbeMatch."""
+    # Extrair endpoints XAddrs (URLs dos serviços ONVIF)
+    endpoints = [x.strip() for x in xaddrs_raw.split() if x.strip().startswith("http")]
+
+    # Determinar IP e Porta primários com validação Anti-SSRF
+    ip = source_ip
+    port = 80
+    primary_endpoint = ""
+
+    if endpoints:
+        valid_endpoints = []
+        for ep in endpoints:
+            parsed_url = urllib.parse.urlparse(ep)
+            # Se source_ip foi fornecido pelo socket de rede, validar correspondência
+            if source_ip and parsed_url.hostname and parsed_url.hostname != source_ip:
+                logger.warning(
+                    f"Anti-SSRF: Endpoint XAddr divergente descartado no discovery "
+                    f"({parsed_url.hostname} != {source_ip})"
+                )
+                continue
+            valid_endpoints.append(ep)
+
+        if valid_endpoints:
+            primary_endpoint = valid_endpoints[0]
+            parsed_url = urllib.parse.urlparse(primary_endpoint)
+            if parsed_url.hostname:
+                ip = parsed_url.hostname
+            if parsed_url.port:
+                port = parsed_url.port
+            elif parsed_url.scheme == "https":
+                port = 443
+        elif source_ip:
+            primary_endpoint = f"http://{source_ip}:80/onvif/device_service"
+        else:
+            primary_endpoint = endpoints[0]
+            parsed_url = urllib.parse.urlparse(primary_endpoint)
+            if parsed_url.hostname:
+                ip = parsed_url.hostname
+            if parsed_url.port:
+                port = parsed_url.port
+
+    # Parsear Scopes ONVIF (onvif://www.onvif.org/name/..., /hardware/..., /location/...)
+    name = "Câmera IP ONVIF"
+    hardware = "Generic ONVIF Device"
+    location = ""
+    scopes_list = scopes_raw.split()
+
+    for scope in scopes_list:
+        decoded_scope = urllib.parse.unquote(scope)
+        if "/name/" in decoded_scope:
+            name = decoded_scope.split("/name/")[-1].replace("_", " ")
+        elif "/hardware/" in decoded_scope:
+            hardware = decoded_scope.split("/hardware/")[-1].replace("_", " ")
+        elif "/location/" in decoded_scope:
+            location = decoded_scope.split("/location/")[-1].replace("_", " ")
+
+    # Se não encontramos nome descritivo nos scopes, gerar a partir do IP
+    if name == "Câmera IP ONVIF" and ip:
+        name = f"Câmera ONVIF ({ip})"
+
+    # Inferir fabricante a partir do hardware ou nome
+    manufacturer = detect_manufacturer(hardware + " " + name + " " + scopes_raw)
+
+    return {
+        "ip": ip,
+        "port": port,
+        "name": name,
+        "model": hardware,
+        "manufacturer": manufacturer,
+        "location": location,
+        "onvif_endpoint": primary_endpoint or f"http://{ip}:{port}/onvif/device_service",
+        "endpoints": endpoints,
+        "types": types_raw,
+        "scopes": scopes_list,
+        "raw_xml": xml_data,
+    }
+
+
+def parse_ws_discovery_fallback(xml_data: str, source_ip: str = "") -> Optional[Dict[str, Any]]:
     """Fallback com Regex para extrair dados essenciais de XML truncado validando Anti-SSRF."""
     xaddrs_match = re.search(r'<[^:]*:?XAddrs[^>]*>(.*?)</[^:]*:?XAddrs>', xml_data, re.DOTALL)
     scopes_match = re.search(r'<[^:]*:?Scopes[^>]*>(.*?)</[^:]*:?Scopes>', xml_data, re.DOTALL)
