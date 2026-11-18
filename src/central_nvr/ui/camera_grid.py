@@ -7,7 +7,11 @@ Garante preenchimento de 100% da área útil sem desperdício de espaço ou slot
 - 4 Câmeras: Grid 2x2.
 - 5 ou 6 Câmeras: Grid 2x3.
 - 7 a 9 Câmeras: Grid 3x3.
+
+Com mais câmeras do que cabem no layout, a grade é paginada (◀ ▶): cada página tem o tamanho do
+layout atual (1x1 → 1, 2x2 → 4, 3x3 e automático → 9). Câmeras de outras páginas ficam pausadas.
 """
+import math
 from typing import Dict, List, Optional
 
 from PySide6.QtCore import Qt, Signal
@@ -131,10 +135,41 @@ class CameraGridWidget(QWidget):
         self.camera_views: Dict[str, CameraViewWidget] = {}
         self.camera_devices: List[CameraDevice] = []
         self.empty_slots: List[EmptySlotWidget] = []
+        self._filler_cells: List[QFrame] = []
+        self.current_page = 0
 
-        self.layout = QGridLayout(self)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        self._grid_host = QWidget(self)
+        self.layout = QGridLayout(self._grid_host)
         self.layout.setContentsMargins(4, 4, 4, 4)
         self.layout.setSpacing(6)
+        outer.addWidget(self._grid_host, 1)
+
+        # Barra de paginação (Issue #46): só aparece quando há mais de uma página
+        self.page_bar = QWidget(self)
+        page_layout = QHBoxLayout(self.page_bar)
+        page_layout.setContentsMargins(4, 0, 4, 4)
+        page_layout.addStretch()
+        self.btn_prev_page = QPushButton("◀")
+        self.btn_prev_page.setFixedWidth(36)
+        self.btn_prev_page.setToolTip("Página anterior")
+        self.btn_prev_page.clicked.connect(self.previous_page)
+        page_layout.addWidget(self.btn_prev_page)
+        self.lbl_page = QLabel("")
+        self.lbl_page.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_page.setMinimumWidth(110)
+        page_layout.addWidget(self.lbl_page)
+        self.btn_next_page = QPushButton("▶")
+        self.btn_next_page.setFixedWidth(36)
+        self.btn_next_page.setToolTip("Próxima página")
+        self.btn_next_page.clicked.connect(self.next_page)
+        page_layout.addWidget(self.btn_next_page)
+        page_layout.addStretch()
+        self.page_bar.hide()
+        outer.addWidget(self.page_bar)
 
     def set_cameras(self, cameras: List[CameraDevice]):
         """
@@ -208,7 +243,7 @@ class CameraGridWidget(QWidget):
             pass
         view.stop()
         view.close()
-        # Tirar do layout mantendo o grid como pai: assim apply_layout() não a transforma em janela
+        # Tirar do layout mantendo um pai: assim apply_layout() não a transforma em janela
         # órfã com destruição pendente, e ela é destruída com o grid se o event loop não rodar antes.
         self.layout.removeWidget(view)
         view.deleteLater()
@@ -220,9 +255,58 @@ class CameraGridWidget(QWidget):
         self.grid_layout_mode = mode
         self.apply_layout(mode)
 
+    # ------------------------------------------------------------------
+    # Paginação (Issue #46)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def page_capacity(mode: str) -> int:
+        return {"1x1": 1, "2x2": 4, "3x3": 9}.get(mode, 9)
+
+    def page_count(self) -> int:
+        return max(1, math.ceil(len(self.camera_views) / self.page_capacity(self.grid_layout_mode)))
+
+    def set_page(self, page: int):
+        if self.grid_layout_mode == "1x1":
+            # Em 1x1 cada página é uma câmera: navegar troca a câmera selecionada
+            ids = list(self.camera_views)
+            if not ids:
+                return
+            page = max(0, min(page, len(ids) - 1))
+            self._on_camera_selected(ids[page])
+            self.apply_layout("1x1")
+            return
+        self.current_page = max(0, min(page, self.page_count() - 1))
+        self.apply_layout(self.grid_layout_mode)
+
+    def next_page(self):
+        self.set_page(self._displayed_page() + 1)
+
+    def previous_page(self):
+        self.set_page(self._displayed_page() - 1)
+
+    def _displayed_page(self) -> int:
+        if self.grid_layout_mode == "1x1":
+            ids = list(self.camera_views)
+            return ids.index(self.selected_camera_id) if self.selected_camera_id in ids else 0
+        return self.current_page
+
+    def _update_page_bar(self):
+        pages = self.page_count()
+        current = self._displayed_page()
+        self.page_bar.setVisible(pages > 1)
+        self.lbl_page.setText(f"Página {current + 1}/{pages}")
+        self.btn_prev_page.setEnabled(current > 0)
+        self.btn_next_page.setEnabled(current < pages - 1)
+
+    # ------------------------------------------------------------------
+    # Disposição
+    # ------------------------------------------------------------------
+
     def apply_layout(self, mode: str = "auto"):
         """Reposiciona as views e pausa as que ficaram fora da tela (Issue #25)."""
         self._apply_layout_impl(mode)
+        self._update_page_bar()
         self._sync_on_screen()
 
     def _sync_on_screen(self):
@@ -234,153 +318,127 @@ class CameraGridWidget(QWidget):
         for view in self.camera_views.values():
             view.set_hidden_timeout(minutes)
 
+    def _reset_grid(self):
+        """
+        Esvazia o QGridLayout e zera o stretch de todas as linhas e colunas (Issue #24): uma linha
+        ou coluna sem widget mas com stretch continuaria recebendo espaço.
+        """
+        while self.layout.count():
+            item = self.layout.takeAt(0)
+            if item.widget():
+                item.widget().hide()
+        for r in range(self.layout.rowCount()):
+            self.layout.setRowStretch(r, 0)
+        for c in range(self.layout.columnCount()):
+            self.layout.setColumnStretch(c, 0)
+
+        for slot in self.empty_slots:
+            slot.deleteLater()
+        self.empty_slots.clear()
+        for cell in self._filler_cells:
+            cell.deleteLater()
+        self._filler_cells.clear()
+
+        for v in self.camera_views.values():
+            v.hide()
+
+    def _place(self, widget: QWidget, row: int, col: int, row_span: int = 1, col_span: int = 1):
+        self.layout.addWidget(widget, row, col, row_span, col_span)
+        widget.show()
+
+    def _stretch(self, rows: int, cols: int):
+        for r in range(rows):
+            self.layout.setRowStretch(r, 1)
+        for c in range(cols):
+            self.layout.setColumnStretch(c, 1)
+
+    def _show_empty_slot(self):
+        self._stretch(1, 1)
+        slot = EmptySlotWidget(1, parent=self._grid_host)
+        slot.add_clicked.connect(self.add_camera_requested.emit)
+        self.empty_slots.append(slot)
+        self._place(slot, 0, 0)
+
     def _apply_layout_impl(self, mode: str = "auto"):
         """
         Aplica o layout com preenchimento completo sem desperdício de espaço:
         - 0 Câmeras: Slot amigável de boas-vindas.
-        - 1 Câmera: Ocupa 100% da área útil (1 linha x 1 coluna).
-        - 2 Câmeras: Câmera 1 no topo e Câmera 2 na base (2 linhas x 1 coluna), ocupando 100% do espaço.
-        - 3 Câmeras: 2 em cima (50% de largura cada) e 1 embaixo (100% de largura).
-        - 4 Câmeras: Grid 2x2 (2 linhas x 2 colunas).
-        - 5 ou 6 Câmeras: Grid 2x3.
-        - 7 a 9 Câmeras: Grid 3x3.
+        - Modo 1x1: só a câmera selecionada, ocupando toda a área.
+        - Modos 2x2 / 3x3: grade fixa com as câmeras da página atual.
+        - Automático: disposição adaptada à quantidade de câmeras da página (até 9).
         """
-        # Limpar itens do QGridLayout
-        while self.layout.count():
-            item = self.layout.takeAt(0)
-            if item.widget():
-                item.widget().setParent(None)
-
-        # Limpar layout e reiniciar estrutura
-
-        # Limpar slots vazios anteriores
-        for slot in self.empty_slots:
-            slot.deleteLater()
-        self.empty_slots.clear()
-
-        # Ocultar todas as views antes de reposicionar
-        for v in self.camera_views.values():
-            v.hide()
-
+        self._reset_grid()
         views_list = list(self.camera_views.values())
-        num_cams = len(views_list)
 
-        # Modo 1x1 explícito
+        if not views_list:
+            self._show_empty_slot()
+            return
+
         if mode == "1x1":
-            self.layout.setRowStretch(0, 1)
-            self.layout.setColumnStretch(0, 1)
             if self.selected_camera_id and self.selected_camera_id in self.camera_views:
                 view = self.camera_views[self.selected_camera_id]
-            elif views_list:
+            else:
                 view = views_list[0]
+            self._stretch(1, 1)
+            self._place(view, 0, 0)
+            return
+
+        capacity = self.page_capacity(mode)
+        self.current_page = max(0, min(self.current_page, self.page_count() - 1))
+        page_views = views_list[self.current_page * capacity:(self.current_page + 1) * capacity]
+
+        if mode in ("2x2", "3x3"):
+            size = 2 if mode == "2x2" else 3
+            self._stretch(size, size)
+            for idx in range(size * size):
+                r, c = divmod(idx, size)
+                if idx < len(page_views):
+                    self._place(page_views[idx], r, c)
+                else:
+                    filler = QFrame(self._grid_host)
+                    filler.setObjectName("emptyGridCell")
+                    filler.setStyleSheet("QFrame#emptyGridCell { background-color: #080D18; border-radius: 6px; }")
+                    self._filler_cells.append(filler)
+                    self._place(filler, r, c)
+            return
+
+        self._arrange_auto(page_views)
+
+    def _arrange_auto(self, views: List[CameraViewWidget]):
+        """Disposição automática sem slots vazios para 1 a 9 câmeras."""
+        n = len(views)
+        if n == 1:
+            self._stretch(1, 1)
+            self._place(views[0], 0, 0)
+        elif n == 2:
+            # 1 em cima e 1 embaixo, ocupando 100% da largura
+            self._stretch(2, 1)
+            self._place(views[0], 0, 0)
+            self._place(views[1], 1, 0)
+        elif n == 3:
+            # 2 no topo e 1 na base ocupando a largura total
+            self._stretch(2, 2)
+            self._place(views[0], 0, 0)
+            self._place(views[1], 0, 1)
+            self._place(views[2], 1, 0, 1, 2)
+        elif n == 4:
+            self._stretch(2, 2)
+            for idx, view in enumerate(views):
+                self._place(view, *divmod(idx, 2))
+        elif n in (5, 6):
+            self._stretch(2, 3)
+            if n == 5:
+                for idx, view in enumerate(views[:3]):
+                    self._place(view, 0, idx)
+                self._place(views[3], 1, 0)
+                self._place(views[4], 1, 1, 1, 2)
             else:
-                slot = EmptySlotWidget(1, parent=self)
-                slot.add_clicked.connect(self.add_camera_requested.emit)
-                self.empty_slots.append(slot)
-                self.layout.addWidget(slot, 0, 0)
-                slot.show()
-                return
-
-            self.layout.addWidget(view, 0, 0)
-            view.show()
-            return
-
-        # Modo sem nenhuma câmera cadastrada
-        if num_cams == 0:
-            self.layout.setRowStretch(0, 1)
-            self.layout.setColumnStretch(0, 1)
-            slot = EmptySlotWidget(1, parent=self)
-            slot.add_clicked.connect(self.add_camera_requested.emit)
-            self.empty_slots.append(slot)
-            self.layout.addWidget(slot, 0, 0)
-            slot.show()
-            return
-
-        # Modo com 1 única câmera conectada: Ocupa 100% da área útil
-        if num_cams == 1:
-            self.layout.setRowStretch(0, 1)
-            self.layout.setColumnStretch(0, 1)
-            view = views_list[0]
-            self.layout.addWidget(view, 0, 0)
-            view.show()
-            return
-
-        # Modo com exatamente 2 câmeras conectadas: 1 em cima e 1 embaixo (2 linhas x 1 coluna)
-        if num_cams == 2:
-            self.layout.setRowStretch(0, 1)
-            self.layout.setRowStretch(1, 1)
-            self.layout.setColumnStretch(0, 1)
-
-            self.layout.addWidget(views_list[0], 0, 0)
-            self.layout.addWidget(views_list[1], 1, 0)
-            views_list[0].show()
-            views_list[1].show()
-            return
-
-        # Modo com 3 câmeras conectadas: 2 no topo e 1 na base ocupando largura total
-        if num_cams == 3:
-            self.layout.setRowStretch(0, 1)
-            self.layout.setRowStretch(1, 1)
-            self.layout.setColumnStretch(0, 1)
-            self.layout.setColumnStretch(1, 1)
-
-            self.layout.addWidget(views_list[0], 0, 0, 1, 1)
-            self.layout.addWidget(views_list[1], 0, 1, 1, 1)
-            self.layout.addWidget(views_list[2], 1, 0, 1, 2)
-            views_list[0].show()
-            views_list[1].show()
-            views_list[2].show()
-            return
-
-        # Modo com 4 câmeras conectadas: Grid 2x2
-        if num_cams == 4 or mode == "2x2":
-            self.layout.setRowStretch(0, 1)
-            self.layout.setRowStretch(1, 1)
-            self.layout.setColumnStretch(0, 1)
-            self.layout.setColumnStretch(1, 1)
-
-            for idx, view in enumerate(views_list[:4]):
-                r = idx // 2
-                c = idx % 2
-                self.layout.addWidget(view, r, c)
-                view.show()
-            return
-
-        # Modo com 5 ou 6 câmeras conectadas: Grid 2x3
-        if num_cams in (5, 6):
-            self.layout.setRowStretch(0, 1)
-            self.layout.setRowStretch(1, 1)
-            self.layout.setColumnStretch(0, 1)
-            self.layout.setColumnStretch(1, 1)
-            self.layout.setColumnStretch(2, 1)
-
-            if num_cams == 5:
-                self.layout.addWidget(views_list[0], 0, 0, 1, 1)
-                self.layout.addWidget(views_list[1], 0, 1, 1, 1)
-                self.layout.addWidget(views_list[2], 0, 2, 1, 1)
-                self.layout.addWidget(views_list[3], 1, 0, 1, 1)
-                self.layout.addWidget(views_list[4], 1, 1, 1, 2)
-                for v in views_list[:5]:
-                    v.show()
-            else:
-                for idx, view in enumerate(views_list[:6]):
-                    r = idx // 3
-                    c = idx % 3
-                    self.layout.addWidget(view, r, c)
-                    view.show()
-            return
-
-        # Modo com 7 ou mais câmeras conectadas: Grid 3x3
-        for r in range(3):
-            self.layout.setRowStretch(r, 1)
-        for c in range(3):
-            self.layout.setColumnStretch(c, 1)
-
-        for idx, view in enumerate(views_list[:9]):
-            r = idx // 3
-            c = idx % 3
-            self.layout.addWidget(view, r, c)
-            view.show()
+                for idx, view in enumerate(views):
+                    self._place(view, *divmod(idx, 3))
+        else:
+            self._stretch(3, 3)
+            for idx, view in enumerate(views[:9]):
+                self._place(view, *divmod(idx, 3))
 
     def _on_camera_selected(self, camera_id: str):
         """Destaca a câmera selecionada e emite sinal para MainWindow."""
