@@ -72,11 +72,6 @@ fi
 SITE_PACKAGES="${APPDIR}/usr/lib/python3.12/site-packages"
 mkdir -p "${SITE_PACKAGES}"
 
-if [ -d "${PROJECT_ROOT}/venv/lib/python3.12/site-packages/PySide6" ]; then
-    echo "===> Sincronizando dependências compiladas de venv/lib/python3.12/site-packages..."
-    rsync -a --exclude='pip*' --exclude='_distutils*' "${PROJECT_ROOT}/venv/lib/python3.12/site-packages/" "${SITE_PACKAGES}/"
-fi
-
 # Garantir presença de todas as dependências, com versões e hashes do lockfile (Issue #20)
 echo "===> Verificando dependências completas (PySide6, av, cv2, numpy, keyring, defusedxml)..."
 if ! "${APPDIR}/usr/bin/python3" -c "import PySide6, av, cv2, numpy, keyring, defusedxml" 2>/dev/null; then

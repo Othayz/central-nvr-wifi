@@ -51,8 +51,12 @@ class SupplyChainTest(unittest.TestCase):
 
     def test_release_installs_with_hashes(self):
         release = (WORKFLOWS / "release.yml").read_text(encoding="utf-8")
-        self.assertIn("--require-hashes", release)
+        for line in release.splitlines():
+            if "pip install" in line and "--upgrade pip" not in line:
+                self.assertIn("--require-hashes", line, line.strip())
         self.assertIn("requirements.lock", release)
+        self.assertIn("requirements-test.lock", release)
+        self.assertIn("--hash=sha256:", (ROOT / "requirements-test.lock").read_text(encoding="utf-8"))
 
     def test_build_script_verifies_downloads(self):
         script = (ROOT / "packaging" / "build_appimage.sh").read_text(encoding="utf-8")
@@ -63,6 +67,7 @@ class SupplyChainTest(unittest.TestCase):
         self.assertNotIn("continuous", script)
         self.assertNotIn("AppImageKit", script)
         self.assertIn("--require-hashes", script)
+        self.assertNotIn("rsync", script)  # nada copiado de um venv local fora do lockfile
 
     def test_lockfile_pins_every_dependency_with_hashes(self):
         lock = (ROOT / "requirements.lock").read_text(encoding="utf-8")

@@ -1,0 +1,2 @@
+# Dependências de teste do workflow de release; requirements-test.lock é gerado a partir daqui
+pytest

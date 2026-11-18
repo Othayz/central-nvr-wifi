@@ -10,6 +10,7 @@ from unittest.mock import MagicMock, patch
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
 
 from central_nvr.core.updater import (
+    _parse_github_release_dict,
     fetch_latest_release,
     is_prerelease,
     is_version_newer,
@@ -56,8 +57,9 @@ class VersionCompareTest(unittest.TestCase):
 
 class ReleaseVersionFromTagTest(unittest.TestCase):
     def test_title_does_not_influence_version(self):
-        self.assertEqual(parse_release_version("v1.2.2", "Suporte ao Ubuntu 24.04 (v1.2.2)"), "1.2.2")
-        self.assertEqual(parse_release_version("v1.2.2", "Release 2026.11 hotfix"), "1.2.2")
+        for title in ("Suporte ao Ubuntu 24.04 (v1.2.2)", "Release 2026.11 hotfix"):
+            info = _parse_github_release_dict({"tag_name": "v1.2.2", "name": title, "assets": []})
+            self.assertEqual(info.version, "1.2.2")
 
     def test_prefixed_tag(self):
         self.assertEqual(parse_release_version("Central_NVR_WiFi_v1.0.0"), "1.0.0")

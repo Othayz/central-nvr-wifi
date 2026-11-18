@@ -85,11 +85,11 @@ class ReleaseInfo:
 _VERSION_IN_TAG_RE = re.compile(r"(\d+(?:\.\d+)+)([-+._]?[0-9A-Za-z][0-9A-Za-z.\-+_]*)?")
 
 
-def parse_release_version(tag_name: str, title: str = "") -> str:
+def parse_release_version(tag_name: str) -> str:
     """
     Extrai a versão da release **somente da tag** (Issue #35). O título é texto livre (ex.:
     "Suporte ao Ubuntu 24.04 (v1.2.2)") e não pode competir com a tag; o workflow de release já
-    garante que a tag é igual à versão do projeto. `title` é aceito apenas por compatibilidade.
+    garante que a tag é igual à versão do projeto.
     """
     m = _VERSION_IN_TAG_RE.search(str(tag_name or ""))
     if m:
@@ -362,7 +362,7 @@ def _parse_github_release_dict(data: Dict[str, Any]) -> ReleaseInfo:
     """Extrai campos da estrutura de resposta JSON do GitHub."""
     tag_name = data.get("tag_name", "")
     title = data.get("name") or f"Versão {tag_name}"
-    clean_v = parse_release_version(tag_name, title)
+    clean_v = parse_release_version(tag_name)
     body = data.get("body") or "Nenhuma nota de versão fornecida."
     html_url = data.get("html_url", "")
     published_at = data.get("published_at", "")

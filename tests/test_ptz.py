@@ -265,6 +265,24 @@ class PTZControllerTest(unittest.TestCase):
         self.assertIsNone(self.widget.client)
         self.assertFalse(self.widget.controls_frame.isEnabled())
 
+    def test_port_detected_after_selection_changed_is_persisted_on_return(self):
+        """#44: probe de A termina depois de selecionar B; ao voltar para A a porta é aplicada e salva."""
+        FakeOnvifClient.responding_ports = {5000}
+        FakeOnvifClient.slow_ips = {"10.0.0.1"}
+        detected = []
+        self.widget.onvif_port_detected.connect(lambda cam_id, port: detected.append((cam_id, port)))
+        cam_a, cam_b = _camera("a", "10.0.0.1"), _camera("b", "10.0.0.2")
+        self.widget.set_camera(cam_a)
+        self.widget.set_camera(cam_b)
+        # O probe lento de A (porta 80 fechada, depois 5000) termina e vai para o cache
+        self.assertTrue(_wait_until(
+            self.app, lambda: any(k[0] == "a" for k in self.widget._client_cache), timeout=5))
+        self.assertEqual(cam_a.port, 80)
+        self.widget.set_camera(cam_a)
+        self.assertEqual(self.widget.client.port, 5000)
+        self.assertEqual(cam_a.port, 5000)
+        self.assertIn(("a", 5000), detected)
+
     def test_probe_does_not_mutate_camera_in_background(self):
         FakeOnvifClient.responding_ports = {5000}
         cam = _camera("a", "10.0.0.1")

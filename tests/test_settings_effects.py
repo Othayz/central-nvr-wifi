@@ -118,6 +118,23 @@ class OsdAndSnapshotTest(QtCase):
                 view._take_snapshot()
             self.assertEqual(Path(take.call_args[0][0]).parent, Path(tmp))
 
+    def test_options_reach_open_fullscreen_window(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            view = self._view(ViewOptions())
+            view._open_fullscreen_player()
+            win = view._fullscreen_win
+            self.addCleanup(win.close)
+            view.apply_options(ViewOptions(snapshot_dir=tmp, show_osd_fps=False, show_osd_timestamp=False))
+            self.assertEqual(win.snapshot_dir, Path(tmp))
+            from PySide6.QtGui import QImage
+            frame = QImage(64, 36, QImage.Format.Format_RGB888)
+            frame.fill(0)
+            win.set_frame(frame, fps=24.0, bitrate=900, codec="H.264")
+            text = win.lbl_metrics.text()
+            self.assertNotIn("FPS", text)
+            self.assertIn("900 kbps", text)
+            self.assertNotRegex(text, r"\d\d:\d\d:\d\d")
+
     def test_fullscreen_snapshot_dir(self):
         from central_nvr.ui.fullscreen_view import FullscreenPlayerWindow
         with tempfile.TemporaryDirectory() as tmp:

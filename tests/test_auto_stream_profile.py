@@ -90,6 +90,25 @@ class AutoProfileTest(unittest.TestCase):
         self.grid.set_layout_mode("3x3")  # troca de layout reaplica o automático
         self.assertTrue(view.worker.prefer_substream)
 
+    def test_page_change_keeps_manual_choice(self):
+        self.grid.set_cameras(_cams(8))
+        self.grid.set_layout_mode("2x2")
+        view = self.grid.camera_views["c1"]
+        view._toggle_stream_profile()  # HD manual
+        self.grid.next_page()
+        self.grid.previous_page()
+        self.assertFalse(view.worker.prefer_substream)
+
+    def test_fullscreen_entry_and_exit_reapply_automatic_profile(self):
+        self.grid.set_cameras(_cams(4))
+        self.grid.set_layout_mode("2x2")
+        view = self.grid.camera_views["c1"]
+        view._toggle_stream_profile()  # HD manual na grade
+        view._open_fullscreen_player()
+        self.assertFalse(view.worker.prefer_substream)
+        view._fullscreen_win.close()
+        self.assertTrue(view.worker.prefer_substream, "ao sair da tela cheia volta ao automático (sub-stream)")
+
     def test_new_worker_starts_with_grid_profile(self):
         self.grid.set_cameras(_cams(4))
         self.grid.set_layout_mode("2x2")

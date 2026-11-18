@@ -268,6 +268,7 @@ class PTZControllerWidget(QWidget):
         key = self._client_key(camera)
         cached = self._client_cache.get(key)
         if cached is not None:
+            self._adopt_detected_port(cached)
             self.client = cached
             self._request_presets(gen, key, cached)
             return
@@ -322,14 +323,21 @@ class PTZControllerWidget(QWidget):
             self.command_failed.emit(self.camera.name, "PTZ indisponível: nenhuma porta ONVIF respondeu")
             return
 
-        if client.port != self.camera.port:
-            # Porta detectada: atualizada aqui (thread da interface) e persistida por quem ouve o sinal
-            self.camera.port = client.port
-            self._client_cache[self._client_key(self.camera)] = client
-            self.onvif_port_detected.emit(self.camera.id, int(client.port))
-
+        self._adopt_detected_port(client)
         self.client = client
         self._request_presets(gen, key, client)
+
+    def _adopt_detected_port(self, client: OnvifClient):
+        """
+        Porta detectada diferente da configurada: atualizada aqui (thread da interface) e persistida
+        por quem ouve o sinal. Vale também para cliente vindo do cache, criado numa seleção anterior
+        que mudou antes de o probe responder.
+        """
+        if self.camera is None or client.port == self.camera.port:
+            return
+        self.camera.port = client.port
+        self._client_cache[self._client_key(self.camera)] = client
+        self.onvif_port_detected.emit(self.camera.id, int(client.port))
 
     def _queue_for(self, key: object) -> SerialCommandQueue:
         q = self._queues.get(key)

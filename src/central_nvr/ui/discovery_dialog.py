@@ -28,7 +28,7 @@ from PySide6.QtWidgets import (
 )
 
 from central_nvr.core.camera import CameraDevice
-from central_nvr.core.onvif_enrich import enrich_from_onvif
+from central_nvr.core.onvif_enrich import FALLBACK_WARNING, enrich_from_onvif
 from central_nvr.core.threads import retire_thread
 from central_nvr.scanner.discovery import NetworkScanner
 
@@ -45,6 +45,11 @@ class ScannerWorker(QThread):
         self.timeout = timeout
         self.enable_port_scan = enable_port_scan
         self.scanner = NetworkScanner()
+
+    @property
+    def warnings(self) -> List[str]:
+        """Avisos da última varredura (ex.: rede grande demais para sondar inteira)."""
+        return self.scanner.warnings
 
     def stop(self):
         """Pede a parada sem bloquear: as sondas pendentes são canceladas (Issue #41)."""
@@ -81,7 +86,7 @@ class OnvifEnrichWorker(QThread):
             try:
                 warning = enrich_from_onvif(camera)
             except Exception as e:  # Nunca deixar a thread morrer sem resposta
-                warning = f"ONVIF indisponível — caminho RTSP deduzido ({e})"
+                warning = f"{FALLBACK_WARNING} ({e})"
             results.append((camera, warning))
         self.finished_enrich.emit(results)
 
@@ -316,7 +321,7 @@ class DiscoveryDialog(QDialog):
         self.btn_scan.setText("🔍 Iniciar Varredura de Rede")
         self.progress_bar.setValue(100)
         status = f"Varredura finalizada. {len(devices)} dispositivos encontrados."
-        warnings = self.worker.scanner.warnings if self.worker else []
+        warnings = self.worker.warnings if self.worker else []
         if warnings:
             status += "\n⚠ " + "\n⚠ ".join(warnings)
         self.lbl_scan_status.setText(status)

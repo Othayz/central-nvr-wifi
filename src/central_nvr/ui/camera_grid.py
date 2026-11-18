@@ -328,7 +328,9 @@ class CameraGridWidget(QWidget):
         """
         visible = [v for v in self.camera_views.values() if not v.isHidden()]
         prefer_sub = len(visible) > 1
-        profile_key = (mode, len(visible))
+        # Troca de layout = outro modo ou outro perfil (uma câmera ↔ várias); trocar de página com
+        # o mesmo perfil não descarta a escolha manual
+        profile_key = (mode, prefer_sub)
         layout_changed = profile_key != self._last_profile_key
         self._last_profile_key = profile_key
         for view in self.camera_views.values():

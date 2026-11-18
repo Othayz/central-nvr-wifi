@@ -183,7 +183,7 @@ class StreamWorker(QThread):
         rtsp_transport: str = DEFAULT_RTSP_TRANSPORT,
         buffer_size_ms: int = 150,
         prefer_substream: bool = False,
-        reconnect_interval_sec: float = 3.0,
+        reconnect_interval_sec: float = 5.0,  # mesmo padrão de ConfigManager
         auto_reconnect: bool = True,
         motion_detection: bool = True,
         parent: Optional[QObject] = None,

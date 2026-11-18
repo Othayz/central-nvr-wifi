@@ -305,11 +305,25 @@ class FullscreenPlayerWindow(QWidget):
         if codec:
             self.codec = codec
         if frame and not frame.isNull():
-            w, h = frame.width(), frame.height()
-            bitrate_str = f" | {int(self.bitrate_kbps)} kbps" if self.bitrate_kbps > 0 else ""
-            jitter_str = f" | Jitter: {jitter_ms:.1f}ms" if jitter_ms > 0 else ""
-            self.lbl_metrics.setText(f"{w}x{h} | {self.fps:.1f} FPS{bitrate_str} | {self.codec}{jitter_str}")
+            # OSD conforme show_osd_timestamp / show_osd_fps / show_osd_bitrate (Issue #34)
+            opts = getattr(self, "_osd_options", None)
+            parts = []
+            if opts is None or opts.show_osd_timestamp:
+                parts.append(datetime.datetime.now().strftime("%H:%M:%S"))
+            parts.append(f"{frame.width()}x{frame.height()}")
+            if opts is None or opts.show_osd_fps:
+                parts.append(f"{self.fps:.1f} FPS")
+            if (opts is None or opts.show_osd_bitrate) and self.bitrate_kbps > 0:
+                parts.append(f"{int(self.bitrate_kbps)} kbps")
+            parts.append(self.codec)
+            if jitter_ms > 0:
+                parts.append(f"Jitter: {jitter_ms:.1f}ms")
+            self.lbl_metrics.setText(" | ".join(parts))
         self.update()
+
+    def set_osd_options(self, options):
+        """Opções de OSD vindas da view (ViewOptions)."""
+        self._osd_options = options
 
     def showEvent(self, event):
         """Ao abrir em tela cheia, exibe controles e inicia contagem regressiva para auto-hide."""

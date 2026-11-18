@@ -380,8 +380,11 @@ class CameraViewWidget(QFrame):
                 camera=self.camera, snapshot_dir=self.options.resolved_snapshot_dir(), parent=None
             )
             self._fullscreen_win.closed.connect(self._on_fullscreen_closed)
-        # Tela cheia de uma câmera: stream principal em resolução original (Issue #47)
-        if self.worker and not self._manual_override:
+            self._fullscreen_win.set_osd_options(self.options)
+        # Tela cheia de uma câmera: stream principal em resolução original. Entrar na tela cheia é
+        # uma troca de layout: reaplica o automático por cima da escolha manual (Issue #47)
+        self._manual_override = False
+        if self.worker:
             self.worker.set_prefer_substream(False)
         if self.current_frame:
             self._fullscreen_win.set_frame(
@@ -464,6 +467,10 @@ class CameraViewWidget(QFrame):
             self.worker.auto_reconnect = options.auto_reconnect
         if not options.motion_detection and hasattr(self, "lbl_motion"):
             self.lbl_motion.hide()
+        fullscreen = getattr(self, "_fullscreen_win", None)
+        if fullscreen is not None:
+            fullscreen.snapshot_dir = options.resolved_snapshot_dir()
+            fullscreen.set_osd_options(options)
         self._render_metrics()
 
     # ------------------------------------------------------------------
@@ -490,9 +497,10 @@ class CameraViewWidget(QFrame):
             self.worker.set_prefer_substream(desired)
 
     def _on_fullscreen_closed(self):
-        # Volta ao perfil da grade (a escolha manual, se houver, continua valendo)
+        # Sair da tela cheia também é troca de layout: volta ao perfil automático da grade
         self._sync_target_size()
-        if self.worker and not self._manual_override:
+        self._manual_override = False
+        if self.worker:
             self.worker.set_prefer_substream(self._auto_prefer_sub)
 
     def _start_stream(self):

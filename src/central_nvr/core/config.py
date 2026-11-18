@@ -302,25 +302,22 @@ class ConfigManager:
                 return kr_pat
         return self.settings.get(key, default)
 
+    def _store(self, key: str, value: Any):
+        """Grava em memória; o token do GitHub vai para o keyring quando disponível."""
+        if key == "github_token" and is_keyring_available():
+            set_keyring_pat(str(value or "").strip())
+            self.settings["github_token"] = ""
+        else:
+            self.settings[key] = value
+
     def update(self, values: Dict[str, Any]):
         """Atualiza várias chaves e grava settings.json uma única vez (Issue #34)."""
         for key, value in values.items():
-            if key == "github_token" and is_keyring_available():
-                set_keyring_pat(str(value or "").strip())
-                self.settings["github_token"] = ""
-            else:
-                self.settings[key] = value
+            self._store(key, value)
         self.save_settings()
 
     def set(self, key: str, value: Any):
-        if key == "github_token":
-            val_str = str(value or "").strip()
-            if is_keyring_available():
-                set_keyring_pat(val_str)
-                self.settings["github_token"] = ""
-                self.save_settings()
-                return
-        self.settings[key] = value
+        self._store(key, value)
         self.save_settings()
 
     def add_or_update_device(self, device: Dict[str, Any]):

@@ -740,9 +740,7 @@ class MainWindow(QMainWindow):
             # Atualizar parâmetros de tema, hardware e reconectar
             theme = self.config_mgr.get("theme", "dark").lower()
             if theme != self.current_theme:
-                self.current_theme = theme
-                self.setStyleSheet(get_theme_qss(self.current_theme))
-                self._set_theme(theme)
+                self._set_theme(theme)  # aplica o QSS, atualiza o menu e registra no log
             hw_accel = self.config_mgr.get("hw_accel", "vaapi")
             self.lbl_sb_hw.setText(f"Aceleração: {hw_accel.upper()} (Ativo)")
             self.camera_grid.hw_accel = hw_accel
