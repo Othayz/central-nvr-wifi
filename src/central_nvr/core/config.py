@@ -335,6 +335,17 @@ class ConfigManager:
             self.save_devices()
         return updated
 
+    def update_device(self, dev_id: str, fields: Dict[str, Any]) -> bool:
+        """Atualiza campos de um dispositivo existente (por ID) e persiste no disco."""
+        updated = False
+        for dev in self.devices:
+            if dev.get("id") == dev_id:
+                dev.update(fields)
+                updated = True
+        if updated:
+            self.save_devices()
+        return updated
+
     def remove_device(self, dev_id: str):
         """Remove um dispositivo pelo seu ID ou IP."""
         delete_keyring_password(dev_id)

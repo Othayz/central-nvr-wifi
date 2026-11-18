@@ -22,7 +22,7 @@ from PySide6.QtWidgets import (
 )
 
 from central_nvr.core.camera import CameraDevice
-from central_nvr.core.onvif_client import OnvifClient
+from central_nvr.core.onvif_client import OnvifClient, OnvifError, OnvifFaultError
 from central_nvr.core.ptz_queue import SerialCommandQueue
 
 logger = logging.getLogger(__name__)
@@ -36,6 +36,7 @@ class PTZControllerWidget(QWidget):
 
     command_executed = Signal(str, str)  # (camera_name, command_str)
     command_failed = Signal(str, str)    # (camera_name, descrição da falha)
+    onvif_port_detected = Signal(str, int)  # (camera_id, porta ONVIF que respondeu)
     presets_loaded = Signal(list)        # lista de presets recebidos via ONVIF
     preset_saved = Signal(str, str)      # (preset_name, preset_token)
 
@@ -279,36 +280,54 @@ class PTZControllerWidget(QWidget):
         threading.Thread(target=_init_client, daemon=True).start()
 
     def _probe_client(self, camera: CameraDevice) -> Optional[OnvifClient]:
-        """Executa em thread de fundo: encontra a porta ONVIF que responde."""
+        """
+        Executa em thread de fundo: encontra a porta que responde ONVIF de verdade (Issue #44).
+        Uma porta só é aceita com perfis reais em GetProfiles. Não altera `camera`.
+        """
         ports_to_try = [camera.port]
-        if 5000 not in ports_to_try:
-            ports_to_try.append(5000)
-        if 80 not in ports_to_try:
-            ports_to_try.append(80)
+        for fallback in (5000, 80):
+            if fallback not in ports_to_try:
+                ports_to_try.append(fallback)
 
         for p in ports_to_try:
+            c = OnvifClient(
+                ip=camera.ip,
+                port=p,
+                username=camera.username,
+                password=camera.password,
+                timeout=2.5,
+            )
             try:
-                c = OnvifClient(
-                    ip=camera.ip,
-                    port=p,
-                    username=camera.username,
-                    password=camera.password,
-                    timeout=2.5,
-                )
                 c.get_capabilities()
-                c.get_profiles()
-                if c.media_service_url or c.ptz_service_url:
-                    return c
-            except Exception:
+            except OnvifFaultError:
+                pass  # Sem GetCapabilities: tenta os endpoints padrão
+            except OnvifError as e:
+                logger.debug(f"ONVIF não respondeu em {camera.ip}:{p}: {e}")
                 continue
+            try:
+                if c.get_profiles():
+                    return c
+            except OnvifError as e:
+                logger.debug(f"GetProfiles falhou em {camera.ip}:{p}: {e}")
         return None
 
     def _on_client_ready(self, gen: int, key: object, client: object):
         """Slot (thread da interface): aceita o cliente só se a seleção ainda for a mesma."""
         if client is not None:
             self._client_cache[key] = client
-        if gen != self._selection_gen or client is None:
+        if gen != self._selection_gen or self.camera is None:
             return
+        if client is None:
+            self.controls_frame.setEnabled(False)
+            self.command_failed.emit(self.camera.name, "PTZ indisponível: nenhuma porta ONVIF respondeu")
+            return
+
+        if client.port != self.camera.port:
+            # Porta detectada: atualizada aqui (thread da interface) e persistida por quem ouve o sinal
+            self.camera.port = client.port
+            self._client_cache[self._client_key(self.camera)] = client
+            self.onvif_port_detected.emit(self.camera.id, int(client.port))
+
         self.client = client
         self._request_presets(gen, key, client)
 

@@ -20,7 +20,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 from PySide6.QtWidgets import QApplication
 
 from central_nvr.core.camera import CameraDevice
-from central_nvr.core.onvif_client import OnvifClient
+from central_nvr.core.onvif_client import OnvifClient, OnvifConnectionError
 from central_nvr.core.ptz_queue import SerialCommandQueue
 
 
@@ -50,6 +50,11 @@ class FakeOnvifClient:
     lock = threading.Lock()
     slow_ips = set()
     fail_commands = False
+    responding_ports = None  # None = todas as portas respondem ONVIF
+
+    def _check_port(self):
+        if FakeOnvifClient.responding_ports is not None and self.port not in FakeOnvifClient.responding_ports:
+            raise OnvifConnectionError(f"porta {self.port} fechada")
 
     def __init__(self, ip, port=80, username="", password="", timeout=4.0):
         self.ip = ip
@@ -62,9 +67,11 @@ class FakeOnvifClient:
             FakeOnvifClient.init_count += 1
         if self.ip in FakeOnvifClient.slow_ips:
             time.sleep(0.4)
+        self._check_port()
         return {}
 
     def get_profiles(self):
+        self._check_port()
         return [{"token": "p1"}]
 
     def ptz_get_presets(self):
@@ -139,6 +146,7 @@ class PTZControllerTest(unittest.TestCase):
         FakeOnvifClient.calls = []
         FakeOnvifClient.slow_ips = set()
         FakeOnvifClient.fail_commands = False
+        FakeOnvifClient.responding_ports = None
         self.patcher = patch("central_nvr.ui.ptz_controller.OnvifClient", FakeOnvifClient)
         self.patcher.start()
         from central_nvr.ui.ptz_controller import PTZControllerWidget
@@ -224,6 +232,45 @@ class PTZControllerTest(unittest.TestCase):
             self.widget._save_preset()
         self.assertTrue(_wait_until(self.app, lambda: len(failures) >= 1))
         self.assertEqual(self.widget.combo_presets.count(), 0)
+
+    def test_closed_port_falls_back_to_5000(self):
+        """#44: porta configurada fechada e 5000 respondendo → o cliente usa a 5000."""
+        FakeOnvifClient.responding_ports = {5000}
+        detected = []
+        self.widget.onvif_port_detected.connect(lambda cam_id, port: detected.append((cam_id, port)))
+        cam = _camera("a", "10.0.0.1")
+        self.widget.set_camera(cam)
+        self.assertTrue(_wait_until(self.app, lambda: self.widget.client is not None))
+        self.assertEqual(self.widget.client.port, 5000)
+        # Persistência: porta atualizada na thread da interface e sinal para salvar
+        self.assertEqual(cam.port, 5000)
+        self.assertEqual(detected, [("a", 5000)])
+
+    def test_detected_port_is_cached_under_new_port(self):
+        FakeOnvifClient.responding_ports = {5000}
+        cam = _camera("a", "10.0.0.1")
+        self.widget.set_camera(cam)
+        self.assertTrue(_wait_until(self.app, lambda: self.widget.client is not None))
+        self.widget.set_camera(None)
+        self.widget.set_camera(cam)  # agora com port=5000
+        self.assertIsNotNone(self.widget.client)
+
+    def test_no_port_responds_means_no_client(self):
+        """#44: nenhuma porta responde → PTZ indisponível, sem cliente ativo."""
+        FakeOnvifClient.responding_ports = set()
+        unavailable = []
+        self.widget.command_failed.connect(lambda cam, msg: unavailable.append(msg))
+        self.widget.set_camera(_camera("a", "10.0.0.1"))
+        self.assertTrue(_wait_until(self.app, lambda: len(unavailable) >= 1))
+        self.assertIsNone(self.widget.client)
+        self.assertFalse(self.widget.controls_frame.isEnabled())
+
+    def test_probe_does_not_mutate_camera_in_background(self):
+        FakeOnvifClient.responding_ports = {5000}
+        cam = _camera("a", "10.0.0.1")
+        client = self.widget._probe_client(cam)
+        self.assertEqual(client.port, 5000)
+        self.assertEqual(cam.port, 80)
 
     def test_no_fictitious_initial_preset(self):
         self.assertEqual(self.widget.combo_presets.count(), 0)

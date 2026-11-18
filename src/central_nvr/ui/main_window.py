@@ -337,6 +337,7 @@ class MainWindow(QMainWindow):
         self.ptz_panel.command_failed.connect(
             lambda cname, msg: self._log_event(f"PTZ (falha) {cname}", msg)
         )
+        self.ptz_panel.onvif_port_detected.connect(self._on_onvif_port_detected)
         self.sidebar_tabs.addTab(self.ptz_panel, "Controle PTZ")
 
         # =====================================================================
@@ -509,6 +510,13 @@ class MainWindow(QMainWindow):
         # 6. Registrar nos Logs e na Barra de Status
         self._log_event("Dispositivo", f"Câmera renomeada: '{old_name}' ➔ '{new_name}'")
         self.statusBar().showMessage(f"Câmera renomeada para '{new_name}' com sucesso!", 4000)
+
+    def _on_onvif_port_detected(self, camera_id: str, port: int):
+        """Persiste a porta ONVIF detectada pelo painel PTZ (o objeto da câmera já foi atualizado)."""
+        if self.config_mgr.update_device(camera_id, {"port": port}):
+            cam = next((c for c in self.cameras if c.id == camera_id), None)
+            name = cam.name if cam else camera_id
+            self._log_event("Dispositivo", f"Porta ONVIF de '{name}' detectada e salva: {port}")
 
     def _reconnect_selected_camera(self):
         """Reconecta a câmera selecionada ou todas caso nenhuma esteja selecionada."""
