@@ -27,6 +27,8 @@ from PySide6.QtWidgets import (
 )
 
 from central_nvr.core.camera import CameraDevice
+from central_nvr.core.onvif_enrich import enrich_from_onvif
+from central_nvr.core.threads import retire_thread
 from central_nvr.scanner.discovery import NetworkScanner
 
 
@@ -57,6 +59,31 @@ class ScannerWorker(QThread):
         self.scan_finished.emit(devices)
 
 
+class OnvifEnrichWorker(QThread):
+    """Consulta o ONVIF de cada câmera a cadastrar, fora da thread da interface (Issue #45)."""
+
+    progress = Signal(int, int, str)   # (atual, total, nome)
+    finished_enrich = Signal(list)     # [(CameraDevice, aviso ou None)]
+
+    def __init__(self, cameras: List[CameraDevice], parent: Optional[QObject] = None):
+        super().__init__(parent)
+        self.cameras = cameras
+
+    def run(self):
+        results = []
+        total = len(self.cameras)
+        for i, camera in enumerate(self.cameras, 1):
+            if self.isInterruptionRequested():
+                return
+            self.progress.emit(i, total, camera.name)
+            try:
+                warning = enrich_from_onvif(camera)
+            except Exception as e:  # Nunca deixar a thread morrer sem resposta
+                warning = f"ONVIF indisponível — caminho RTSP deduzido ({e})"
+            results.append((camera, warning))
+        self.finished_enrich.emit(results)
+
+
 class DiscoveryDialog(QDialog):
     """
     Diálogo para descoberta automática via ONVIF WS-Discovery e adição manual de câmeras.
@@ -70,6 +97,7 @@ class DiscoveryDialog(QDialog):
         self.resize(780, 520)
         self.discovered_list: List[Dict[str, Any]] = []
         self.worker: Optional[ScannerWorker] = None
+        self.enrich_worker: Optional[OnvifEnrichWorker] = None
 
         self._setup_ui()
 
@@ -279,11 +307,13 @@ class DiscoveryDialog(QDialog):
         self.lbl_scan_status.setText(f"Varredura finalizada. {len(devices)} dispositivos encontrados.")
 
     def _add_selected_devices(self):
-        """Adiciona todos os dispositivos marcados na tabela."""
+        """Adiciona os dispositivos marcados, consultando o ONVIF de cada um em segundo plano."""
+        if self.enrich_worker and self.enrich_worker.isRunning():
+            return
         user = self.txt_disc_user.text().strip() or "admin"
         pwd = self.txt_disc_pass.text()
 
-        count = 0
+        cameras: List[CameraDevice] = []
         for row in range(self.table.rowCount()):
             chk = self.table.item(row, 0)
             if chk and chk.checkState() == Qt.CheckState.Checked:
@@ -292,10 +322,11 @@ class DiscoveryDialog(QDialog):
                     continue
                 dev_port = dev_data.get("port", 80)
                 is_yoosee = (dev_port == 5000 or dev_data.get("manufacturer", "").lower() == "yoosee")
+                # Caminho deduzido: só é usado se a consulta ONVIF falhar
                 rtsp_path = "/onvif1" if is_yoosee else "/live/ch0"
                 mfg = "Yoosee" if is_yoosee else dev_data.get("manufacturer", "Genérico")
 
-                camera = CameraDevice(
+                cameras.append(CameraDevice(
                     id=f"cam_{dev_data['ip'].replace('.', '_')}",
                     name=dev_data.get("name", f"Câmera {dev_data['ip']}"),
                     ip=dev_data["ip"],
@@ -307,17 +338,42 @@ class DiscoveryDialog(QDialog):
                     manufacturer=mfg,
                     model=dev_data.get("model", "Câmera ONVIF"),
                     onvif_endpoint=dev_data.get("onvif_endpoint", ""),
-                    has_ptz=True,
+                    has_ptz=False,  # Definido pela resposta ONVIF
                     enabled=True,
-                )
-                self.device_added.emit(camera)
-                count += 1
+                ))
 
-        if count > 0:
-            QMessageBox.information(self, "Sucesso", f"{count} dispositivo(s) adicionado(s) com sucesso!")
-            self.accept()
-        else:
+        if not cameras:
             QMessageBox.warning(self, "Aviso", "Selecione ao menos um dispositivo para adicionar.")
+            return
+
+        self.btn_add_selected.setEnabled(False)
+        self.lbl_scan_status.setText("Consultando ONVIF dos dispositivos selecionados...")
+        self.enrich_worker = OnvifEnrichWorker(cameras, parent=self)
+        self.enrich_worker.progress.connect(self._on_enrich_progress)
+        self.enrich_worker.finished_enrich.connect(self._on_enrich_finished)
+        self.enrich_worker.start()
+
+    def _on_enrich_progress(self, current: int, total: int, name: str):
+        self.lbl_scan_status.setText(f"Consultando ONVIF ({current}/{total}): {name}")
+
+    def _on_enrich_finished(self, results: list):
+        worker, self.enrich_worker = self.enrich_worker, None
+        if worker is not None:
+            retire_thread(worker)  # Libera quando o run() terminar de retornar
+        self.btn_add_selected.setEnabled(True)
+        warnings = []
+        for camera, warning in results:
+            self.device_added.emit(camera)
+            if warning:
+                warnings.append(f"• {camera.name} ({camera.ip}): {warning}")
+
+        msg = f"{len(results)} dispositivo(s) adicionado(s)."
+        if warnings:
+            msg += "\n\nAtenção:\n" + "\n".join(warnings)
+            QMessageBox.warning(self, "Dispositivos adicionados com avisos", msg)
+        else:
+            QMessageBox.information(self, "Sucesso", msg)
+        self.accept()
 
     def _on_preset_changed(self, index: int):
         """Preenche automaticamente os campos de acordo com o modelo selecionado."""
@@ -381,7 +437,23 @@ class DiscoveryDialog(QDialog):
         QMessageBox.information(self, "Sucesso", f"Câmera '{camera.name}' adicionada com sucesso!")
         self.accept()
 
+    def _cancel_enrich(self):
+        """Abandona a consulta ONVIF em andamento sem bloquear a interface."""
+        if self.enrich_worker and self.enrich_worker.isRunning():
+            self.enrich_worker.requestInterruption()
+            self.enrich_worker.finished_enrich.disconnect()
+            self.enrich_worker.progress.disconnect()
+            retire_thread(self.enrich_worker)
+            self.enrich_worker = None
+            self.btn_add_selected.setEnabled(True)
+
+    def done(self, result: int):
+        # "Fechar" e Esc passam por aqui (não por closeEvent)
+        self._cancel_enrich()
+        super().done(result)
+
     def closeEvent(self, event):
         if self.worker and self.worker.isRunning():
             self.worker.stop()
+        self._cancel_enrich()
         super().closeEvent(event)

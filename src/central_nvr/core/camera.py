@@ -67,27 +67,30 @@ class CameraDevice:
     stats: StreamStats = field(default_factory=StreamStats)
     last_error: str = ""
 
+    def _with_credentials(self, url: str) -> str:
+        """Injeta usuário/senha numa URL RTSP explícita (ex.: devolvida pelo ONVIF) que não os tenha."""
+        parsed = urllib.parse.urlparse(url)
+        if self.username and not parsed.username:
+            auth = urllib.parse.quote(self.username)
+            if self.password:
+                auth += f":{urllib.parse.quote(self.password)}"
+            netloc = f"{auth}@{parsed.hostname}"
+            if parsed.port:
+                netloc += f":{parsed.port}"
+            return urllib.parse.urlunparse((
+                parsed.scheme,
+                netloc,
+                parsed.path,
+                parsed.params,
+                parsed.query,
+                parsed.fragment
+            ))
+        return url
+
     def get_full_rtsp_url(self) -> str:
         """Gera a URL RTSP completa com credenciais embutidas caso necessário."""
         if self.rtsp_url:
-            # Se a URL já possui esquema RTSP, injetar credenciais se houver
-            parsed = urllib.parse.urlparse(self.rtsp_url)
-            if self.username and not parsed.username:
-                auth = urllib.parse.quote(self.username)
-                if self.password:
-                    auth += f":{urllib.parse.quote(self.password)}"
-                netloc = f"{auth}@{parsed.hostname}"
-                if parsed.port:
-                    netloc += f":{parsed.port}"
-                return urllib.parse.urlunparse((
-                    parsed.scheme,
-                    netloc,
-                    parsed.path,
-                    parsed.params,
-                    parsed.query,
-                    parsed.fragment
-                ))
-            return self.rtsp_url
+            return self._with_credentials(self.rtsp_url)
 
         # Construir a partir dos campos individuais
         username = self.username if self.username else ("admin" if self.password else "")
@@ -104,7 +107,7 @@ class CameraDevice:
     def get_substream_url(self) -> str:
         """Retorna a URL RTSP do Sub-Stream (baixa resolução para economia de banda Wi-Fi)."""
         if self.substream_url:
-            return self.substream_url
+            return self._with_credentials(self.substream_url)
 
         username = self.username if self.username else ("admin" if self.password else "")
         auth = ""
