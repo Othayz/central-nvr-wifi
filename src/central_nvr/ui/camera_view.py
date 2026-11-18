@@ -8,7 +8,7 @@ import re
 import time
 from typing import Optional
 
-from PySide6.QtCore import QPoint, QRect, QSize, Qt, Signal
+from PySide6.QtCore import QPoint, QRect, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QCursor, QFont, QImage, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QFrame,
@@ -132,6 +132,12 @@ class CameraViewWidget(QFrame):
         self.lbl_metrics = QLabel("0.0 FPS | 0 kbps | 0 ms")
         self.lbl_metrics.setStyleSheet("color: #94A3B8; background-color: rgba(15, 23, 42, 0.85); padding: 3px 8px; border-radius: 4px; font-size: 10px; font-family: monospace;")
         bottom_bar.addWidget(self.lbl_metrics)
+
+        # Aviso temporário (ex.: sub-stream indisponível)
+        self.lbl_notice = QLabel("")
+        self.lbl_notice.setStyleSheet("color: #000000; background-color: rgba(245, 158, 11, 0.95); padding: 3px 8px; border-radius: 4px; font-size: 10px; font-weight: bold;")
+        self.lbl_notice.hide()
+        bottom_bar.addWidget(self.lbl_notice)
 
         bottom_bar.addStretch()
 
@@ -331,6 +337,7 @@ class CameraViewWidget(QFrame):
         self.worker.state_changed.connect(self._on_state_changed)
         self.worker.snapshot_saved.connect(self._on_snapshot_saved)
         self.worker.motion_detected.connect(self._on_motion_detected)
+        self.worker.stream_variant.connect(self._on_stream_variant)
         self.worker.start()
 
     def set_selected(self, selected: bool):
@@ -403,12 +410,29 @@ class CameraViewWidget(QFrame):
             return
         new_pref = not self.worker.prefer_substream
         self.worker.set_prefer_substream(new_pref)
-        self.btn_stream_profile.setText("SD" if new_pref else "HD")
+        # O rótulo só muda quando o novo stream conectar (_on_stream_variant)
+        self.btn_stream_profile.setText("…")
+        self.btn_stream_profile.setToolTip("Trocando de stream...")
+
+    def _on_stream_variant(self, substream_active: bool, substream_requested: bool):
+        """Mostra o stream que de fato conectou; avisa se o sub-stream pedido não estava disponível."""
+        self.btn_stream_profile.setText("SD" if substream_active else "HD")
         self.btn_stream_profile.setStyleSheet(
             "background-color: rgba(245, 158, 11, 0.9); color: #000000; font-weight: bold; border-radius: 4px; border: none;"
-            if new_pref else
+            if substream_active else
             "background-color: rgba(30, 41, 59, 0.9); border: 1px solid #475569; color: #38BDF8; font-weight: 700; border-radius: 4px;"
         )
+        if substream_requested and not substream_active:
+            msg = "Sub-stream indisponível — exibindo o stream principal (HD)"
+            self.btn_stream_profile.setToolTip(msg)
+            self._show_notice(msg)
+        else:
+            self.btn_stream_profile.setToolTip("Alternar entre Stream Principal (HD/4K) e Sub-Stream (SD/Baixa Banda)")
+
+    def _show_notice(self, text: str, duration_ms: int = 6000):
+        self.lbl_notice.setText(text)
+        self.lbl_notice.show()
+        QTimer.singleShot(duration_ms, self.lbl_notice.hide)
 
     def _on_state_changed(self, state: ConnectionState, message: str):
         """Atualiza a indicação visual de conexão."""
@@ -497,7 +521,8 @@ class CameraViewWidget(QFrame):
         if self.worker:
             w = self.worker
             self.worker = None
-            for worker_signal in (w.frame_received, w.stats_updated, w.state_changed, w.snapshot_saved, w.motion_detected):
+            for worker_signal in (w.frame_received, w.stats_updated, w.state_changed, w.snapshot_saved,
+                                  w.motion_detected, w.stream_variant):
                 try:
                     worker_signal.disconnect()
                 except (RuntimeError, TypeError):

@@ -124,6 +124,7 @@ class StreamOutcome(Enum):
     AUTH_FAILED = "auth_failed"       # credenciais recusadas (RTSP 401)
     ENDED = "ended"                   # transmitiu e terminou (câmera fechou, queda no meio)
     STOPPED = "stopped"               # parada pedida pela aplicação
+    RESTART = "restart"               # troca HD/SD pedida: reconectar já, sem espera (Issue #26)
 
 
 def _pyav_socket_timeout_option() -> Dict[str, str]:
@@ -170,6 +171,8 @@ class StreamWorker(QThread):
     state_changed = Signal(object, str)  # (ConnectionState, message)
     snapshot_saved = Signal(str)  # filepath
     motion_detected = Signal(str, bool)  # (camera_id, is_motion)
+    # (sub-stream em uso, sub-stream pedido): emitido quando a transmissão começa (Issue #26)
+    stream_variant = Signal(bool, bool)
 
     def __init__(
         self,
@@ -194,6 +197,8 @@ class StreamWorker(QThread):
         self._is_running = False
         self._stop_requested = False
         self._connected_once = False
+        self._switch_requested = False
+        self._current_url = ""
         self._is_paused = False
         self._request_snapshot: Optional[str] = None
         self._is_recording = False
@@ -231,9 +236,24 @@ class StreamWorker(QThread):
         self._is_paused = False
 
     def set_prefer_substream(self, prefer: bool):
-        """Alterna a preferência de stream (MainStream vs SubStream) e reinicia a conexão se necessário."""
+        """
+        Alterna a preferência de stream (MainStream vs SubStream) e reconecta com a nova preferência:
+        o stream atual é encerrado e a lista de URLs candidatas é recalculada (Issue #26).
+        """
         if self.prefer_substream != prefer:
             self.prefer_substream = prefer
+            # O caminho memorizado era o da preferência anterior
+            self.camera.resolved_stream = None
+            self._switch_requested = True
+
+    def _keep_reading(self) -> bool:
+        return self._is_running and not self._switch_requested
+
+    def _announce_streaming(self, message: str):
+        """Estado AO VIVO + qual stream de fato conectou (o rótulo HD/SD segue este sinal)."""
+        self.state_changed.emit(ConnectionState.STREAMING, message)
+        is_sub = bool(self._current_url) and self._current_url == self.camera.get_substream_url()
+        self.stream_variant.emit(is_sub, self.prefer_substream)
 
     def take_snapshot(self, output_path: str):
         """Solicita a gravação do próximo frame como imagem no disco."""
@@ -288,6 +308,11 @@ class StreamWorker(QThread):
             outcome = self._connect_once()
             if not self._is_running or outcome == StreamOutcome.STOPPED:
                 break
+
+            if outcome == StreamOutcome.RESTART or self._switch_requested:
+                self._switch_requested = False
+                self.state_changed.emit(ConnectionState.CONNECTING, "Trocando de stream (HD/SD)...")
+                continue
 
             if outcome == StreamOutcome.AUTH_FAILED:
                 # Repetir só aumentaria o risco de bloqueio por tentativas na câmera
@@ -351,6 +376,7 @@ class StreamWorker(QThread):
             f"Conectando RTSP {backend_name} ({self.camera.name}) via {self.stats.transport_mode}: "
             f"{sanitize_rtsp_url(url)}"
         )
+        self._current_url = url
         outcome = runner(url, transport=transport)
         if outcome == StreamOutcome.ENDED or (outcome == StreamOutcome.STOPPED and self._connected_once):
             self.camera.resolved_stream = (backend_name, url, transport)
@@ -399,18 +425,18 @@ class StreamWorker(QThread):
 
             vaapi_ok = (self.hw_accel == "vaapi" and is_vaapi_supported())
             self.stats.hw_accel_active = vaapi_ok
-            self.state_changed.emit(ConnectionState.STREAMING, f"Ao Vivo ({self.stats.codec} {self.stats.transport_mode})")
+            self._announce_streaming(f"Ao Vivo ({self.stats.codec} {self.stats.transport_mode})")
 
             self._last_frame_ts = time.time()
 
             for packet in container.demux(video_stream):
-                if not self._is_running:
+                if not self._keep_reading():
                     break
 
                 self._bytes_count += packet.size or 0
 
                 for frame in packet.decode():
-                    if not self._is_running:
+                    if not self._keep_reading():
                         break
 
                     now = time.time()
@@ -474,10 +500,10 @@ class StreamWorker(QThread):
             else:
                 self.stats.codec = VideoCodec.H264.value
 
-            self.state_changed.emit(ConnectionState.STREAMING, f"Ao Vivo (OpenCV {self.stats.transport_mode})")
+            self._announce_streaming(f"Ao Vivo (OpenCV {self.stats.transport_mode})")
             self._last_frame_ts = time.time()
 
-            while self._is_running:
+            while self._keep_reading():
                 ret, frame = cap.read()
                 if not ret:
                     break
@@ -514,6 +540,8 @@ class StreamWorker(QThread):
         """Fim do laço de leitura: parada pedida, queda depois de transmitir, ou nunca transmitiu."""
         if not self._is_running:
             return StreamOutcome.STOPPED
+        if self._switch_requested:
+            return StreamOutcome.RESTART
         return StreamOutcome.ENDED if frames_seen > 0 else StreamOutcome.NOT_CONNECTED
 
     def _run_test_pattern_stream(self):
