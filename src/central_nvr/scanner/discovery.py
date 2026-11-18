@@ -2,7 +2,7 @@
 Módulo de Descoberta de Rede para Câmeras IP e NVRs.
 Implementa WS-Discovery via UDP Multicast (239.255.255.250:3702) e sondagem rápida de portas.
 """
-import concurrent.futures
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import logging
 import select
 import socket
@@ -58,7 +58,7 @@ class NetworkScanner:
         self._discovered_devices: Dict[str, Dict[str, Any]] = {}
         self._discovered_ips: set = set()
         self._lock = threading.Lock()
-        self._executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
+        self._executor: Optional[ThreadPoolExecutor] = None
         self.warnings: List[str] = []
 
     @property
@@ -245,12 +245,12 @@ class NetworkScanner:
                     device_info["rtsp_port"] = 554
                 self._register(device_info, on_device_found)
 
-        executor = concurrent.futures.ThreadPoolExecutor(max_workers=32)
+        executor = ThreadPoolExecutor(max_workers=32)
         self._executor = executor
         try:
             futures = [executor.submit(probe_target, ip) for ip in hosts]
             completed = 0
-            for future in concurrent.futures.as_completed(futures):
+            for future in as_completed(futures):
                 if self._stop_requested:
                     break
                 completed += 1
