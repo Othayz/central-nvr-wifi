@@ -64,7 +64,7 @@ except ImportError:
         def copy(self):
             return self
 
-from central_nvr.core.camera import CameraDevice, ConnectionState, StreamStats
+from central_nvr.core.camera import DEFAULT_RTSP_TRANSPORT, CameraDevice, ConnectionState, StreamStats
 
 logger = logging.getLogger(__name__)
 
@@ -181,17 +181,20 @@ class StreamWorker(QThread):
         self,
         camera: CameraDevice,
         hw_accel: str = "vaapi",
-        rtsp_transport: str = "auto",
+        rtsp_transport: str = DEFAULT_RTSP_TRANSPORT,
         buffer_size_ms: int = 150,
         prefer_substream: bool = False,
         reconnect_interval_sec: float = 3.0,
         auto_reconnect: bool = True,
+        motion_detection: bool = True,
         parent: Optional[QObject] = None,
     ):
         super().__init__(parent)
         self.camera = camera
         self.hw_accel = hw_accel
-        self.rtsp_transport = rtsp_transport or getattr(camera, "rtsp_transport", "auto")
+        self.rtsp_transport = rtsp_transport or getattr(camera, "rtsp_transport", DEFAULT_RTSP_TRANSPORT)
+        # Lido a cada frame: pode ser alterado com o stream aberto (Issue #34)
+        self.motion_detection = bool(motion_detection)
         self.buffer_size_ms = buffer_size_ms
         self.prefer_substream = prefer_substream
         self.reconnect_interval_sec = max(0.5, float(reconnect_interval_sec or 3.0))
@@ -328,7 +331,7 @@ class StreamWorker(QThread):
             time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
 
     def _transports(self) -> List[str]:
-        user_transport = (self.rtsp_transport or "auto").lower()
+        user_transport = (self.rtsp_transport or DEFAULT_RTSP_TRANSPORT).lower()
         return ["tcp", "udp"] if user_transport == "tcp" else ["udp", "tcp"]
 
     def _backends(self) -> List[Tuple[str, Callable[..., StreamOutcome]]]:
@@ -439,7 +442,7 @@ class StreamWorker(QThread):
     def _transport_label(self, backend_name: str, transport: str) -> str:
         if backend_name == "OpenCV":
             return TransportMode.OPENCV_UDP.value if transport == "udp" else TransportMode.OPENCV_TCP.value
-        if (self.rtsp_transport or "auto").lower() == "auto":
+        if (self.rtsp_transport or DEFAULT_RTSP_TRANSPORT).lower() == "auto":
             return TransportMode.AUTO_UDP.value if transport == "udp" else TransportMode.AUTO_TCP_FALLBACK.value
         return TransportMode.UDP.value if transport == "udp" else TransportMode.TCP.value
 
@@ -736,6 +739,13 @@ class StreamWorker(QThread):
     def _evaluate_motion(self, rgb_array: Any, width: int, height: int):
         """Avalia variação entre frames em sub-amostragem (64x36) para detecção de movimento eficiente."""
         if not HAS_NUMPY or rgb_array is None:
+            return
+        if not self.motion_detection:
+            if self._motion_active:
+                self._motion_active = False
+                self._motion_cooldown = 0
+                self.motion_detected.emit(self.camera.id, False)
+            self._prev_sample_matrix = None
             return
 
         self._motion_eval_counter += 1

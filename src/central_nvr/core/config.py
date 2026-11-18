@@ -7,6 +7,8 @@ import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from central_nvr.core.camera import DEFAULT_RTSP_TRANSPORT
+
 try:
     import keyring
     HAS_KEYRING = True
@@ -187,8 +189,9 @@ class ConfigManager:
         "theme": "dark",
         "grid_layout": "auto",  # 1x1, 2x2, 3x3, 4x4
         "hw_accel": "vaapi",   # vaapi, auto, cpu, cuda
-        "rtsp_transport": "tcp", # tcp ou udp
+        "rtsp_transport": DEFAULT_RTSP_TRANSPORT,  # tcp, udp ou auto
         "buffer_size_ms": 150,
+        "enable_motion_detection": True,
         "auto_reconnect": True,
         "reconnect_interval_sec": 5,
         "hidden_camera_timeout_min": 5,
@@ -298,6 +301,16 @@ class ConfigManager:
             if kr_pat:
                 return kr_pat
         return self.settings.get(key, default)
+
+    def update(self, values: Dict[str, Any]):
+        """Atualiza várias chaves e grava settings.json uma única vez (Issue #34)."""
+        for key, value in values.items():
+            if key == "github_token" and is_keyring_available():
+                set_keyring_pat(str(value or "").strip())
+                self.settings["github_token"] = ""
+            else:
+                self.settings[key] = value
+        self.save_settings()
 
     def set(self, key: str, value: Any):
         if key == "github_token":

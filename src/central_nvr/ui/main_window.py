@@ -32,11 +32,12 @@ from PySide6.QtWidgets import (
 )
 
 from central_nvr import __version__
-from central_nvr.core.camera import CameraDevice
+from central_nvr.core.camera import DEFAULT_RTSP_TRANSPORT, CameraDevice
 from central_nvr.core.config import ConfigManager, get_data_dir
 from central_nvr.ui.camera_grid import CameraGridWidget
 from central_nvr.ui.discovery_dialog import DiscoveryDialog
 from central_nvr.ui.playback_view import PlaybackWidget
+from central_nvr.ui.camera_view import ViewOptions
 from central_nvr.ui.ptz_controller import PTZControllerWidget
 from central_nvr.ui.settings_dialog import SettingsDialog
 from central_nvr.ui.styles import DARK_THEME_QSS, LIGHT_THEME_QSS, get_theme_qss
@@ -110,11 +111,12 @@ class MainWindow(QMainWindow):
 
         # Grid Multi-Câmeras
         hw_accel = self.config_mgr.get("hw_accel", "vaapi")
-        rtsp_transport = self.config_mgr.get("rtsp_transport", "tcp")
+        rtsp_transport = self.config_mgr.get("rtsp_transport", DEFAULT_RTSP_TRANSPORT)
         self.camera_grid = CameraGridWidget(
             hw_accel=hw_accel,
             rtsp_transport=rtsp_transport,
             hidden_timeout_min=float(self.config_mgr.get("hidden_camera_timeout_min", 5)),
+            view_options=ViewOptions.from_config(self.config_mgr),
             parent=self,
         )
         self.camera_grid.camera_selected.connect(self._on_camera_selected)
@@ -692,7 +694,12 @@ class MainWindow(QMainWindow):
         super().keyPressEvent(event)
 
     def _open_discovery_dialog(self):
-        dialog = DiscoveryDialog(parent=self, default_username=self.config_mgr.get("default_username", ""))
+        dialog = DiscoveryDialog(
+            parent=self,
+            default_username=self.config_mgr.get("default_username", ""),
+            discovery_timeout=float(self.config_mgr.get("ws_discovery_timeout", 3.0)),
+            enable_port_scan=bool(self.config_mgr.get("enable_port_scan", True)),
+        )
         dialog.device_added.connect(self._add_discovered_camera)
         dialog.exec()
 
@@ -736,26 +743,29 @@ class MainWindow(QMainWindow):
             hw_accel = self.config_mgr.get("hw_accel", "vaapi")
             self.lbl_sb_hw.setText(f"Aceleração: {hw_accel.upper()} (Ativo)")
             self.camera_grid.hw_accel = hw_accel
-            self.camera_grid.rtsp_transport = self.config_mgr.get("rtsp_transport", "auto")
+            self.camera_grid.rtsp_transport = self.config_mgr.get("rtsp_transport", DEFAULT_RTSP_TRANSPORT)
             self.camera_grid.set_hidden_timeout(float(self.config_mgr.get("hidden_camera_timeout_min", 5)))
+            self.camera_grid.set_view_options(ViewOptions.from_config(self.config_mgr))
+            # Só reabre os streams cujas opções de conexão mudaram (transporte, GPU, buffer)
             self.camera_grid.set_cameras(self.cameras)
+            self._reconfigure_periodic_update_checker()
 
 
     def _setup_periodic_update_checker(self):
-        """Configura a verificação periódica em segundo plano (a cada 10 minutos)."""
+        """Configura a verificação periódica em segundo plano."""
         self._notified_version: Optional[str] = None
         self._periodic_worker: Optional[UpdateCheckWorker] = None
-        
-        enabled = self.config_mgr.get("periodic_update_check", True)
-        if not enabled:
-            return
-
-        interval_min = self.config_mgr.get("periodic_update_interval_min", 10)
-        interval_ms = max(1, interval_min) * 60 * 1000
-
         self.update_periodic_timer = QTimer(self)
         self.update_periodic_timer.timeout.connect(self._run_background_update_check)
-        self.update_periodic_timer.start(interval_ms)
+        self._reconfigure_periodic_update_checker()
+
+    def _reconfigure_periodic_update_checker(self):
+        """Aplica periodic_update_check / periodic_update_interval_min sem reiniciar o app (Issue #34)."""
+        self.update_periodic_timer.stop()
+        if not self.config_mgr.get("periodic_update_check", True):
+            return
+        interval_min = self.config_mgr.get("periodic_update_interval_min", 10)
+        self.update_periodic_timer.start(max(1, int(interval_min)) * 60 * 1000)
         logger.debug(f"Verificação periódica de atualizações ativa (intervalo: {interval_min} min).")
 
     def _run_background_update_check(self):
@@ -794,7 +804,7 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         """Encerra threads de forma graciosa ao fechar a janela."""
-        if hasattr(self, "update_periodic_timer") and self.update_periodic_timer.isActive():
+        if self.update_periodic_timer.isActive():
             self.update_periodic_timer.stop()
 
         # Nenhuma espera aqui: as threads de streaming são aposentadas (retire_thread) e as demais

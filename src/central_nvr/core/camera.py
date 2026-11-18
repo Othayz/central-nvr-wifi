@@ -8,6 +8,11 @@ import urllib.parse
 from typing import Optional, Dict, Any, List, Tuple
 
 
+# Padrão único de transporte RTSP (Issue #34): TCP é mais previsível em Wi-Fi, onde UDP perde
+# pacotes e gera artefatos na imagem
+DEFAULT_RTSP_TRANSPORT = "tcp"
+
+
 class ConnectionState(Enum):
     DISCONNECTED = "Desconectado"
     CONNECTING = "Conectando..."
@@ -55,7 +60,7 @@ class CameraDevice:
     has_events: bool = False
     has_edge_storage: bool = False
     edge_recordings_count: int = 0
-    rtsp_transport: str = "auto"  # "auto", "tcp", "udp"
+    rtsp_transport: str = DEFAULT_RTSP_TRANSPORT  # "auto", "tcp", "udp"
     enabled: bool = True
     grid_slot: int = 0
     
@@ -250,7 +255,7 @@ class CameraDevice:
             has_ptz=data.get("has_ptz", False),
             has_events=data.get("has_events", False),
             has_edge_storage=data.get("has_edge_storage", False),
-            rtsp_transport=data.get("rtsp_transport", "auto"),
+            rtsp_transport=data.get("rtsp_transport", DEFAULT_RTSP_TRANSPORT),
             enabled=data.get("enabled", True),
             grid_slot=data.get("grid_slot", 0),
         )

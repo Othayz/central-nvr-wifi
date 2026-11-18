@@ -25,8 +25,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from central_nvr.core.camera import CameraDevice
-from central_nvr.ui.camera_view import CameraViewWidget
+from central_nvr.core.camera import DEFAULT_RTSP_TRANSPORT, CameraDevice
+from central_nvr.ui.camera_view import CameraViewWidget, ViewOptions
 
 
 class EmptySlotWidget(QFrame):
@@ -119,14 +119,16 @@ class CameraGridWidget(QWidget):
     def __init__(
         self,
         hw_accel: str = "vaapi",
-        rtsp_transport: str = "auto",
+        rtsp_transport: str = DEFAULT_RTSP_TRANSPORT,
         hidden_timeout_min: float = 5.0,
+        view_options: Optional[ViewOptions] = None,
         parent: Optional[QWidget] = None,
     ):
         super().__init__(parent)
         self.hw_accel = hw_accel
         self.rtsp_transport = rtsp_transport
         self.hidden_timeout_min = hidden_timeout_min
+        self.view_options = view_options or ViewOptions()
         
         self.grid_layout_mode = "auto"  # "auto", "1x1", "2x2", "3x3"
         self.previous_grid_mode = "auto"
@@ -190,6 +192,8 @@ class CameraGridWidget(QWidget):
                 del previous_views[cam.id]
                 if view.camera.name != cam.name:
                     view.update_camera_name(cam.name)
+                if view.options != self.view_options:
+                    view.apply_options(self.view_options)
             else:
                 view = self._create_view(cam)
             self.camera_views[cam.id] = view
@@ -213,6 +217,7 @@ class CameraGridWidget(QWidget):
             view.camera.stream_settings() == camera.stream_settings()
             and view.hw_accel == self.hw_accel
             and view.rtsp_transport == self.rtsp_transport
+            and view.options.buffer_size_ms == self.view_options.buffer_size_ms
         )
 
     def _create_view(self, camera: CameraDevice) -> CameraViewWidget:
@@ -221,6 +226,7 @@ class CameraGridWidget(QWidget):
             hw_accel=self.hw_accel,
             rtsp_transport=self.rtsp_transport,
             hidden_timeout_min=self.hidden_timeout_min,
+            options=self.view_options,
             parent=self,
         )
         view.selected.connect(self._on_camera_selected)
@@ -327,6 +333,10 @@ class CameraGridWidget(QWidget):
     def _sync_on_screen(self):
         for view in self.camera_views.values():
             view.set_on_screen(not view.isHidden())
+
+    def set_view_options(self, options: ViewOptions):
+        """Novas opções de Configurações; o buffer só vale após set_cameras() reabrir os streams."""
+        self.view_options = options
 
     def set_hidden_timeout(self, minutes: float):
         self.hidden_timeout_min = minutes

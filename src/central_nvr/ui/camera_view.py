@@ -6,6 +6,8 @@ import html
 import os
 import re
 import time
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 
 from PySide6.QtCore import QPoint, QRect, QSize, Qt, QTimer, Signal
@@ -21,9 +23,41 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from central_nvr.core.camera import CameraDevice, ConnectionState, StreamStats
+from central_nvr.core.camera import DEFAULT_RTSP_TRANSPORT, CameraDevice, ConnectionState, StreamStats
 from central_nvr.core.stream_worker import StreamWorker
 from central_nvr.core.threads import retire_thread
+
+
+@dataclass(frozen=True)
+class ViewOptions:
+    """Opções de Configurações aplicadas às views de câmera (Issue #34)."""
+    buffer_size_ms: int = 150
+    motion_detection: bool = True
+    reconnect_interval_sec: float = 5.0
+    auto_reconnect: bool = True
+    snapshot_dir: str = ""
+    show_osd_fps: bool = True
+    show_osd_bitrate: bool = True
+    show_osd_timestamp: bool = True
+
+    @classmethod
+    def from_config(cls, config) -> "ViewOptions":
+        return cls(
+            buffer_size_ms=int(config.get("buffer_size_ms", 150)),
+            motion_detection=bool(config.get("enable_motion_detection", True)),
+            reconnect_interval_sec=float(config.get("reconnect_interval_sec", 5)),
+            auto_reconnect=bool(config.get("auto_reconnect", True)),
+            snapshot_dir=str(config.get("snapshot_dir", "") or ""),
+            show_osd_fps=bool(config.get("show_osd_fps", True)),
+            show_osd_bitrate=bool(config.get("show_osd_bitrate", True)),
+            show_osd_timestamp=bool(config.get("show_osd_timestamp", True)),
+        )
+
+    def resolved_snapshot_dir(self) -> Path:
+        if self.snapshot_dir:
+            return Path(self.snapshot_dir).expanduser()
+        from central_nvr.core.config import get_data_dir
+        return get_data_dir() / "snapshots"
 
 
 class CameraViewWidget(QFrame):
@@ -43,14 +77,16 @@ class CameraViewWidget(QFrame):
         self,
         camera: CameraDevice,
         hw_accel: str = "vaapi",
-        rtsp_transport: str = "tcp",
+        rtsp_transport: str = DEFAULT_RTSP_TRANSPORT,
         hidden_timeout_min: float = 5.0,
+        options: Optional[ViewOptions] = None,
         parent: Optional[QWidget] = None,
     ):
         super().__init__(parent)
         self.camera = camera
         self.hw_accel = hw_accel
         self.rtsp_transport = rtsp_transport
+        self.options = options or ViewOptions()
 
         # Perfil de stream escolhido pela grade (Issue #47) e escolha manual pelo botão HD/SD,
         # que prevalece até a próxima troca de layout
@@ -329,7 +365,9 @@ class CameraViewWidget(QFrame):
         """Abre uma janela 100% tela cheia exclusiva apenas com o vídeo da câmera (sem menus/barras do programa)."""
         from central_nvr.ui.fullscreen_view import FullscreenPlayerWindow
         if not hasattr(self, "_fullscreen_win") or self._fullscreen_win is None:
-            self._fullscreen_win = FullscreenPlayerWindow(camera=self.camera, parent=None)
+            self._fullscreen_win = FullscreenPlayerWindow(
+                camera=self.camera, snapshot_dir=self.options.resolved_snapshot_dir(), parent=None
+            )
             self._fullscreen_win.closed.connect(self._on_fullscreen_closed)
         # Tela cheia de uma câmera: stream principal em resolução original (Issue #47)
         if self.worker and not self._manual_override:
@@ -402,6 +440,20 @@ class CameraViewWidget(QFrame):
         if frame is not None:
             self._on_frame_received(frame)
 
+    def apply_options(self, options: ViewOptions):
+        """
+        Aplica opções de Configurações sem reabrir o stream: detecção de movimento, reconexão,
+        OSD e pasta de fotos valem na hora (o buffer exige reconexão, decidida pela grade).
+        """
+        self.options = options
+        if self.worker:
+            self.worker.motion_detection = options.motion_detection
+            self.worker.reconnect_interval_sec = max(0.5, float(options.reconnect_interval_sec))
+            self.worker.auto_reconnect = options.auto_reconnect
+        if not options.motion_detection and hasattr(self, "lbl_motion"):
+            self.lbl_motion.hide()
+        self._render_metrics()
+
     # ------------------------------------------------------------------
     # Perfil de stream automático (Issue #47)
     # ------------------------------------------------------------------
@@ -441,7 +493,11 @@ class CameraViewWidget(QFrame):
             camera=self.camera,
             hw_accel=self.hw_accel,
             rtsp_transport=self.rtsp_transport,
+            buffer_size_ms=self.options.buffer_size_ms,
             prefer_substream=prefer_sub,
+            reconnect_interval_sec=self.options.reconnect_interval_sec,
+            auto_reconnect=self.options.auto_reconnect,
+            motion_detection=self.options.motion_detection,
             parent=self,
         )
         self._suspended = False
@@ -494,14 +550,27 @@ class CameraViewWidget(QFrame):
     def _on_stats_updated(self, stats: StreamStats):
         """Atualiza a exibição de FPS, Bitrate, Codec e QoS no OSD."""
         self.stats = stats
-        codec_str = stats.codec if stats.codec else "H.264"
-        jitter_str = f" | Jitter: {stats.jitter_ms}ms" if stats.jitter_ms > 0 else ""
-        self.lbl_metrics.setText(f"{stats.fps} FPS | {int(stats.bitrate_kbps)} kbps | {codec_str}{jitter_str}")
+        self._render_metrics()
+
+    def _render_metrics(self):
+        """Monta o OSD conforme show_osd_fps / show_osd_bitrate / show_osd_timestamp."""
+        stats = self.stats
+        parts = []
+        if self.options.show_osd_timestamp:
+            parts.append(datetime.datetime.now().strftime("%H:%M:%S"))
+        if self.options.show_osd_fps:
+            parts.append(f"{stats.fps} FPS")
+        if self.options.show_osd_bitrate:
+            parts.append(f"{int(stats.bitrate_kbps)} kbps")
+        parts.append(stats.codec if stats.codec else "H.264")
+        if stats.jitter_ms > 0:
+            parts.append(f"Jitter: {stats.jitter_ms}ms")
+        self.lbl_metrics.setText(" | ".join(parts))
 
     def _on_motion_detected(self, camera_id: str, is_detected: bool):
         """Atualiza o alerta visual de detecção de movimento em tempo real."""
         if hasattr(self, "lbl_motion"):
-            if is_detected:
+            if is_detected and self.options.motion_detection:
                 self.lbl_motion.show()
                 if not self.is_selected:
                     self.setStyleSheet("""
@@ -577,8 +646,11 @@ class CameraViewWidget(QFrame):
 
     def _take_snapshot(self):
         """Dispara a captura de foto do frame atual sanitizando o ID da câmera contra Path Traversal."""
-        from central_nvr.core.config import get_data_dir
-        snap_dir = get_data_dir() / "snapshots"
+        snap_dir = self.options.resolved_snapshot_dir()
+        try:
+            snap_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         safe_id = re.sub(r'[^a-zA-Z0-9_-]', '_', str(self.camera.id))
         filename = f"snap_{safe_id}_{ts}.jpg"

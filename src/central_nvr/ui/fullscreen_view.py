@@ -35,9 +35,10 @@ class FullscreenPlayerWindow(QWidget):
     - Pressione S para tirar foto/snapshot instantâneo do fluxo ao vivo.
     """
 
-    def __init__(self, camera: CameraDevice, parent: Optional[QWidget] = None):
+    def __init__(self, camera: CameraDevice, snapshot_dir: Optional[Path] = None, parent: Optional[QWidget] = None):
         super().__init__(parent, Qt.WindowType.Window | Qt.WindowType.FramelessWindowHint)
         self.camera = camera
+        self.snapshot_dir = Path(snapshot_dir) if snapshot_dir else get_data_dir() / "snapshots"
         self.current_frame: Optional[QImage] = None
         self.fps: float = 0.0
         self.bitrate_kbps: float = 0.0
@@ -259,7 +260,7 @@ class FullscreenPlayerWindow(QWidget):
     def _take_snapshot(self):
         """Salva snapshot direto do frame atual em alta qualidade com sanitização contra Path Traversal."""
         if self.current_frame and not self.current_frame.isNull():
-            snap_dir = get_data_dir() / "snapshots"
+            snap_dir = self.snapshot_dir
             snap_dir.mkdir(parents=True, exist_ok=True)
             ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
             safe_id = re.sub(r'[^a-zA-Z0-9_-]', '_', str(self.camera.id))

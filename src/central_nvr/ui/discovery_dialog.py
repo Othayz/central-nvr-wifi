@@ -92,8 +92,12 @@ class DiscoveryDialog(QDialog):
 
     device_added = Signal(object)  # CameraDevice
 
-    def __init__(self, parent: Optional[QWidget] = None, default_username: str = ""):
+    def __init__(self, parent: Optional[QWidget] = None, default_username: str = "",
+                 discovery_timeout: float = 4.0, enable_port_scan: bool = True):
         super().__init__(parent)
+        # Configurações ws_discovery_timeout / enable_port_scan (Issue #34)
+        self.discovery_timeout = float(discovery_timeout)
+        self.default_port_scan = bool(enable_port_scan)
         # Configuração `default_username`; "admin" se o usuário nunca a definiu
         self.default_username = default_username or "admin"
         self.setWindowTitle("Gerenciamento de Dispositivos e Descoberta de Rede")
@@ -126,7 +130,7 @@ class DiscoveryDialog(QDialog):
         ctrl_layout.addWidget(self.btn_scan)
 
         self.chk_port_scan = QCheckBox("Sondagem de Portas RTSP/HTTP")
-        self.chk_port_scan.setChecked(True)
+        self.chk_port_scan.setChecked(self.default_port_scan)
         ctrl_layout.addWidget(self.chk_port_scan)
 
         ctrl_layout.addStretch()
@@ -274,7 +278,7 @@ class DiscoveryDialog(QDialog):
         self.btn_scan.setText("⏹ Cancelar Varredura")
 
         self.worker = ScannerWorker(
-            timeout=4.0,
+            timeout=self.discovery_timeout,
             enable_port_scan=self.chk_port_scan.isChecked(),
             parent=self,
         )
