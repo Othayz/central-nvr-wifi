@@ -334,6 +334,9 @@ class MainWindow(QMainWindow):
         # =====================================================================
         self.ptz_panel = PTZControllerWidget(parent=self)
         self.ptz_panel.command_executed.connect(self._log_event)
+        self.ptz_panel.command_failed.connect(
+            lambda cname, msg: self._log_event(f"PTZ (falha) {cname}", msg)
+        )
         self.sidebar_tabs.addTab(self.ptz_panel, "Controle PTZ")
 
         # =====================================================================
@@ -787,4 +790,5 @@ class MainWindow(QMainWindow):
         # Nenhuma espera aqui: as threads de streaming são aposentadas (retire_thread) e as demais
         # threads filhas desta janela são tratadas no encerramento do processo (app.main).
         self.camera_grid.stop_all()
+        self.ptz_panel.shutdown()
         super().closeEvent(event)

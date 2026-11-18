@@ -517,12 +517,15 @@ class OnvifClient:
         tilt_speed: float = 0.0,
         zoom_speed: float = 0.0,
         profile_token: Optional[str] = None,
+        timeout_sec: int = 2,
     ) -> bool:
         """
         Executa movimento contínuo PTZ com token escapado.
         pan_speed: -1.0 (Esquerda) a 1.0 (Direita)
         tilt_speed: -1.0 (Abaixo) a 1.0 (Acima)
         zoom_speed: -1.0 (Zoom Out) a 1.0 (Zoom In)
+        timeout_sec: a câmera para sozinha após esse tempo se o Stop se perder; quem mantém o
+        movimento deve reenviar o comando antes de expirar.
         """
         token = profile_token or self.active_profile_token
         if not token and self.profiles:
@@ -540,6 +543,7 @@ class OnvifClient:
             <tptz:Velocity>
                 {velocity_elements}
             </tptz:Velocity>
+            <tptz:Timeout>PT{int(timeout_sec)}S</tptz:Timeout>
         </tptz:ContinuousMove>"""
 
         xml_resp = self._send_soap_request(self.ptz_service_url, body)
