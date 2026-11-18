@@ -52,7 +52,8 @@ Central NVR Wifi/
 │   ├── AppRun                          # Launcher portátil com Host Delegation para VA-API
 │   ├── central-nvr-launcher.sh         # Launcher instalado em usr/bin/central-nvr dentro do AppDir
 │   └── build_appimage.sh               # Script de geração do pacote AppImage universal
-├── requirements.txt                    # Dependências do Python
+├── requirements.txt                    # Dependências do Python (desenvolvimento)
+├── requirements.lock                   # Versões e hashes fixos usados no build de release
 ├── pyproject.toml                      # Metadados de empacotamento Python (PEP 517/621)
 └── README.md                           # Documentação do projeto
 ```
@@ -119,6 +120,14 @@ chmod +x packaging/build_appimage.sh
 ./packaging/build_appimage.sh
 ```
 O pacote será gerado em `dist/Central_NVR_WiFi-<versão>-x86_64.AppImage`.
+
+O build confere o SHA-256 de tudo o que baixa (runtime CPython e `appimagetool`, com versões fixas no
+script) e instala as dependências Python de `requirements.lock` com `--require-hashes`. Para atualizar
+o lockfile depois de mudar as dependências em `pyproject.toml` (o Dependabot abre PRs semanais):
+```bash
+pip install pip-tools
+pip-compile --generate-hashes --strip-extras --no-emit-index-url --output-file requirements.lock pyproject.toml
+```
 
 ### Executando o AppImage
 Basta conceder permissão de execução e rodar:

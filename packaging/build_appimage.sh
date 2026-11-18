@@ -12,10 +12,29 @@ APPDIR="${BUILD_DIR}/Central_NVR_WiFi.AppDir"
 DIST_DIR="${PROJECT_ROOT}/dist"
 VERSION=$(grep -m1 'version = ' "${PROJECT_ROOT}/pyproject.toml" | cut -d '"' -f 2)
 
+# Downloads com versão e SHA-256 fixos (Issue #20): o build falha se o arquivo baixado divergir.
+# CPython: hash publicado no SHA256SUMS da release do python-build-standalone.
 PYTHON_STANDALONE_TAG="20261026"
 PYTHON_TARBALL="cpython-3.12.16+20261026-x86_64-unknown-linux-gnu-install_only.tar.gz"
 PYTHON_URL="https://github.com/astral-sh/python-build-standalone/releases/download/${PYTHON_STANDALONE_TAG}/${PYTHON_TARBALL}"
-APPIMAGETOOL_URL="https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage"
+PYTHON_SHA256="6a79e922e50006b601f29e688407659da1c2b86ebcd4e9c7254cf234be8b89de"
+# appimagetool: release com tag fixa (o runtime dela é embutido em todo AppImage gerado).
+# Hash calculado do asset da release 1.9.1 (a release não publica checksum próprio).
+APPIMAGETOOL_VERSION="1.9.1"
+APPIMAGETOOL_URL="https://github.com/AppImage/appimagetool/releases/download/${APPIMAGETOOL_VERSION}/appimagetool-x86_64.AppImage"
+APPIMAGETOOL_SHA256="ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0"
+
+# Confere o SHA-256 de um arquivo baixado; remove o arquivo e aborta se divergir
+verify_sha256() {
+    local file="$1" expected="$2"
+    if ! echo "${expected}  ${file}" | sha256sum -c --status -; then
+        echo "===> [ERRO] SHA-256 divergente para $(basename "${file}"). Esperado: ${expected}"
+        echo "            Obtido:   $(sha256sum "${file}" | cut -d ' ' -f 1)"
+        rm -f "${file}"
+        exit 1
+    fi
+    echo "     [OK] SHA-256 conferido: $(basename "${file}")"
+}
 
 export DESKTOPINTEGRATION=no
 export APPIMAGELAUNCHER_DISABLE=1
@@ -40,6 +59,7 @@ if [ ! -x "${APPDIR}/usr/bin/python3" ]; then
         echo "     Baixando ${PYTHON_TARBALL}..."
         curl -fsSL -o "${CACHE_DIR}/${PYTHON_TARBALL}" "${PYTHON_URL}"
     fi
+    verify_sha256 "${CACHE_DIR}/${PYTHON_TARBALL}" "${PYTHON_SHA256}"
     echo "     Descompactando CPython em ${APPDIR}/usr..."
     tar -xzf "${CACHE_DIR}/${PYTHON_TARBALL}" --strip-components=1 -C "${APPDIR}/usr"
 fi
@@ -57,12 +77,13 @@ if [ -d "${PROJECT_ROOT}/venv/lib/python3.12/site-packages/PySide6" ]; then
     rsync -a --exclude='pip*' --exclude='_distutils*' "${PROJECT_ROOT}/venv/lib/python3.12/site-packages/" "${SITE_PACKAGES}/"
 fi
 
-# Garantir presença de todas as dependências essenciais do requirements.txt
+# Garantir presença de todas as dependências, com versões e hashes do lockfile (Issue #20)
 echo "===> Verificando dependências completas (PySide6, av, cv2, numpy, keyring, defusedxml)..."
 if ! "${APPDIR}/usr/bin/python3" -c "import PySide6, av, cv2, numpy, keyring, defusedxml" 2>/dev/null; then
-    echo "     Instalando dependências completas do requirements.txt no ambiente embutido..."
+    echo "     Instalando dependências do requirements.lock (--require-hashes) no ambiente embutido..."
     "${APPDIR}/usr/bin/python3" -m ensurepip --default-pip 2>/dev/null || true
-    "${APPDIR}/usr/bin/python3" -m pip install --no-warn-script-location --target "${SITE_PACKAGES}" -r "${PROJECT_ROOT}/requirements.txt"
+    "${APPDIR}/usr/bin/python3" -m pip install --no-warn-script-location --require-hashes --no-deps \
+        --target "${SITE_PACKAGES}" -r "${PROJECT_ROOT}/requirements.lock"
 fi
 
 # Sanity check estrito: se os imports críticos falharem, o build DEVE falhar aqui
@@ -111,20 +132,16 @@ echo "===> Removendo caches __pycache__ e arquivos .pyc do AppDir..."
 find "${APPDIR}" -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
 find "${APPDIR}" -type f -name "*.pyc" -delete 2>/dev/null || true
 
-# 7. Obter appimagetool se não estiver instalado no sistema
-APPIMAGETOOL="${CACHE_DIR}/appimagetool-x86_64.AppImage"
-if ! command -v appimagetool &> /dev/null; then
-    if [ ! -s "${APPIMAGETOOL}" ]; then
-        echo "===> Baixando appimagetool oficial..."
-        curl -fsSL -o "${APPIMAGETOOL}" "${APPIMAGETOOL_URL}" \
-            || curl -fsSL -o "${APPIMAGETOOL}" "https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage" \
-            || rm -f "${APPIMAGETOOL}"
-        [ -s "${APPIMAGETOOL}" ] && chmod +x "${APPIMAGETOOL}" || true
-    fi
-    TOOL_CMD="${APPIMAGETOOL}"
-else
-    TOOL_CMD="appimagetool"
+# 7. Obter o appimagetool fixado (sempre o mesmo binário, conferido por SHA-256; sem fallback
+#    para outro repositório nem uso de um appimagetool qualquer instalado no sistema)
+APPIMAGETOOL="${CACHE_DIR}/appimagetool-${APPIMAGETOOL_VERSION}-x86_64.AppImage"
+if [ ! -s "${APPIMAGETOOL}" ]; then
+    echo "===> Baixando appimagetool ${APPIMAGETOOL_VERSION}..."
+    curl -fsSL -o "${APPIMAGETOOL}" "${APPIMAGETOOL_URL}"
 fi
+verify_sha256 "${APPIMAGETOOL}" "${APPIMAGETOOL_SHA256}"
+chmod +x "${APPIMAGETOOL}"
+TOOL_CMD="${APPIMAGETOOL}"
 
 OUTPUT_APPIMAGE="${DIST_DIR}/Central_NVR_WiFi-${VERSION}-x86_64.AppImage"
 
