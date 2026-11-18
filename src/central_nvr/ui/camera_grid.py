@@ -116,11 +116,13 @@ class CameraGridWidget(QWidget):
         self,
         hw_accel: str = "vaapi",
         rtsp_transport: str = "auto",
+        hidden_timeout_min: float = 5.0,
         parent: Optional[QWidget] = None,
     ):
         super().__init__(parent)
         self.hw_accel = hw_accel
         self.rtsp_transport = rtsp_transport
+        self.hidden_timeout_min = hidden_timeout_min
         
         self.grid_layout_mode = "auto"  # "auto", "1x1", "2x2", "3x3"
         self.previous_grid_mode = "auto"
@@ -182,6 +184,7 @@ class CameraGridWidget(QWidget):
             camera=camera,
             hw_accel=self.hw_accel,
             rtsp_transport=self.rtsp_transport,
+            hidden_timeout_min=self.hidden_timeout_min,
             parent=self,
         )
         view.selected.connect(self._on_camera_selected)
@@ -218,6 +221,20 @@ class CameraGridWidget(QWidget):
         self.apply_layout(mode)
 
     def apply_layout(self, mode: str = "auto"):
+        """Reposiciona as views e pausa as que ficaram fora da tela (Issue #25)."""
+        self._apply_layout_impl(mode)
+        self._sync_on_screen()
+
+    def _sync_on_screen(self):
+        for view in self.camera_views.values():
+            view.set_on_screen(not view.isHidden())
+
+    def set_hidden_timeout(self, minutes: float):
+        self.hidden_timeout_min = minutes
+        for view in self.camera_views.values():
+            view.set_hidden_timeout(minutes)
+
+    def _apply_layout_impl(self, mode: str = "auto"):
         """
         Aplica o layout com preenchimento completo sem desperdício de espaço:
         - 0 Câmeras: Slot amigável de boas-vindas.

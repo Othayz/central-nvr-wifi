@@ -22,7 +22,7 @@ except ImportError:
 
 # Tentar importar PySide6
 try:
-    from PySide6.QtCore import QObject, QThread, Signal
+    from PySide6.QtCore import QObject, Qt, QThread, Signal
     from PySide6.QtGui import QImage
     HAS_PYSIDE = True
 except ImportError:
@@ -125,6 +125,7 @@ class StreamOutcome(Enum):
     ENDED = "ended"                   # transmitiu e terminou (câmera fechou, queda no meio)
     STOPPED = "stopped"               # parada pedida pela aplicação
     RESTART = "restart"               # troca HD/SD pedida: reconectar já, sem espera (Issue #26)
+    PAUSED = "paused"                 # câmera fora da tela com backend que não lê sem decodificar
 
 
 def _pyav_socket_timeout_option() -> Dict[str, str]:
@@ -166,7 +167,9 @@ class StreamWorker(QThread):
     - Suporte a Dual-Stream (MainStream para alta resolução / SubStream para economia de banda Wi-Fi).
     """
 
-    frame_received = Signal(QImage)
+    # "Último frame vence" (Issue #25): o worker sobrescreve um slot e avisa uma única vez até a
+    # interface consumir com take_latest_frame(); frames não lidos são descartados, sem fila.
+    frame_available = Signal()
     stats_updated = Signal(object)  # StreamStats
     state_changed = Signal(object, str)  # (ConnectionState, message)
     snapshot_saved = Signal(str)  # filepath
@@ -200,6 +203,12 @@ class StreamWorker(QThread):
         self._switch_requested = False
         self._current_url = ""
         self._is_paused = False
+        self._await_keyframe = False
+        self._paused_announced = False
+        self._frame_lock = threading.Lock()
+        self._latest_frame: Optional[QImage] = None
+        self._frame_pending = False
+        self._target_size: Optional[Tuple[int, int]] = None
         self._request_snapshot: Optional[str] = None
         self._is_recording = False
         self._recording_writer = None
@@ -230,10 +239,49 @@ class StreamWorker(QThread):
         self.wait(1000)
 
     def pause(self):
+        """
+        Câmera fora da tela (Issue #25): no PyAV a conexão continua aberta e os pacotes são lidos e
+        descartados sem decodificar; no OpenCV (que não lê sem decodificar) a conexão é encerrada.
+        """
         self._is_paused = True
 
     def resume(self):
+        """Volta a decodificar a partir do próximo keyframe (evita imagem corrompida)."""
+        self._await_keyframe = True
         self._is_paused = False
+
+    @property
+    def is_paused(self) -> bool:
+        return self._is_paused
+
+    def set_target_size(self, width: int, height: int):
+        """Tamanho em que o frame será exibido; 0 = resolução original (ex.: tela cheia aberta)."""
+        self._target_size = (int(width), int(height)) if width > 0 and height > 0 else None
+
+    def take_latest_frame(self) -> Optional[QImage]:
+        """Chamado pela interface: devolve o frame mais recente e libera o próximo aviso."""
+        with self._frame_lock:
+            frame = self._latest_frame
+            self._latest_frame = None
+            self._frame_pending = False
+        return frame
+
+    def _publish_frame(self, q_img: QImage):
+        with self._frame_lock:
+            self._latest_frame = q_img
+            notify = not self._frame_pending
+            self._frame_pending = True
+        if notify:
+            self.frame_available.emit()
+
+    def _update_pause_state(self):
+        """Anuncia transições de pausa a partir da thread do worker."""
+        if self._is_paused and not self._paused_announced:
+            self._paused_announced = True
+            self.state_changed.emit(ConnectionState.PAUSED, "Pausada (fora da tela)")
+        elif not self._is_paused and self._paused_announced:
+            self._paused_announced = False
+            self.state_changed.emit(ConnectionState.STREAMING, "Ao Vivo")
 
     def set_prefer_substream(self, prefer: bool):
         """
@@ -308,6 +356,12 @@ class StreamWorker(QThread):
             outcome = self._connect_once()
             if not self._is_running or outcome == StreamOutcome.STOPPED:
                 break
+
+            if outcome == StreamOutcome.PAUSED:
+                self._update_pause_state()
+                while self._is_running and self._is_paused:
+                    time.sleep(0.1)
+                continue
 
             if outcome == StreamOutcome.RESTART or self._switch_requested:
                 self._switch_requested = False
@@ -433,6 +487,16 @@ class StreamWorker(QThread):
                 if not self._keep_reading():
                     break
 
+                self._update_pause_state()
+                if self._is_paused:
+                    # Continua lendo para manter a sessão RTSP viva, mas sem decodificar
+                    self._await_keyframe = True
+                    continue
+                if self._await_keyframe:
+                    if not getattr(packet, "is_keyframe", True):
+                        continue
+                    self._await_keyframe = False
+
                 self._bytes_count += packet.size or 0
 
                 for frame in packet.decode():
@@ -466,6 +530,8 @@ class StreamWorker(QThread):
 
     def _run_opencv_stream(self, stream_url: str, transport: str = "udp") -> StreamOutcome:
         """Consome o fluxo utilizando OpenCV VideoCapture como fallback resiliente."""
+        if self._is_paused:
+            return StreamOutcome.PAUSED  # Não abre conexão para uma câmera fora da tela
         cap = None
         frames_seen = 0
         try:
@@ -504,6 +570,8 @@ class StreamWorker(QThread):
             self._last_frame_ts = time.time()
 
             while self._keep_reading():
+                if self._is_paused:
+                    return StreamOutcome.PAUSED  # OpenCV não lê sem decodificar: encerra a conexão
                 ret, frame = cap.read()
                 if not ret:
                     break
@@ -616,7 +684,8 @@ class StreamWorker(QThread):
         # Detecção de Movimento Leve (Edge-AI / Motion Tracking)
         self._evaluate_motion(rgb_array, width, height)
 
-        # Criar QImage para a UI Qt
+        # Criar QImage para a UI Qt, já reduzida ao tamanho de exibição (Issue #25): o
+        # redimensionamento sai da thread da interface e o frame entregue ocupa menos memória
         bytes_per_line = 3 * width
         q_img = QImage(
             rgb_array.data,
@@ -624,9 +693,18 @@ class StreamWorker(QThread):
             height,
             bytes_per_line,
             QImage.Format.Format_RGB888
-        ).copy()
+        )
+        target = self._target_size
+        if target and (width > target[0] or height > target[1]):
+            q_img = q_img.scaled(
+                target[0], target[1],
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+        else:
+            q_img = q_img.copy()  # Desvincula do buffer do numpy
 
-        self.frame_received.emit(q_img)
+        self._publish_frame(q_img)
 
         # Atualizar estatísticas de desempenho e QoS
         self._frame_count += 1

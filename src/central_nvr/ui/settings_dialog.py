@@ -129,6 +129,16 @@ class SettingsDialog(QDialog):
         self.spin_reconn.setValue(5)
         conn_form.addRow("Intervalo de Reconexão:", self.spin_reconn)
 
+        self.spin_hidden_timeout = QSpinBox()
+        self.spin_hidden_timeout.setRange(1, 240)
+        self.spin_hidden_timeout.setSuffix(" min")
+        self.spin_hidden_timeout.setValue(5)
+        self.spin_hidden_timeout.setToolTip(
+            "Câmeras fora da tela ficam pausadas (conexão mantida, sem decodificar) e são "
+            "desconectadas após este tempo, liberando banda do Wi-Fi."
+        )
+        conn_form.addRow("Desconectar câmeras fora da tela após:", self.spin_hidden_timeout)
+
         layout.addWidget(conn_group)
 
         # 4. Grupo Atualizações do Aplicativo (GitHub)
@@ -217,6 +227,7 @@ class SettingsDialog(QDialog):
         self.txt_rec_dir.setText(self.config_mgr.get("recordings_dir", ""))
         self.txt_default_user.setText(self.config_mgr.get("default_username", "admin"))
         self.spin_reconn.setValue(self.config_mgr.get("reconnect_interval_sec", 5))
+        self.spin_hidden_timeout.setValue(int(self.config_mgr.get("hidden_camera_timeout_min", 5)))
 
         # Valores de atualização
         self.chk_startup_update.setChecked(self.config_mgr.get("check_updates_on_startup", True))
@@ -235,6 +246,7 @@ class SettingsDialog(QDialog):
         self.config_mgr.set("recordings_dir", self.txt_rec_dir.text().strip())
         self.config_mgr.set("default_username", self.txt_default_user.text().strip())
         self.config_mgr.set("reconnect_interval_sec", self.spin_reconn.value())
+        self.config_mgr.set("hidden_camera_timeout_min", self.spin_hidden_timeout.value())
 
         # Salvar parâmetros de atualização
         self.config_mgr.set("check_updates_on_startup", self.chk_startup_update.isChecked())

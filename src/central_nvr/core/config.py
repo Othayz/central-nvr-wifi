@@ -191,6 +191,7 @@ class ConfigManager:
         "buffer_size_ms": 150,
         "auto_reconnect": True,
         "reconnect_interval_sec": 5,
+        "hidden_camera_timeout_min": 5,
         "default_username": "",
         "snapshot_dir": str(get_data_dir() / "snapshots"),
         "recordings_dir": str(get_data_dir() / "recordings"),

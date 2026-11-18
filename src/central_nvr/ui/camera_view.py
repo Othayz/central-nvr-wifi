@@ -44,12 +44,21 @@ class CameraViewWidget(QFrame):
         camera: CameraDevice,
         hw_accel: str = "vaapi",
         rtsp_transport: str = "tcp",
+        hidden_timeout_min: float = 5.0,
         parent: Optional[QWidget] = None,
     ):
         super().__init__(parent)
         self.camera = camera
         self.hw_accel = hw_accel
         self.rtsp_transport = rtsp_transport
+
+        # Câmera fora da tela (Issue #25): pausada e, após este tempo, desconectada
+        self._on_screen = True
+        self._suspended = False
+        self._hidden_timer = QTimer(self)
+        self._hidden_timer.setSingleShot(True)
+        self._hidden_timer.timeout.connect(self._suspend_hidden)
+        self.set_hidden_timeout(hidden_timeout_min)
         
         self.is_selected = False
         self.is_maximized_view = False
@@ -324,6 +333,65 @@ class CameraViewWidget(QFrame):
             )
         self._fullscreen_win.showFullScreen()
 
+    # ------------------------------------------------------------------
+    # Câmera fora da tela (Issue #25)
+    # ------------------------------------------------------------------
+
+    def set_hidden_timeout(self, minutes: float):
+        self._hidden_timer.setInterval(max(1, int(float(minutes) * 60_000)))
+
+    def set_on_screen(self, on_screen: bool):
+        """
+        Chamado pela grade: fora da tela, a câmera é pausada (volta na hora) e, depois do tempo
+        configurado, desconectada para liberar banda; ao voltar, reconecta.
+        """
+        if on_screen == self._on_screen:
+            return
+        self._on_screen = on_screen
+        if on_screen:
+            self._hidden_timer.stop()
+            if self._suspended:
+                self._start_stream()
+            elif self.worker:
+                self.worker.resume()
+        else:
+            if self.worker:
+                self.worker.pause()
+            self._hidden_timer.start()
+
+    @property
+    def is_suspended(self) -> bool:
+        return self._suspended
+
+    def _suspend_hidden(self):
+        if self._on_screen or self.worker is None:
+            return
+        self.stop()
+        self._suspended = True
+        self.status_message = "Desconectada (fora da tela)"
+
+    def _sync_target_size(self):
+        """Informa ao worker o tamanho de exibição; tela cheia aberta pede a resolução original."""
+        if not self.worker:
+            return
+        fullscreen = getattr(self, "_fullscreen_win", None)
+        if fullscreen is not None and fullscreen.isVisible():
+            self.worker.set_target_size(0, 0)
+        else:
+            self.worker.set_target_size(self.width(), self.height())
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._sync_target_size()
+
+    def _on_frame_available(self):
+        w = self.worker
+        if w is None:
+            return
+        frame = w.take_latest_frame()
+        if frame is not None:
+            self._on_frame_received(frame)
+
     def _start_stream(self):
         """Inicia a thread de captura e decodificação do fluxo RTSP."""
         self.worker = StreamWorker(
@@ -332,7 +400,12 @@ class CameraViewWidget(QFrame):
             rtsp_transport=self.rtsp_transport,
             parent=self,
         )
-        self.worker.frame_received.connect(self._on_frame_received)
+        self._suspended = False
+        if not self._on_screen:
+            self.worker.pause()
+            self._hidden_timer.start()
+        self._sync_target_size()
+        self.worker.frame_available.connect(self._on_frame_available)
         self.worker.stats_updated.connect(self._on_stats_updated)
         self.worker.state_changed.connect(self._on_state_changed)
         self.worker.snapshot_saved.connect(self._on_snapshot_saved)
@@ -363,6 +436,7 @@ class CameraViewWidget(QFrame):
 
     def _on_frame_received(self, q_img: QImage):
         """Recebe novo frame e repassa para a tela cheia se estiver aberta."""
+        self._sync_target_size()  # tela cheia pode ter sido aberta/fechada
         self.current_frame = q_img
         if hasattr(self, "_fullscreen_win") and self._fullscreen_win and self._fullscreen_win.isVisible():
             self._fullscreen_win.set_frame(
@@ -445,6 +519,9 @@ class CameraViewWidget(QFrame):
         elif state == ConnectionState.CONNECTING or state == ConnectionState.RECONNECTING:
             self.lbl_status.setText("CONECTANDO")
             self.lbl_status.setStyleSheet("color: #FBBF24; background-color: rgba(146, 64, 14, 0.9); padding: 3px 6px; border-radius: 4px; font-size: 10px; font-weight: bold;")
+        elif state == ConnectionState.PAUSED:
+            self.lbl_status.setText("PAUSADA")
+            self.lbl_status.setStyleSheet("color: #CBD5E1; background-color: rgba(51, 65, 85, 0.9); padding: 3px 6px; border-radius: 4px; font-size: 10px; font-weight: bold;")
         elif state == ConnectionState.ERROR:
             self.lbl_status.setText("ERRO")
             self.lbl_status.setStyleSheet("color: #F87171; background-color: rgba(153, 27, 27, 0.9); padding: 3px 6px; border-radius: 4px; font-size: 10px; font-weight: bold;")
@@ -521,7 +598,7 @@ class CameraViewWidget(QFrame):
         if self.worker:
             w = self.worker
             self.worker = None
-            for worker_signal in (w.frame_received, w.stats_updated, w.state_changed, w.snapshot_saved,
+            for worker_signal in (w.frame_available, w.stats_updated, w.state_changed, w.snapshot_saved,
                                   w.motion_detected, w.stream_variant):
                 try:
                     worker_signal.disconnect()

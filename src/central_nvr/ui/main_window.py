@@ -114,6 +114,7 @@ class MainWindow(QMainWindow):
         self.camera_grid = CameraGridWidget(
             hw_accel=hw_accel,
             rtsp_transport=rtsp_transport,
+            hidden_timeout_min=float(self.config_mgr.get("hidden_camera_timeout_min", 5)),
             parent=self,
         )
         self.camera_grid.camera_selected.connect(self._on_camera_selected)
@@ -736,6 +737,7 @@ class MainWindow(QMainWindow):
             self.lbl_sb_hw.setText(f"Aceleração: {hw_accel.upper()} (Ativo)")
             self.camera_grid.hw_accel = hw_accel
             self.camera_grid.rtsp_transport = self.config_mgr.get("rtsp_transport", "auto")
+            self.camera_grid.set_hidden_timeout(float(self.config_mgr.get("hidden_camera_timeout_min", 5)))
             self.camera_grid.set_cameras(self.cameras)
 
 
