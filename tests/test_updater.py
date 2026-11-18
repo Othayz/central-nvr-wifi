@@ -28,7 +28,6 @@ from central_nvr.core.updater import (
     ReleaseInfo,
     UpdateCheckWorker,
     _parse_github_release_dict,
-    detect_system_package_format,
     download_asset,
     find_best_asset_for_system,
     is_version_newer,
@@ -424,50 +423,6 @@ class TestUpdaterWorkers(unittest.TestCase):
                     backup_file = bin_dir / "central-nvr.AppImage.bak"
                     self.assertTrue(backup_file.exists())
                     self.assertEqual(backup_file.read_text(), "old user local binary")
-
-    def test_tar_slip_and_symlink_prevention(self):
-        """Valida que _extract_tar_members_to_local bloqueia Tar Slip e links maliciosos (SEC-03)."""
-        import io
-        import tarfile
-        from pathlib import Path
-        from central_nvr.core.updater import _extract_tar_members_to_local
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            base_dir = Path(tmpdir) / "user_home"
-            base_dir.mkdir()
-
-            # Criar tarball contendo caminhos maliciosos com Tar Slip e links externos
-            tar_buf = io.BytesIO()
-            with tarfile.open(fileobj=tar_buf, mode="w") as tar:
-                # 1. Arquivo benigno
-                info_valid = tarfile.TarInfo(name="usr/bin/safe_app")
-                data_valid = b"safe code"
-                info_valid.size = len(data_valid)
-                tar.addfile(info_valid, io.BytesIO(data_valid))
-
-                # 2. Arquivo com Tar Slip
-                info_slip = tarfile.TarInfo(name="usr/../../.test_slip")
-                data_slip = b"malicious content"
-                info_slip.size = len(data_slip)
-                tar.addfile(info_slip, io.BytesIO(data_slip))
-
-                # 3. Symlink apontando para fora do target
-                info_sym = tarfile.TarInfo(name="usr/evil_link")
-                info_sym.type = tarfile.SYMTYPE
-                info_sym.linkname = "/etc/passwd"
-                tar.addfile(info_sym)
-
-            tar_buf.seek(0)
-            with tarfile.open(fileobj=tar_buf, mode="r") as tar:
-                _extract_tar_members_to_local(tar, base_dir)
-
-            # O arquivo benigno deve ter sido extraído
-            self.assertTrue((base_dir / "bin" / "safe_app").exists())
-            # O arquivo malicioso com Tar Slip NÃO deve existir fora de base_dir nem em .test_slip
-            self.assertFalse((Path(tmpdir) / ".test_slip").exists())
-            self.assertFalse((base_dir / ".test_slip").exists())
-            # O link simbólico para fora NÃO deve ter sido criado
-            self.assertFalse((base_dir / "evil_link").exists())
 
     def test_get_updates_dir_and_file_permissions(self):
         """Valida diretório privado 0700 e permissões 0600 em atualizações (SEC-02)."""

@@ -136,6 +136,13 @@ chmod +x dist/Central_NVR_WiFi-*-x86_64.AppImage
 ./dist/Central_NVR_WiFi-*-x86_64.AppImage
 ```
 
+### Atualização e volta à versão anterior
+A atualização baixa o novo AppImage, confere o SHA-256 da release, grava a cópia em disco (`fsync`) e
+substitui o arquivo atual em uma única operação (`os.replace`). A versão anterior fica ao lado, com a
+extensão `.bak`; para voltar a ela, feche o aplicativo e renomeie o `.bak` para o nome original. Se o
+AppImage estiver em um local sem permissão de escrita (por exemplo, `/opt`), a nova versão é instalada
+em `~/.local/bin/central-nvr.AppImage` e o atalho do menu passa a apontar para ela.
+
 ---
 
 ## 5. Principais Recursos e Funcionalidades
