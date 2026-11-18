@@ -75,8 +75,13 @@ class SupplyChainTest(unittest.TestCase):
         # Toda dependência declarada no pyproject está no lockfile
         pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
         deps = re.search(r"dependencies = \[(.*?)\]", pyproject, re.DOTALL).group(1)
-        names = {re.split(r"[<>=!~ ]", d.strip().strip('",'))[0].lower()
-                 for d in deps.splitlines() if d.strip().strip('",')}
+        names = set()
+        for line in deps.splitlines():
+            line = line.strip().strip(",")
+            if not line or line.startswith("#"):
+                continue
+            spec = line.strip('"').split(";")[0]
+            names.add(re.split(r"[<>=!~ ]", spec)[0].lower())
         lowered = {k.lower() for k in pinned}
         for name in names:
             self.assertIn(name, lowered, f"{name} ausente do requirements.lock")
