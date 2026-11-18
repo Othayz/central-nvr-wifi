@@ -10,6 +10,13 @@ updates:
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 5
+    ignore:
+      # PySide6 6.12.x decrementa a contagem de referências de True a cada emit() em Python < 3.12
+      # e o app aborta ("free(): invalid size"). O pyproject restringe <6.12 nessas versões e o
+      # PR #51 tentou desfazer isso. Remover esta regra quando sair uma versão corrigida
+      # (tests/test_pyside_emit_refcount.py confirma no CI com Python 3.10).
+      - dependency-name: "pyside6"
+        versions: ["6.12.x"]
 
   - package-ecosystem: "github-actions"
     directory: "/"
