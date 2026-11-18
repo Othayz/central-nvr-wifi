@@ -513,6 +513,8 @@ class CameraViewWidget(QFrame):
         (muitas câmeras Wi-Fi aceitam apenas uma): a nova conexão só começa quando a anterior encerra.
         """
         previous = self.worker
+        # Reconexão pedida pelo operador: refaz a busca completa de caminhos/transportes
+        self.camera.resolved_stream = None
         self.stop()
         if previous is None or not previous.isRunning():
             self._start_stream()

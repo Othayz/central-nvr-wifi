@@ -66,6 +66,9 @@ class CameraDevice:
     state: ConnectionState = ConnectionState.DISCONNECTED
     stats: StreamStats = field(default_factory=StreamStats)
     last_error: str = ""
+    # (backend, url, transporte) que conectou por último nesta sessão: as reconexões tentam
+    # primeiro só ele (Issue #27). Não é persistido; "Reconectar" limpa e refaz a busca completa.
+    resolved_stream: Optional[Tuple[str, str, str]] = field(default=None, repr=False, compare=False)
 
     # ------------------------------------------------------------------
     # Montagem de URLs RTSP (Issue #18)
