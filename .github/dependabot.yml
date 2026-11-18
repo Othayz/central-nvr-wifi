@@ -16,7 +16,7 @@ updates:
       # PR #51 tentou desfazer isso. Remover esta regra quando sair uma versão corrigida
       # (tests/test_pyside_emit_refcount.py confirma no CI com Python 3.10).
       - dependency-name: "pyside6"
-        versions: ["6.12.x"]
+        versions: [">=6.12.0, <6.13.0"]
 
   - package-ecosystem: "github-actions"
     directory: "/"
