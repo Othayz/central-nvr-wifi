@@ -20,6 +20,7 @@ import tempfile
 import threading
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
 
 import requests
 from PySide6.QtCore import QObject, QThread, Signal
@@ -32,6 +33,9 @@ _SHA256_RE = re.compile(r"^[a-fA-F0-9]{64}$")
 
 DEFAULT_GITHUB_REPO = "Othayz/central-nvr-wifi"
 
+# O token do GitHub só é enviado a estes hosts, comparados pelo hostname (Issue #19)
+GITHUB_TOKEN_HOSTS = frozenset({"api.github.com", "github.com"})
+
 
 @dataclass
 class ReleaseAsset:
@@ -41,6 +45,9 @@ class ReleaseAsset:
     download_url: str
     content_type: str = ""
     created_at: str = ""
+    # URL de API do asset (/repos/<repo>/releases/assets/<id>): única que aceita o token
+    # para baixar de repositório privado, com Accept: application/octet-stream
+    api_url: str = ""
 
     @property
     def formatted_size(self) -> str:
@@ -160,6 +167,46 @@ def find_best_asset_for_system(assets: List[ReleaseAsset]) -> Optional[ReleaseAs
     return None
 
 
+def resolve_github_token(token: Optional[str] = None) -> Optional[str]:
+    """Token explícito, ou GITHUB_TOKEN do ambiente, ou `github_token` das configurações."""
+    if token and token.strip():
+        return token.strip()
+    env_token = os.environ.get("GITHUB_TOKEN", "").strip()
+    if env_token:
+        return env_token
+    try:
+        from central_nvr.core.config import ConfigManager
+        return ConfigManager().get("github_token", "").strip() or None
+    except Exception:
+        return None
+
+
+def github_auth_headers(url: str, token: Optional[str]) -> Dict[str, str]:
+    """
+    Cabeçalhos de autenticação para `url`: o token só vai para os hosts do GitHub, comparando o
+    hostname (nunca por substring da URL). Na URL de API de asset, pede o binário.
+    """
+    if not token:
+        return {}
+    try:
+        host = (urlparse(url).hostname or "").lower()
+    except ValueError:
+        return {}
+    if host not in GITHUB_TOKEN_HOSTS:
+        return {}
+    headers = {"Authorization": f"Bearer {token}"}
+    if host == "api.github.com" and "/releases/assets/" in urlparse(url).path:
+        headers["Accept"] = "application/octet-stream"
+    return headers
+
+
+def preferred_download_url(asset: "ReleaseAsset", token: Optional[str]) -> str:
+    """Com token, baixa pela URL de API (funciona em repositório privado); sem token, pela pública."""
+    if token and asset.api_url and (urlparse(asset.api_url).hostname or "").lower() == "api.github.com":
+        return asset.api_url
+    return asset.download_url
+
+
 def fetch_latest_release(
     repo: str = DEFAULT_GITHUB_REPO,
     include_prereleases: bool = False,
@@ -170,14 +217,7 @@ def fetch_latest_release(
     Consulta a API pública do GitHub para obter a última release disponível.
     Suporta autenticação por token (PAT) para repositórios privados ou para contornar rate-limit.
     """
-    if not token:
-        token = os.environ.get("GITHUB_TOKEN", "").strip() or None
-        if not token:
-            try:
-                from central_nvr.core.config import ConfigManager
-                token = ConfigManager().get("github_token", "").strip() or None
-            except Exception:
-                token = None
+    token = resolve_github_token(token)
 
     headers = {
         "Accept": "application/vnd.github.v3+json",
@@ -296,6 +336,7 @@ def _parse_github_release_dict(data: Dict[str, Any]) -> ReleaseInfo:
                 download_url=item.get("browser_download_url", ""),
                 content_type=item.get("content_type", ""),
                 created_at=item.get("created_at", ""),
+                api_url=item.get("url", ""),
             )
         )
 
@@ -329,9 +370,7 @@ def download_asset(
     try:
         os.makedirs(os.path.dirname(os.path.abspath(dest_path)), exist_ok=True)
         headers = {"User-Agent": f"CentralNVR-Updater/{__version__}"}
-        if token and "api.github.com" in url:
-            headers["Authorization"] = f"Bearer {token}"
-            headers["Accept"] = "application/octet-stream"
+        headers.update(github_auth_headers(url, token))
 
         response = requests.get(url, stream=True, headers=headers, timeout=30)
         response.raise_for_status()
@@ -449,13 +488,15 @@ def get_expected_sha256_for_asset(
         if aname_low in ("sha256sums.txt", "sha256sums", "checksums.txt", "checksums", "sha256.txt"):
             checksum_asset = a
 
-    headers = {"User-Agent": f"CentralNVR-Updater/{__version__}"}
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
+    def _get(asset: ReleaseAsset):
+        url = preferred_download_url(asset, token)
+        headers = {"User-Agent": f"CentralNVR-Updater/{__version__}"}
+        headers.update(github_auth_headers(url, token))
+        return requests.get(url, headers=headers, timeout=10)
 
     if direct_sha_asset:
         try:
-            resp = requests.get(direct_sha_asset.download_url, headers=headers, timeout=10)
+            resp = _get(direct_sha_asset)
             if resp.status_code == 200:
                 m = re.search(r"([a-fA-F0-9]{64})", resp.text)
                 if m:
@@ -465,7 +506,7 @@ def get_expected_sha256_for_asset(
 
     if checksum_asset:
         try:
-            resp = requests.get(checksum_asset.download_url, headers=headers, timeout=10)
+            resp = _get(checksum_asset)
             if resp.status_code == 200:
                 for line in resp.text.splitlines():
                     if asset_name in line:
@@ -790,7 +831,7 @@ class ChecksumFetchWorker(QThread):
         self.token = token
 
     def run(self):
-        h = resolve_checksum_or_none(self.release_info, self.asset_name, self.token)
+        h = resolve_checksum_or_none(self.release_info, self.asset_name, resolve_github_token(self.token))
         if h:
             self.checksum_ready.emit(h)
         else:

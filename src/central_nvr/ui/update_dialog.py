@@ -37,6 +37,8 @@ from central_nvr.core.updater import (
     find_best_asset_for_system,
     get_updates_dir,
     install_downloaded_package,
+    preferred_download_url,
+    resolve_github_token,
 )
 
 logger = logging.getLogger(__name__)
@@ -398,10 +400,11 @@ class StartupUpdateDialog(BaseUpdateDialog):
         self.btn_update.setEnabled(False)
         self.btn_update.setText("Baixando...")
 
+        token = resolve_github_token(self.token)
         self.download_worker = AssetDownloadWorker(
-            download_url=self.best_asset.download_url,
+            download_url=preferred_download_url(self.best_asset, token),
             destination_path=self._download_destination(),
-            token=self.token,
+            token=token,
             expected_size=self.best_asset.size,
             parent=self,
         )
@@ -683,10 +686,11 @@ class UpdateDialog(BaseUpdateDialog):
         self.btn_action.setEnabled(False)
         self.btn_action.setText("Baixando...")
 
+        token = resolve_github_token(self.token)
         self.download_worker = AssetDownloadWorker(
-            download_url=self.best_asset.download_url,
+            download_url=preferred_download_url(self.best_asset, token),
             destination_path=self._download_destination(),
-            token=self.token,
+            token=token,
             expected_size=self.best_asset.size,
             parent=self,
         )
