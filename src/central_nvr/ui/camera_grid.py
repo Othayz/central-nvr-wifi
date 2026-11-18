@@ -115,6 +115,7 @@ class CameraGridWidget(QWidget):
     layout_mode_changed = Signal(str)  # "auto", "1x1", "2x2", "3x3"
     fullscreen_requested = Signal(str)  # camera_id
     camera_renamed = Signal(str, str)  # (camera_id, new_name)
+    camera_display_state_changed = Signal(str, str)  # (camera_id, "Ao Vivo" / "Sem sinal" / ...)
 
     def __init__(
         self,
@@ -235,7 +236,12 @@ class CameraGridWidget(QWidget):
         view.snapshot_taken.connect(lambda cid, fp: self.snapshot_taken.emit(cid, fp))
         view.fullscreen_requested.connect(lambda cid: self.fullscreen_requested.emit(cid))
         view.rename_requested.connect(lambda cid, name: self.camera_renamed.emit(cid, name))
+        view.display_state_changed.connect(self.camera_display_state_changed.emit)
         return view
+
+    def display_state_of(self, camera_id: str) -> str:
+        view = self.camera_views.get(camera_id)
+        return view.display_state if view else "Conectando"
 
     def _dispose_view(self, view: CameraViewWidget):
         """Encerra o stream e descarta a view de forma segura."""
@@ -246,6 +252,7 @@ class CameraGridWidget(QWidget):
             view.snapshot_taken.disconnect()
             view.fullscreen_requested.disconnect()
             view.rename_requested.disconnect()
+            view.display_state_changed.disconnect()
         except Exception:
             pass
         view.stop()

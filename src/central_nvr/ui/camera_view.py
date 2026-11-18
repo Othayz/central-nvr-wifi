@@ -66,6 +66,8 @@ class CameraViewWidget(QFrame):
     estatísticas de rede e atalhos rápidos de controle (Snapshot, PTZ, Renomear, Tela Cheia).
     """
 
+    # Estado exibido ("Ao Vivo", "Sem sinal", "Pausada", "Conectando") para a árvore lateral
+    display_state_changed = Signal(str, str)  # (camera_id, estado)
     selected = Signal(str)  # camera_id
     double_clicked = Signal(str)  # camera_id
     ptz_requested = Signal(str)  # camera_id
@@ -87,6 +89,17 @@ class CameraViewWidget(QFrame):
         self.hw_accel = hw_accel
         self.rtsp_transport = rtsp_transport
         self.options = options or ViewOptions()
+
+        # Perda de sinal (Issue #33): instante em que o vídeo deixou de ser ao vivo e watchdog de
+        # stream travado (STREAMING sem frames novos)
+        self._signal_lost_at: Optional[datetime.datetime] = None
+        self._last_frame_monotonic: Optional[float] = None
+        self._stalled = False
+        self._display_state = "Conectando"
+        self._watchdog = QTimer(self)
+        self._watchdog.setInterval(1000)
+        self._watchdog.timeout.connect(self._check_stall)
+        self._watchdog.start()
 
         # Perfil de stream escolhido pela grade (Issue #47) e escolha manual pelo botão HD/SD,
         # que prevalece até a próxima troca de layout
@@ -170,8 +183,8 @@ class CameraViewWidget(QFrame):
         self.lbl_hw_accel.setStyleSheet("color: #38BDF8; background-color: rgba(15, 23, 42, 0.85); padding: 3px 6px; border-radius: 4px; font-size: 10px; font-weight: bold;")
         top_bar.addWidget(self.lbl_hw_accel)
 
-        self.lbl_status = QLabel("AO VIVO")
-        self.lbl_status.setStyleSheet("color: #4ADE80; background-color: rgba(22, 101, 52, 0.9); padding: 3px 6px; border-radius: 4px; font-size: 10px; font-weight: bold;")
+        self.lbl_status = QLabel("CONECTANDO")
+        self.lbl_status.setStyleSheet("color: #FBBF24; background-color: rgba(146, 64, 14, 0.9); padding: 3px 6px; border-radius: 4px; font-size: 10px; font-weight: bold;")
         top_bar.addWidget(self.lbl_status)
 
         main_layout.addLayout(top_bar)
@@ -379,6 +392,7 @@ class CameraViewWidget(QFrame):
                 bitrate=self.stats.bitrate_kbps,
                 codec=self.stats.codec
             )
+        self._fullscreen_win.set_live(self.is_live(), self.signal_warning())
         self._fullscreen_win.showFullScreen()
 
     # ------------------------------------------------------------------
@@ -538,6 +552,10 @@ class CameraViewWidget(QFrame):
         """Recebe novo frame e repassa para a tela cheia se estiver aberta."""
         self._sync_target_size()  # tela cheia pode ter sido aberta/fechada
         self.current_frame = q_img
+        self._last_frame_monotonic = time.monotonic()
+        if self._stalled:
+            self._stalled = False
+            self._set_live(True)
         if hasattr(self, "_fullscreen_win") and self._fullscreen_win and self._fullscreen_win.isVisible():
             self._fullscreen_win.set_frame(
                 q_img,
@@ -623,10 +641,71 @@ class CameraViewWidget(QFrame):
         self.lbl_notice.show()
         QTimer.singleShot(duration_ms, self.lbl_notice.hide)
 
+    # ------------------------------------------------------------------
+    # Perda de sinal (Issue #33)
+    # ------------------------------------------------------------------
+
+    STALL_TIMEOUT_SEC = 5.0
+
+    def _set_live(self, live: bool):
+        """Marca o início/fim da perda de sinal e propaga para a tela cheia e a árvore."""
+        if live:
+            self._signal_lost_at = None
+            self._publish_display_state("Ao Vivo")
+        else:
+            if self._signal_lost_at is None and self.current_frame is not None:
+                self._signal_lost_at = datetime.datetime.now()
+            self._publish_display_state("Sem sinal")
+        fullscreen = getattr(self, "_fullscreen_win", None)
+        if fullscreen is not None:
+            fullscreen.set_live(live, self.signal_warning())
+        self.update()
+
+    def _publish_display_state(self, label: str):
+        if label != self._display_state:
+            self._display_state = label
+            self.display_state_changed.emit(self.camera.id, label)
+
+    @property
+    def display_state(self) -> str:
+        return self._display_state
+
+    def is_live(self) -> bool:
+        return self.connection_state == ConnectionState.STREAMING and not self._stalled
+
+    def signal_warning(self) -> str:
+        """Aviso sobreposto ao último frame quando o vídeo não é mais ao vivo ("" se ao vivo)."""
+        if self.is_live() or self.connection_state == ConnectionState.PAUSED:
+            return ""
+        if self._signal_lost_at is not None:
+            return f"Sem sinal desde {self._signal_lost_at.strftime('%H:%M:%S')}"
+        return ""
+
+    def _check_stall(self, now: Optional[float] = None):
+        """Watchdog: STREAMING sem frame novo por STALL_TIMEOUT_SEC → perda de sinal."""
+        if self.connection_state != ConnectionState.STREAMING or self._last_frame_monotonic is None:
+            return
+        now = time.monotonic() if now is None else now
+        if not self._stalled and now - self._last_frame_monotonic >= self.STALL_TIMEOUT_SEC:
+            self._stalled = True
+            self.lbl_status.setText("SEM SINAL")
+            self.lbl_status.setStyleSheet("color: #F87171; background-color: rgba(153, 27, 27, 0.9); padding: 3px 6px; border-radius: 4px; font-size: 10px; font-weight: bold;")
+            self._set_live(False)
+
     def _on_state_changed(self, state: ConnectionState, message: str):
         """Atualiza a indicação visual de conexão."""
         self.connection_state = state
         self.status_message = message
+        if state == ConnectionState.STREAMING:
+            self._stalled = False
+            self._last_frame_monotonic = time.monotonic()
+            self._set_live(True)
+        elif state == ConnectionState.PAUSED:
+            self._publish_display_state("Pausada")
+        elif state == ConnectionState.CONNECTING and self.current_frame is None:
+            self._publish_display_state("Conectando")
+        else:
+            self._set_live(False)
 
         if state == ConnectionState.STREAMING:
             self.lbl_status.setText("AO VIVO")
@@ -679,6 +758,13 @@ class CameraViewWidget(QFrame):
                 dest_y = (target_rect.height() - dest_h) // 2
                 dest_rect = QRect(dest_x, dest_y, dest_w, dest_h)
                 painter.drawImage(dest_rect, self.current_frame)
+                warning = self.signal_warning()
+                if warning:
+                    # Escurece a imagem parada e sobrepõe o aviso: não pode passar por "ao vivo"
+                    painter.fillRect(dest_rect, QColor(0, 0, 0, 170))
+                    painter.setPen(QColor("#F87171"))
+                    painter.setFont(QFont("Arial", 13, QFont.Weight.Bold))
+                    painter.drawText(dest_rect, Qt.AlignmentFlag.AlignCenter, f"⚠ {warning}")
         else:
             # Fundo sem sinal elegante
             painter.fillRect(self.rect(), QColor("#0A0F1D"))

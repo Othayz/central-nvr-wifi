@@ -126,6 +126,7 @@ class MainWindow(QMainWindow):
         self.camera_grid.layout_mode_changed.connect(self._on_layout_mode_changed_by_grid)
         self.camera_grid.fullscreen_requested.connect(self._on_camera_fullscreen_requested)
         self.camera_grid.camera_renamed.connect(self._on_camera_renamed)
+        self.camera_grid.camera_display_state_changed.connect(self._on_camera_display_state_changed)
         right_vbox.addWidget(self.camera_grid, stretch=1)
 
         self.splitter.addWidget(self.right_workspace)
@@ -432,11 +433,12 @@ class MainWindow(QMainWindow):
         nvr_root.setText(0, f"Central NVR ({len(self.cameras)} Câmeras)")
         nvr_root.setExpanded(True)
 
+        self._tree_items = {}
         for cam in self.cameras:
             cam_item = QTreeWidgetItem(nvr_root)
-            ptz_tag = " [PTZ]" if cam.has_ptz else ""
-            cam_item.setText(0, f"[Ao Vivo] {cam.name} ({cam.ip}){ptz_tag}")
             cam_item.setData(0, Qt.ItemDataRole.UserRole, cam.id)
+            self._tree_items[cam.id] = cam_item
+            self._render_tree_item(cam, self.camera_grid.display_state_of(cam.id))
 
         self._log_event("Sistema", f"{len(self.cameras)} câmera(s) carregada(s).")
 
@@ -484,6 +486,19 @@ class MainWindow(QMainWindow):
                 self.sidebar_tabs.setCurrentIndex(1)
         elif action == act_del:
             self._remove_camera_by_id(cam_id)
+
+    def _render_tree_item(self, cam: CameraDevice, state: str):
+        """Item da árvore com o estado real da câmera, não "[Ao Vivo]" fixo (Issue #33)."""
+        item = getattr(self, "_tree_items", {}).get(cam.id)
+        if item is None:
+            return
+        ptz_tag = " [PTZ]" if cam.has_ptz else ""
+        item.setText(0, f"[{state}] {cam.name} ({cam.ip}){ptz_tag}")
+
+    def _on_camera_display_state_changed(self, camera_id: str, state: str):
+        cam = next((c for c in self.cameras if c.id == camera_id), None)
+        if cam:
+            self._render_tree_item(cam, state)
 
     def _on_camera_renamed(self, camera_id: str, new_name: str):
         """Atualiza o nome da câmera em todos os componentes do sistema e salva nas configurações."""

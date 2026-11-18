@@ -708,6 +708,8 @@ class StreamWorker(QThread):
             q_img = q_img.copy()  # Desvincula do buffer do numpy
 
         self._publish_frame(q_img)
+        # Instante do último frame entregue: base do watchdog de stream travado (Issue #33)
+        self.stats.last_frame_time = time.time()
 
         # Atualizar estatísticas de desempenho e QoS
         self._frame_count += 1

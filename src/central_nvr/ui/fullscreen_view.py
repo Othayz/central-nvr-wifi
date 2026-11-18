@@ -277,9 +277,23 @@ class FullscreenPlayerWindow(QWidget):
     def update_camera_name(self, new_name: str):
         """Atualiza dinamicamente o nome da câmera na visualização de tela cheia."""
         self.camera.name = new_name
-        self.lbl_title.setText(f"🔴 AO VIVO: {new_name} ({self.camera.ip})")
+        self._render_title()
         self.setWindowTitle(f"Central NVR - {new_name} (Tela Cheia)")
         self.update()
+
+    def set_live(self, live: bool, warning: str = ""):
+        """Estado da câmera vindo da view (Issue #33): sem sinal não pode exibir "AO VIVO"."""
+        self._live = live
+        self._signal_warning = warning
+        self._render_title()
+        self.update()
+
+    def _render_title(self):
+        if getattr(self, "_live", False):
+            self.lbl_title.setText(f"🔴 AO VIVO: {self.camera.name} ({self.camera.ip})")
+        else:
+            warning = getattr(self, "_signal_warning", "") or "Sem sinal"
+            self.lbl_title.setText(f"⚠ {warning.upper()}: {self.camera.name} ({self.camera.ip})")
 
     def set_frame(self, frame: QImage, fps: float = 0.0, bitrate: float = 0.0, codec: str = "", jitter_ms: float = 0.0):
         """Recebe novo frame e atualiza métricas de QoS no OSD."""
@@ -341,6 +355,11 @@ class FullscreenPlayerWindow(QWidget):
                 dest_y = (target_rect.height() - dest_h) // 2
                 dest_rect = QRect(dest_x, dest_y, dest_w, dest_h)
                 painter.drawImage(dest_rect, self.current_frame)
+                if not getattr(self, "_live", True) and getattr(self, "_signal_warning", ""):
+                    painter.fillRect(dest_rect, QColor(0, 0, 0, 170))
+                    painter.setPen(QColor("#F87171"))
+                    painter.setFont(QFont("Arial", 20, QFont.Weight.Bold))
+                    painter.drawText(dest_rect, Qt.AlignmentFlag.AlignCenter, f"⚠ {self._signal_warning}")
         else:
             painter.setPen(QColor("#64748B"))
             painter.setFont(QFont("Arial", 16))
