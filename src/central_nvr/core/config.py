@@ -205,7 +205,7 @@ class ConfigManager:
         "show_osd_timestamp": True,
         "check_updates_on_startup": True,
         "periodic_update_check": True,
-        "periodic_update_interval_min": 10,
+        "periodic_update_interval_min": 60,
         "github_repo": "Othayz/central-nvr-wifi",
         "github_token": "",
     }

@@ -215,6 +215,10 @@ def preferred_download_url(asset: "ReleaseAsset", token: Optional[str]) -> str:
     return asset.download_url
 
 
+# ETag e corpo da última resposta de /releases/latest, por URL (Issue #37)
+_ETAG_CACHE: Dict[str, Tuple[str, Dict[str, Any]]] = {}
+
+
 def fetch_latest_release(
     repo: str = DEFAULT_GITHUB_REPO,
     include_prereleases: bool = False,
@@ -245,7 +249,15 @@ def fetch_latest_release(
                 if best is not None:
                     return _parse_github_release_dict(best)
 
-        response = requests.get(url, headers=headers, timeout=timeout)
+        # Requisição condicional (Issue #37): 304 não conta na cota da API e evita baixar de novo
+        cached = _ETAG_CACHE.get(url)
+        conditional_headers = dict(headers)
+        if cached:
+            conditional_headers["If-None-Match"] = cached[0]
+        response = requests.get(url, headers=conditional_headers, timeout=timeout)
+
+        if response.status_code == 304 and cached:
+            return _parse_github_release_dict(cached[1])
 
         # 401: Token inválido
         if response.status_code == 401:
@@ -324,6 +336,12 @@ def fetch_latest_release(
             raise RuntimeError(f"Consulta ao GitHub retornou status HTTP {response.status_code}.")
 
         data = response.json()
+        try:
+            etag = response.headers.get("ETag")
+        except AttributeError:
+            etag = None
+        if isinstance(etag, str) and etag:
+            _ETAG_CACHE[url] = (etag, data)
         return _parse_github_release_dict(data)
 
     except requests.exceptions.RequestException as e:

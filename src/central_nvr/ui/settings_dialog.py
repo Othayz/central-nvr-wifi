@@ -176,9 +176,10 @@ class SettingsDialog(QDialog):
         up_form.addRow(self.chk_periodic_update)
 
         self.spin_update_interval = QSpinBox()
-        self.spin_update_interval.setRange(2, 1440)
+        # Mínimo de 1 h: o app roda 24/7 e cada checagem consome a cota da API do GitHub (Issue #37)
+        self.spin_update_interval.setRange(60, 1440)
         self.spin_update_interval.setSuffix(" minutos")
-        self.spin_update_interval.setValue(10)
+        self.spin_update_interval.setValue(60)
         up_form.addRow("Intervalo de Checagem:", self.spin_update_interval)
 
         self.txt_github_repo = QLineEdit("Othayz/central-nvr-wifi")
@@ -262,7 +263,7 @@ class SettingsDialog(QDialog):
         # Valores de atualização
         self.chk_startup_update.setChecked(self.config_mgr.get("check_updates_on_startup", True))
         self.chk_periodic_update.setChecked(self.config_mgr.get("periodic_update_check", True))
-        self.spin_update_interval.setValue(self.config_mgr.get("periodic_update_interval_min", 10))
+        self.spin_update_interval.setValue(self.config_mgr.get("periodic_update_interval_min", 60))
         self.txt_github_repo.setText(self.config_mgr.get("github_repo", "Othayz/central-nvr-wifi"))
         self.txt_github_token.setText(self.config_mgr.get("github_token", ""))
 

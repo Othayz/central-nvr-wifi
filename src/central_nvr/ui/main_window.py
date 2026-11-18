@@ -630,6 +630,9 @@ class MainWindow(QMainWindow):
         item_text = f"[{ts}] {source}: {message}"
         item = QListWidgetItem(item_text)
         self.list_logs.addItem(item)
+        # Limite de itens: o app roda 24/7 e o log crescia sem fim (Issue #37)
+        while self.list_logs.count() > self.MAX_LOG_ITEMS:
+            self.list_logs.takeItem(0)
         self.list_logs.scrollToBottom()
 
     def _change_grid_layout(self, mode: str):
@@ -716,6 +719,7 @@ class MainWindow(QMainWindow):
             enable_port_scan=bool(self.config_mgr.get("enable_port_scan", True)),
         )
         dialog.device_added.connect(self._add_discovered_camera)
+        dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         dialog.exec()
 
     def _add_discovered_camera(self, camera: CameraDevice):
@@ -748,6 +752,7 @@ class MainWindow(QMainWindow):
 
     def _open_settings_dialog(self):
         dialog = SettingsDialog(config_mgr=self.config_mgr, parent=self)
+        dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         if dialog.exec():
             # Atualizar parâmetros de tema, hardware e reconectar
             theme = self.config_mgr.get("theme", "dark").lower()
@@ -774,47 +779,60 @@ class MainWindow(QMainWindow):
         self.update_periodic_timer.timeout.connect(self._run_background_update_check)
         self._reconfigure_periodic_update_checker()
 
+    MIN_UPDATE_INTERVAL_MIN = 60
+    MAX_LOG_ITEMS = 1000
+
     def _reconfigure_periodic_update_checker(self):
         """Aplica periodic_update_check / periodic_update_interval_min sem reiniciar o app (Issue #34)."""
         self.update_periodic_timer.stop()
         if not self.config_mgr.get("periodic_update_check", True):
             return
-        interval_min = self.config_mgr.get("periodic_update_interval_min", 10)
-        self.update_periodic_timer.start(max(1, int(interval_min)) * 60 * 1000)
+        interval_min = max(self.MIN_UPDATE_INTERVAL_MIN, int(self.config_mgr.get("periodic_update_interval_min", 60)))
+        self.update_periodic_timer.start(interval_min * 60 * 1000)
         logger.debug(f"Verificação periódica de atualizações ativa (intervalo: {interval_min} min).")
+
+    def start_background_update_check(self):
+        """Verificação de atualização na abertura, em segundo plano (Issue #37)."""
+        self._run_background_update_check()
 
     def _run_background_update_check(self):
         """Dispara consulta assíncrona ao GitHub em segundo plano."""
-        if hasattr(self, "_periodic_worker") and self._periodic_worker and self._periodic_worker.isRunning():
+        if self._periodic_worker is not None and self._periodic_worker.isRunning():
             logger.debug("Verificação de atualização anterior ainda ativa. Ignorando disparo.")
             return
         repo = self.config_mgr.get("github_repo", "Othayz/central-nvr-wifi")
         token = self.config_mgr.get("github_token", "").strip() or None
-        self._periodic_worker = UpdateCheckWorker(repo=repo, token=token, parent=self)
-        self._periodic_worker.update_available.connect(self._on_background_update_found)
-        self._periodic_worker.start()
+        worker = UpdateCheckWorker(repo=repo, token=token, parent=self)
+        worker.update_available.connect(self._on_background_update_found)
+        # Um worker por checagem: liberado ao terminar (antes acumulava 144 por dia)
+        worker.finished.connect(lambda w=worker: self._release_update_worker(w))
+        self._periodic_worker = worker
+        worker.start()
+
+    def _release_update_worker(self, worker):
+        if self._periodic_worker is worker:
+            self._periodic_worker = None
+        worker.deleteLater()
 
     def _on_background_update_found(self, release: ReleaseInfo):
-        """Abre o diálogo de atualização quando a checagem de 10 minutos encontra uma nova versão."""
-        if hasattr(self, "btn_sb_update"):
-            self.btn_sb_update.setText(f"⚡ Nova Versão v{release.version} Disponível!")
-            self.btn_sb_update.show()
-
-        self._log_event("Atualização", f"Nova versão v{release.version} encontrada no GitHub.")
-
-        # Notificar o usuário abrindo a janela de atualização (apenas uma vez por versão lançada)
+        """
+        Nova versão encontrada: avisa pelo botão da barra de status e pelo log, sem abrir diálogo
+        modal sobre o mosaico (Issue #37). O operador abre a atualização quando quiser.
+        """
+        self._pending_release = release
+        self.btn_sb_update.setText(f"⚡ Nova Versão v{release.version} Disponível!")
+        self.btn_sb_update.show()
         if self._notified_version != release.version:
             self._notified_version = release.version
-            repo = self.config_mgr.get("github_repo", "Othayz/central-nvr-wifi")
-            token = self.config_mgr.get("github_token", "").strip() or None
-            dialog = UpdateDialog(repo=repo, release_info=release, token=token, parent=self)
-            dialog.exec()
+            self._log_event("Atualização", f"Nova versão v{release.version} encontrada no GitHub.")
 
     def _open_update_dialog(self):
-        """Abre a janela de verificação de atualização sob demanda do usuário."""
+        """Abre a janela de atualização sob demanda do usuário."""
         repo = self.config_mgr.get("github_repo", "Othayz/central-nvr-wifi")
         token = self.config_mgr.get("github_token", "").strip() or None
-        dialog = UpdateDialog(repo=repo, token=token, parent=self)
+        dialog = UpdateDialog(repo=repo, release_info=getattr(self, "_pending_release", None),
+                              token=token, parent=self)
+        dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         dialog.exec()
 
     def closeEvent(self, event):
