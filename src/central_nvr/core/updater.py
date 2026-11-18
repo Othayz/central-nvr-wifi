@@ -85,52 +85,62 @@ class ReleaseInfo:
             return self.published_at[:10]
 
 
+_VERSION_IN_TAG_RE = re.compile(r"(\d+(?:\.\d+)+)([-+._]?[0-9A-Za-z][0-9A-Za-z.\-+_]*)?")
+
+
 def parse_release_version(tag_name: str, title: str = "") -> str:
     """
-    Extrai a melhor versão semântica considerando tanto o título da release quanto a tag git.
-    Isso resolve divergências quando uma release é nomeada no GitHub (ex: 'v1.1')
-    enquanto a tag subjacente possui outro formato (ex: 'Central_NVR_WiFi_v1.0.0').
+    Extrai a versão da release **somente da tag** (Issue #35). O título é texto livre (ex.:
+    "Suporte ao Ubuntu 24.04 (v1.2.2)") e não pode competir com a tag; o workflow de release já
+    garante que a tag é igual à versão do projeto. `title` é aceito apenas por compatibilidade.
     """
-    candidates = []
-    for s in [title, tag_name]:
-        if not s:
-            continue
-        m = re.search(r"(?:v|ver|version)?\s*([0-9]+(?:\.[0-9]+)+[a-zA-Z0-9_\-]*)", str(s), re.IGNORECASE)
-        if m:
-            ver_str = m.group(1)
-            candidates.append((parse_version(ver_str), ver_str))
-        else:
-            clean = re.sub(r"^[a-zA-Z_\-]+", "", str(s).strip())
-            if clean and clean[0].isdigit():
-                candidates.append((parse_version(clean), clean))
+    m = _VERSION_IN_TAG_RE.search(str(tag_name or ""))
+    if m:
+        return m.group(1) + (m.group(2) or "")
+    return re.sub(r"^[a-zA-Z_\-]+", "", str(tag_name or "")) or "0.0.0"
 
-    if candidates:
-        candidates.sort(key=lambda x: x[0], reverse=True)
-        return candidates[0][1]
 
-    return re.sub(r"^[a-zA-Z_\-]+", "", tag_name) or "1.0.0"
+def _split_version(ver_str: str) -> Tuple[Tuple[int, ...], str]:
+    """Separa '1.3.0-rc2+build' em ((1, 3, 0), 'rc2'); metadados de build (+...) são ignorados."""
+    clean = re.sub(r"^[a-zA-Z_\-]+", "", str(ver_str or "").strip())
+    m = re.match(r"(\d+(?:\.\d+)*)(.*)$", clean)
+    if not m:
+        return (0, 0, 0), ""
+    release = tuple(int(x) for x in m.group(1).split("."))
+    suffix = m.group(2).split("+", 1)[0].lstrip("-._")
+    return release, suffix
 
 
 def parse_version(ver_str: str) -> Tuple[int, ...]:
     """
-    Converte uma string de versão (ex: 'v1.2.3', '1.0.0-beta', '2.1') em uma tupla comparável.
+    Componentes numéricos da versão (ex.: 'v1.2.3' → (1, 2, 3); '1.0.0-rc1' → (1, 0, 0)).
+    O sufixo de pré-release não entra aqui: veja version_key().
     """
-    if not ver_str:
-        return (0, 0, 0)
-    
-    clean_ver = re.sub(r"^[a-zA-Z_\-]+", "", str(ver_str).strip())
-    parts = []
-    for part in re.split(r"[.\-+]", clean_ver):
-        digits = re.findall(r"\d+", part)
-        if digits:
-            parts.append(int(digits[0]))
-        else:
-            break
-
+    release, _ = _split_version(ver_str)
+    parts = list(release)
     while len(parts) < 3:
         parts.append(0)
+    return tuple(parts)
 
-    return tuple(parts[:4])
+
+def is_prerelease(ver_str: str) -> bool:
+    """True para versões com sufixo de pré-release (1.3.0-beta, 1.3.0rc1...)."""
+    return bool(_split_version(ver_str)[1])
+
+
+def version_key(ver_str: str) -> Tuple[Any, ...]:
+    """
+    Chave de ordenação com a precedência do SemVer: a pré-release vem **antes** da versão final
+    (1.2.1-rc2 < 1.2.1; 1.3.0-beta < 1.3.0) e identificadores numéricos comparam como números
+    (rc2 < rc10).
+    """
+    release, suffix = _split_version(ver_str)
+    padded = tuple(release) + (0,) * max(0, 6 - len(release))
+    if not suffix:
+        return (padded, (1,))
+    ids = tuple((0, int(tok), "") if tok.isdigit() else (1, 0, tok.lower())
+                for tok in re.findall(r"\d+|[A-Za-z]+", suffix))
+    return (padded, (0,) + ids)
 
 
 def is_version_newer(current_ver: str, remote_ver: str) -> bool:
@@ -138,9 +148,7 @@ def is_version_newer(current_ver: str, remote_ver: str) -> bool:
     Compara a versão atual com a versão remota do GitHub.
     Retorna True se remote_ver for estritamente mais recente que current_ver.
     """
-    parsed_curr = parse_version(current_ver)
-    parsed_rem = parse_version(remote_ver)
-    return parsed_rem > parsed_curr
+    return version_key(remote_ver) > version_key(current_ver)
 
 
 def detect_system_package_format() -> str:
@@ -229,6 +237,14 @@ def fetch_latest_release(
     url = f"https://api.github.com/repos/{repo}/releases/latest"
 
     try:
+        if include_prereleases:
+            # /releases/latest nunca devolve pré-releases: listar e escolher a maior versão
+            list_resp = requests.get(f"https://api.github.com/repos/{repo}/releases", headers=headers, timeout=timeout)
+            if list_resp.status_code == 200:
+                best = _pick_highest_release(list_resp.json(), include_prereleases=True)
+                if best is not None:
+                    return _parse_github_release_dict(best)
+
         response = requests.get(url, headers=headers, timeout=timeout)
 
         # 401: Token inválido
@@ -253,10 +269,9 @@ def fetch_latest_release(
 
             if list_resp.status_code == 200:
                 releases = list_resp.json()
-                if isinstance(releases, list) and len(releases) > 0:
-                    candidates = [r for r in releases if include_prereleases or not r.get("prerelease", False)]
-                    if candidates:
-                        return _parse_github_release_dict(candidates[0])
+                best = _pick_highest_release(releases, include_prereleases=include_prereleases)
+                if best is not None:
+                    return _parse_github_release_dict(best)
 
             # 2. Se a lista de releases também deu 404, verificar se o repositório ou tags existem
             tags_url = f"https://api.github.com/repos/{repo}/tags"
@@ -264,10 +279,14 @@ def fetch_latest_release(
 
             if tags_resp.status_code == 200:
                 tags = tags_resp.json()
-                if isinstance(tags, list) and len(tags) > 0:
-                    first_tag = tags[0]
-                    tag_name = first_tag.get("name", "v1.0.0")
-                    clean_v = re.sub(r"^[a-zA-Z_\-]+", "", tag_name)
+                # A ordem da API não é por versão nem por data: ordenar e ignorar pré-releases
+                versioned = [] if not isinstance(tags, list) else [
+                    (t.get("name", ""), parse_release_version(t.get("name", "")))
+                    for t in tags if isinstance(t, dict) and _VERSION_IN_TAG_RE.search(t.get("name", ""))
+                ]
+                versioned = [(name, ver) for name, ver in versioned if not is_prerelease(ver)]
+                if versioned:
+                    tag_name, clean_v = max(versioned, key=lambda nv: version_key(nv[1]))
                     return ReleaseInfo(
                         tag_name=tag_name,
                         version=clean_v,
@@ -315,6 +334,20 @@ def fetch_latest_release(
     except Exception as e:
         logger.error(f"Erro inesperado ao processar dados de release do GitHub: {e}")
         raise RuntimeError(f"Erro ao processar dados da release: {e}") from e
+
+
+def _pick_highest_release(releases: Any, include_prereleases: bool) -> Optional[Dict[str, Any]]:
+    """Release publicada (não rascunho) de maior versão; pré-releases só se permitidas."""
+    if not isinstance(releases, list):
+        return None
+    candidates = [
+        r for r in releases
+        if isinstance(r, dict) and not r.get("draft", False)
+        and (include_prereleases or not r.get("prerelease", False))
+    ]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda r: version_key(parse_release_version(r.get("tag_name", ""))))
 
 
 def _parse_github_release_dict(data: Dict[str, Any]) -> ReleaseInfo:
