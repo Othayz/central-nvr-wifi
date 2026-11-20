@@ -37,6 +37,9 @@ class SettingsDialog(QDialog):
     def __init__(self, config_mgr: ConfigManager, parent: Optional[QWidget] = None):
         super().__init__(parent)
         self.config_mgr = config_mgr
+        self._loaded_hw_accel: Optional[str] = None
+        self._loaded_rtsp_transport: Optional[str] = None
+        self._unrepresented_hw_accel: Optional[str] = None
         self.setWindowTitle("Configurações do Sistema - Central NVR WiFi")
         self.resize(580, 520)
 
@@ -76,6 +79,8 @@ class SettingsDialog(QDialog):
         self.combo_hw.addItem("VA-API (Linux Hardware - Intel/AMD)", "vaapi")
         self.combo_hw.addItem("CPU / Software (Universal)", "cpu")
         self.combo_hw.addItem("NVIDIA CUDA / NVDEC", "cuda")
+        self.combo_hw.currentIndexChanged.connect(self._on_hw_selection_changed)
+        self.combo_hw.activated.connect(self._on_hw_selection_changed)
         hw_form.addRow("Decodificação por GPU:", self.combo_hw)
 
         self.combo_proto = QComboBox()
@@ -83,6 +88,12 @@ class SettingsDialog(QDialog):
         self.combo_proto.addItem("TCP Interleaved (Mais estável contra perda Wi-Fi)", "tcp")
         self.combo_proto.addItem("UDP Unicast (Menor latência bruta)", "udp")
         hw_form.addRow("Transporte RTSP:", self.combo_proto)
+
+        self.lbl_cli_override_notice = QLabel()
+        self.lbl_cli_override_notice.setWordWrap(True)
+        self.lbl_cli_override_notice.setStyleSheet("color: #F59E0B; font-size: 11px; font-weight: 600;")
+        self.lbl_cli_override_notice.setVisible(False)
+        hw_form.addRow("", self.lbl_cli_override_notice)
 
         self.chk_motion = QCheckBox("Habilitar Detecção de Movimento (Edge-AI)")
         self.chk_motion.setChecked(True)
@@ -230,48 +241,97 @@ class SettingsDialog(QDialog):
 
         main_layout.addLayout(btn_box)
 
+    def _get_persisted(self, key: str, default=None):
+        """Lê o valor persistido (compatível com mocks que expõem apenas get())."""
+        getter = getattr(self.config_mgr, "get_persisted", self.config_mgr.get)
+        return getter(key, default)
+
+    def _on_hw_selection_changed(self, _index: int):
+        self._unrepresented_hw_accel = None
+
+    def _update_cli_override_notice(self):
+        has_override = getattr(self.config_mgr, "has_override", None)
+        get_override = getattr(self.config_mgr, "get_override", None)
+        if not callable(has_override) or not callable(get_override):
+            self.lbl_cli_override_notice.setVisible(False)
+            return
+
+        active_flags = []
+        if has_override("hw_accel"):
+            active_flags.append(f"--hw-accel {get_override('hw_accel')}")
+        if has_override("rtsp_transport"):
+            active_flags.append(f"--transport {get_override('rtsp_transport')}")
+
+        if active_flags:
+            flags_str = ", ".join(active_flags)
+            self.lbl_cli_override_notice.setText(
+                f"Override de CLI ativo nesta execução ({flags_str}). "
+                "Os campos acima exibem as preferências salvas; alterá-los aqui substitui o override na sessão atual."
+            )
+            self.lbl_cli_override_notice.setVisible(True)
+        else:
+            self.lbl_cli_override_notice.setText("")
+            self.lbl_cli_override_notice.setVisible(False)
+
     def _load_values(self):
-        theme = self.config_mgr.get("theme", "dark")
+        theme = self._get_persisted("theme", "dark")
         idx_t = self.combo_theme.findData(theme)
         if idx_t >= 0:
             self.combo_theme.setCurrentIndex(idx_t)
 
-        hw = self.config_mgr.get("hw_accel", "vaapi")
+        hw = self._get_persisted("hw_accel", "vaapi")
+        self._loaded_hw_accel = hw
         idx = self.combo_hw.findData(hw)
         if idx >= 0:
-            self.combo_hw.setCurrentIndex(idx)
+            self._unrepresented_hw_accel = None
+            self.combo_hw.blockSignals(True)
+            try:
+                self.combo_hw.setCurrentIndex(idx)
+            finally:
+                self.combo_hw.blockSignals(False)
+        else:
+            # Preserva valores persistidos fora do combo (ex.: "auto") se o usuário não alterar o campo
+            self._unrepresented_hw_accel = hw
 
-        proto = self.config_mgr.get("rtsp_transport", DEFAULT_RTSP_TRANSPORT)
+        proto = self._get_persisted("rtsp_transport", DEFAULT_RTSP_TRANSPORT)
+        self._loaded_rtsp_transport = proto
         idx_p = self.combo_proto.findData(proto)
         if idx_p >= 0:
             self.combo_proto.setCurrentIndex(idx_p)
-        self.chk_motion.setChecked(self.config_mgr.get("enable_motion_detection", True))
 
-        self.spin_buffer.setValue(self.config_mgr.get("buffer_size_ms", 150))
-        self.txt_snap_dir.setText(self.config_mgr.get("snapshot_dir", ""))
-        self.txt_rec_dir.setText(self.config_mgr.get("recordings_dir", ""))
-        self.txt_default_user.setText(self.config_mgr.get("default_username", "admin"))
-        self.spin_reconn.setValue(self.config_mgr.get("reconnect_interval_sec", 5))
-        self.spin_hidden_timeout.setValue(int(self.config_mgr.get("hidden_camera_timeout_min", 5)))
-        self.chk_auto_reconnect.setChecked(bool(self.config_mgr.get("auto_reconnect", True)))
-        self.spin_discovery_timeout.setValue(float(self.config_mgr.get("ws_discovery_timeout", 3.0)))
-        self.chk_port_scan_default.setChecked(bool(self.config_mgr.get("enable_port_scan", True)))
-        self.chk_osd_timestamp.setChecked(bool(self.config_mgr.get("show_osd_timestamp", True)))
-        self.chk_osd_fps.setChecked(bool(self.config_mgr.get("show_osd_fps", True)))
-        self.chk_osd_bitrate.setChecked(bool(self.config_mgr.get("show_osd_bitrate", True)))
+        self._update_cli_override_notice()
+        self.chk_motion.setChecked(self._get_persisted("enable_motion_detection", True))
+
+        self.spin_buffer.setValue(self._get_persisted("buffer_size_ms", 150))
+        self.txt_snap_dir.setText(self._get_persisted("snapshot_dir", ""))
+        self.txt_rec_dir.setText(self._get_persisted("recordings_dir", ""))
+        self.txt_default_user.setText(self._get_persisted("default_username", "admin"))
+        self.spin_reconn.setValue(self._get_persisted("reconnect_interval_sec", 5))
+        self.spin_hidden_timeout.setValue(int(self._get_persisted("hidden_camera_timeout_min", 5)))
+        self.chk_auto_reconnect.setChecked(bool(self._get_persisted("auto_reconnect", True)))
+        self.spin_discovery_timeout.setValue(float(self._get_persisted("ws_discovery_timeout", 3.0)))
+        self.chk_port_scan_default.setChecked(bool(self._get_persisted("enable_port_scan", True)))
+        self.chk_osd_timestamp.setChecked(bool(self._get_persisted("show_osd_timestamp", True)))
+        self.chk_osd_fps.setChecked(bool(self._get_persisted("show_osd_fps", True)))
+        self.chk_osd_bitrate.setChecked(bool(self._get_persisted("show_osd_bitrate", True)))
 
         # Valores de atualização
-        self.chk_startup_update.setChecked(self.config_mgr.get("check_updates_on_startup", True))
-        self.chk_periodic_update.setChecked(self.config_mgr.get("periodic_update_check", True))
-        self.spin_update_interval.setValue(self.config_mgr.get("periodic_update_interval_min", 60))
-        self.txt_github_repo.setText(self.config_mgr.get("github_repo", "Othayz/central-nvr-wifi"))
-        self.txt_github_token.setText(self.config_mgr.get("github_token", ""))
+        self.chk_startup_update.setChecked(self._get_persisted("check_updates_on_startup", True))
+        self.chk_periodic_update.setChecked(self._get_persisted("periodic_update_check", True))
+        self.spin_update_interval.setValue(self._get_persisted("periodic_update_interval_min", 60))
+        self.txt_github_repo.setText(self._get_persisted("github_repo", "Othayz/central-nvr-wifi"))
+        self.txt_github_token.setText(self._get_persisted("github_token", ""))
 
     def collect_values(self) -> dict:
         """Valores da tela, prontos para gravar de uma vez com ConfigManager.update()."""
+        hw_value = (
+            self._unrepresented_hw_accel
+            if self._unrepresented_hw_accel is not None
+            else self.combo_hw.currentData()
+        )
         return {
             "theme": self.combo_theme.currentData(),
-            "hw_accel": self.combo_hw.currentData(),
+            "hw_accel": hw_value,
             "rtsp_transport": self.combo_proto.currentData(),
             "enable_motion_detection": self.chk_motion.isChecked(),
             "buffer_size_ms": self.spin_buffer.value(),
@@ -293,8 +353,17 @@ class SettingsDialog(QDialog):
         }
 
     def _save_values(self):
+        values = self.collect_values()
         # Uma única gravação de settings.json (antes eram ~14, uma por chave)
-        self.config_mgr.update(self.collect_values())
+        self.config_mgr.update(values)
+
+        # Limpa o override de CLI somente para chaves que o usuário alterou explicitamente na tela
+        clear_override = getattr(self.config_mgr, "clear_override", None)
+        if callable(clear_override):
+            if values["hw_accel"] != self._loaded_hw_accel:
+                clear_override("hw_accel")
+            if values["rtsp_transport"] != self._loaded_rtsp_transport:
+                clear_override("rtsp_transport")
 
         QMessageBox.information(self, "Configurações", "Configurações salvas com sucesso!")
         self.accept()

@@ -60,10 +60,10 @@ def apply_cli_overrides(config_mgr: ConfigManager, args: argparse.Namespace) -> 
     """
     hw_accel = getattr(args, "hw_accel", None)
     if hw_accel:
-        config_mgr.settings["hw_accel"] = hw_accel
+        config_mgr.set_override("hw_accel", hw_accel)
     transport = getattr(args, "transport", None)
     if transport:
-        config_mgr.settings["rtsp_transport"] = transport
+        config_mgr.set_override("rtsp_transport", transport)
 
 
 def setup_logging(debug: bool = False):
