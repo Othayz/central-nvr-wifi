@@ -294,7 +294,15 @@ class SettingsDialog(QDialog):
 
     def _save_values(self):
         # Uma única gravação de settings.json (antes eram ~14, uma por chave)
-        self.config_mgr.update(self.collect_values())
+        saved = self.config_mgr.update(self.collect_values())
+        if saved is False:
+            err = getattr(self.config_mgr, "last_write_error", None) or "erro de E/S"
+            QMessageBox.critical(
+                self,
+                "Erro ao Salvar Configurações",
+                f"Não foi possível salvar as configurações: {err}",
+            )
+            return
 
         QMessageBox.information(self, "Configurações", "Configurações salvas com sucesso!")
         self.accept()

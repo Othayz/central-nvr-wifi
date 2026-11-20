@@ -505,10 +505,19 @@ class MainWindow(QMainWindow):
         if not cam:
             return
         old_name = cam.name
-        cam.name = new_name
 
-        # 1. Salvar no ConfigManager (devices.json)
-        self.config_mgr.rename_device(camera_id, new_name)
+        # 1. Salvar no ConfigManager (devices.json) antes de alterar a interface
+        if not self.config_mgr.rename_device(camera_id, new_name):
+            err = getattr(self.config_mgr, "last_write_error", None) or "erro de E/S"
+            self._log_event("Erro", f"Não foi possível renomear o Dispositivo Cadastrado '{old_name}': {err}")
+            QMessageBox.critical(
+                self,
+                "Erro ao Renomear Câmera",
+                f"Não foi possível salvar a renomeação da câmera: {err}",
+            )
+            return
+
+        cam.name = new_name
 
         # 2. Atualizar no grid de câmeras
         self.camera_grid.update_camera_name(camera_id, new_name)
@@ -589,7 +598,15 @@ class MainWindow(QMainWindow):
         )
 
         if reply == QMessageBox.StandardButton.Yes:
-            self.config_mgr.remove_device(cam_id)
+            if not self.config_mgr.remove_device(cam_id):
+                err = getattr(self.config_mgr, "last_write_error", None) or "erro de E/S"
+                self._log_event("Erro", f"Não foi possível remover o Dispositivo Cadastrado '{cam_name}': {err}")
+                QMessageBox.critical(
+                    self,
+                    "Erro ao Remover Câmera",
+                    f"Não foi possível salvar a remoção da câmera: {err}",
+                )
+                return
             self._load_cameras_from_config()
             self.camera_grid.set_cameras(self.cameras)
             self._populate_device_tree()
@@ -721,17 +738,13 @@ class MainWindow(QMainWindow):
             default_username=self.config_mgr.get("default_username", ""),
             discovery_timeout=float(self.config_mgr.get("ws_discovery_timeout", 3.0)),
             enable_port_scan=bool(self.config_mgr.get("enable_port_scan", True)),
+            on_device_added=self._add_discovered_camera,
         )
-        dialog.device_added.connect(self._add_discovered_camera)
         dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         dialog.exec()
 
-    def _add_discovered_camera(self, camera: CameraDevice):
+    def _add_discovered_camera(self, camera: CameraDevice) -> bool:
         saved = self.config_mgr.add_or_update_device(camera.to_dict())
-        self._load_cameras_from_config()
-        self.camera_grid.set_cameras(self.cameras)
-        self._populate_device_tree()
-        self.lbl_sb_streams.setText(f"Câmeras Cadastradas: {len(self.cameras)}")
         if not saved:
             err = self.config_mgr.last_write_error or "erro de E/S"
             self._log_event("Erro", f"Não foi possível salvar o Dispositivo Cadastrado '{camera.name}': {err}")
@@ -740,8 +753,13 @@ class MainWindow(QMainWindow):
                 "Erro ao Salvar Dispositivo",
                 f"Não foi possível salvar a lista de dispositivos: {err}",
             )
-            return
+            return False
+        self._load_cameras_from_config()
+        self.camera_grid.set_cameras(self.cameras)
+        self._populate_device_tree()
+        self.lbl_sb_streams.setText(f"Câmeras Cadastradas: {len(self.cameras)}")
         self._log_event("Dispositivo", f"Câmera '{camera.name}' adicionada ao sistema.")
+        return True
 
     def _set_theme(self, theme_name: str):
         """Aplica o tema selecionado (dark ou light) e salva nas preferências."""

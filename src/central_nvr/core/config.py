@@ -1,6 +1,7 @@
 """
 Módulo de Configuração e Persistência do Sistema (Padrão XDG).
 """
+import copy
 import json
 import logging
 import os
@@ -186,9 +187,49 @@ def _secure_write_json(filepath: Path, data: Any):
         raise
 
 
-def _channel_key(device: Dict[str, Any]) -> Tuple[Any, Any]:
+def _device_rtsp_port(device: Dict[str, Any]) -> int:
+    """Normaliza a porta RTSP de um Dispositivo Cadastrado para comparação."""
+    port = device.get("rtsp_port", 554)
+    try:
+        return int(554 if port is None else port)
+    except (TypeError, ValueError):
+        return 554
+
+
+def _channel_key(device: Dict[str, Any]) -> Tuple[int, Any, Any]:
     """Assinatura de canal RTSP para distinguir múltiplos canais no mesmo IP/porta."""
-    return (device.get("rtsp_path", "/live/ch0"), device.get("rtsp_url", ""))
+    return (
+        _device_rtsp_port(device),
+        device.get("rtsp_path", "/live/ch0"),
+        device.get("rtsp_url", ""),
+    )
+
+
+def _same_id_channel_compatible(existing: Dict[str, Any], entry: Dict[str, Any]) -> bool:
+    """
+    Indica se dois registros com o mesmo ID representam o mesmo canal (permitindo atualizar
+    rtsp_url/rtsp_path recém-descobertos via ONVIF) ou dois canais colidentes no mesmo IP.
+    """
+    if existing.get("ip") != entry.get("ip"):
+        return True
+    if _channel_key(existing) == _channel_key(entry):
+        return True
+    existing_port = _device_rtsp_port(existing)
+    entry_port = _device_rtsp_port(entry)
+    if existing_port != entry_port:
+        return False
+    existing_path = existing.get("rtsp_path", "/live/ch0")
+    entry_path = entry.get("rtsp_path", "/live/ch0")
+    if existing_path == entry_path:
+        return True
+    existing_url = existing.get("rtsp_url", "")
+    entry_url = entry.get("rtsp_url", "")
+    # Permite atualizar câmera cujo rtsp_url antes estava no fallback vazio e foi descoberto via ONVIF
+    if bool(existing_url) != bool(entry_url) and (
+        existing_path == "/live/ch0" or entry_path == "/live/ch0"
+    ):
+        return True
+    return False
 
 
 def _device_port(device: Dict[str, Any]) -> int:
@@ -214,8 +255,8 @@ class ConfigManager:
         "reconnect_interval_sec": 5,
         "hidden_camera_timeout_min": 5,
         "default_username": "",
-        "snapshot_dir": str(get_data_dir() / "snapshots"),
-        "recordings_dir": str(get_data_dir() / "recordings"),
+        "snapshot_dir": "",
+        "recordings_dir": "",
         "ws_discovery_timeout": 3.0,
         "enable_port_scan": True,
         "show_osd_fps": True,
@@ -231,8 +272,12 @@ class ConfigManager:
     def __init__(self):
         self.config_path = get_config_dir() / "settings.json"
         self.devices_path = get_config_dir() / "devices.json"
+        data_dir = get_data_dir()
         self.settings: Dict[str, Any] = self.DEFAULT_SETTINGS.copy()
+        self.settings["snapshot_dir"] = str(data_dir / "snapshots")
+        self.settings["recordings_dir"] = str(data_dir / "recordings")
         self.devices: List[Dict[str, Any]] = []
+        self._keyring_synced: Dict[str, str] = {}
         self.last_write_error: Optional[str] = None
         self.load()
 
@@ -269,16 +314,19 @@ class ConfigManager:
                 # SEC-01: Carregar senhas do keyring e migrar senhas legadas em texto puro
                 need_resave = False
                 keyring_active = is_keyring_available()
+                self._keyring_synced = {}
                 for d in self.devices:
                     dev_id = d.get("id") or d.get("ip")
                     if dev_id:
                         plaintext_pass = d.get("password")
                         if plaintext_pass and keyring_active:
-                            set_keyring_password(dev_id, plaintext_pass)
+                            if set_keyring_password(dev_id, plaintext_pass):
+                                self._keyring_synced[dev_id] = plaintext_pass
                             need_resave = True
                         kr_pass = get_keyring_password(dev_id)
                         if kr_pass is not None:
                             d["password"] = kr_pass
+                            self._keyring_synced[dev_id] = kr_pass
 
                 if need_resave:
                     self.save_devices()
@@ -300,34 +348,60 @@ class ConfigManager:
             logger.error(f"Não foi possível salvar configurações: {e}")
             return False
 
-    def save_devices(self) -> bool:
-        """Salva a lista de câmeras/dispositivos cadastrados sanitizando senhas se keyring ativo (SEC-01)."""
+    def _persist_devices(self, devices: List[Dict[str, Any]]) -> bool:
+        """
+        Persiste a lista de dispositivos de forma transacional: só sincroniza no keyring senhas
+        novas/alteradas e reverte alterações de keyring se _secure_write_json() falhar.
+        """
         self.last_write_error = None
-        try:
-            import copy
-            devices_to_save = []
-            keyring_active = is_keyring_available()
+        keyring_active = is_keyring_available()
+        devices_to_save = []
+        keyring_rollback: List[Tuple[str, Optional[str]]] = []
+        new_synced = dict(self._keyring_synced)
 
-            for d in self.devices:
+        try:
+            for d in devices:
                 dev_id = d.get("id") or d.get("ip")
                 d_copy = copy.deepcopy(d)
                 raw_pwd = d.get("password", "")
 
                 if dev_id and raw_pwd:
-                    saved = set_keyring_password(dev_id, raw_pwd)
+                    if new_synced.get(dev_id) == raw_pwd:
+                        saved = True
+                    else:
+                        prev_pwd = new_synced.get(dev_id)
+                        saved = set_keyring_password(dev_id, raw_pwd)
+                        if saved:
+                            keyring_rollback.append((dev_id, prev_pwd))
+                            new_synced[dev_id] = raw_pwd
                     if keyring_active and saved:
                         d_copy.pop("password", None)
                 elif dev_id and not raw_pwd and keyring_active:
+                    if dev_id in new_synced:
+                        prev_pwd = new_synced.get(dev_id)
+                        if set_keyring_password(dev_id, ""):
+                            keyring_rollback.append((dev_id, prev_pwd))
+                            new_synced.pop(dev_id, None)
                     d_copy.pop("password", None)
 
                 devices_to_save.append(d_copy)
 
             _secure_write_json(self.devices_path, devices_to_save)
+            self._keyring_synced = new_synced
             return True
         except (OSError, PermissionError) as e:
+            for rb_id, prev_pwd in reversed(keyring_rollback):
+                if prev_pwd:
+                    set_keyring_password(rb_id, prev_pwd)
+                else:
+                    delete_keyring_password(rb_id)
             self.last_write_error = str(e)
             logger.error(f"Não foi possível salvar dispositivos: {e}")
             return False
+
+    def save_devices(self) -> bool:
+        """Salva a lista de câmeras/dispositivos cadastrados sanitizando senhas se keyring ativo (SEC-01)."""
+        return self._persist_devices(self.devices)
 
     def get(self, key: str, default: Any = None) -> Any:
         if key == "github_token":
@@ -346,17 +420,25 @@ class ConfigManager:
 
     def update(self, values: Dict[str, Any]) -> bool:
         """Atualiza várias chaves e grava settings.json uma única vez (Issue #34)."""
+        previous_settings = self.settings.copy()
         for key, value in values.items():
             self._store(key, value)
-        return self.save_settings()
+        if not self.save_settings():
+            self.settings = previous_settings
+            return False
+        return True
 
     def set(self, key: str, value: Any) -> bool:
+        previous_settings = self.settings.copy()
         self._store(key, value)
-        return self.save_settings()
+        if not self.save_settings():
+            self.settings = previous_settings
+            return False
+        return True
 
     def add_or_update_device(self, device: Dict[str, Any]) -> bool:
         """Adiciona um novo Dispositivo Cadastrado ou atualiza o canal correspondente sem sobrescrever outros canais."""
-        entry = dict(device)
+        entry = copy.deepcopy(device)
         if not str(entry.get("id") or "").strip():
             entry["id"] = f"cam_{uuid.uuid4().hex[:12]}"
 
@@ -373,18 +455,22 @@ class ConfigManager:
             )
             same_id_compatible = (
                 d.get("id") == entry["id"]
-                and (_channel_key(d) == entry_channel or d.get("ip") != entry_ip)
+                and _same_id_channel_compatible(d, entry)
             )
             if same_endpoint_channel or same_id_compatible:
                 match_index = i
                 break
 
+        candidate_devices = list(self.devices)
+        old_keyring_id: Optional[str] = None
+
         if match_index is not None:
-            existing = self.devices[match_index]
+            existing = candidate_devices[match_index]
             old_id = existing.get("id")
+            old_keyring_id = old_id or existing.get("ip")
             other_ids = {
                 other.get("id")
-                for j, other in enumerate(self.devices)
+                for j, other in enumerate(candidate_devices)
                 if j != match_index
             }
             if entry["id"] in other_ids:
@@ -394,51 +480,70 @@ class ConfigManager:
                     base_id = entry["id"]
                     while entry["id"] in other_ids:
                         entry["id"] = f"{base_id}_{uuid.uuid4().hex[:6]}"
-            if old_id and old_id != entry["id"]:
-                delete_keyring_password(old_id)
-            self.devices[match_index] = entry
+            candidate_devices[match_index] = entry
         else:
-            existing_ids = {d.get("id") for d in self.devices}
+            existing_ids = {d.get("id") for d in candidate_devices}
             if entry["id"] in existing_ids:
                 base_id = entry["id"]
                 while entry["id"] in existing_ids:
                     entry["id"] = f"{base_id}_{uuid.uuid4().hex[:6]}"
-            self.devices.append(entry)
+            candidate_devices.append(entry)
 
-        if "password" in entry:
-            set_keyring_password(entry["id"], entry.get("password", ""))
+        if not self._persist_devices(candidate_devices):
+            return False
 
-        return self.save_devices()
+        self.devices = candidate_devices
+        if old_keyring_id and old_keyring_id != entry["id"]:
+            delete_keyring_password(old_keyring_id)
+            self._keyring_synced.pop(old_keyring_id, None)
+        return True
 
     def rename_device(self, dev_id: str, new_name: str) -> bool:
         """Atualiza o nome de um dispositivo existente por ID ou IP e persiste no disco."""
+        candidate_devices = copy.deepcopy(self.devices)
         updated = False
-        for dev in self.devices:
+        for dev in candidate_devices:
             if dev.get("id") == dev_id or dev.get("ip") == dev_id:
                 dev["name"] = new_name
                 updated = True
-        if updated:
-            return self.save_devices()
-        return False
+        if not updated:
+            return False
+        if not self._persist_devices(candidate_devices):
+            return False
+        self.devices = candidate_devices
+        return True
 
     def update_device(self, dev_id: str, fields: Dict[str, Any]) -> bool:
         """Atualiza campos de um dispositivo existente (por ID) e persiste no disco."""
+        candidate_devices = copy.deepcopy(self.devices)
         updated = False
-        for dev in self.devices:
+        for dev in candidate_devices:
             if dev.get("id") == dev_id:
                 dev.update(fields)
                 updated = True
-        if updated:
-            return self.save_devices()
-        return False
+        if not updated:
+            return False
+        if not self._persist_devices(candidate_devices):
+            return False
+        self.devices = candidate_devices
+        return True
 
     def remove_device(self, dev_id: str) -> bool:
         """Remove um Dispositivo Cadastrado pelo seu ID ou IP e limpa sua senha no keyring."""
         removed = [d for d in self.devices if d.get("id") == dev_id or d.get("ip") == dev_id]
+        candidate_devices = [d for d in self.devices if d.get("id") != dev_id and d.get("ip") != dev_id]
+        if not self._persist_devices(candidate_devices):
+            return False
+
+        self.devices = candidate_devices
+        keys_to_delete = set()
         for dev in removed:
-            removed_id = dev.get("id")
-            if removed_id and removed_id != dev_id:
-                delete_keyring_password(removed_id)
-        delete_keyring_password(dev_id)
-        self.devices = [d for d in self.devices if d.get("id") != dev_id and d.get("ip") != dev_id]
-        return self.save_devices()
+            for key in (dev.get("id"), dev.get("ip")):
+                if key:
+                    keys_to_delete.add(key)
+        if dev_id:
+            keys_to_delete.add(dev_id)
+        for key in keys_to_delete:
+            delete_keyring_password(key)
+            self._keyring_synced.pop(key, None)
+        return True

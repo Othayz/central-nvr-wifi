@@ -3,7 +3,7 @@ Diálogo de Descoberta de Rede (WS-Discovery ONVIF e Sondagem de Portas) e Adiç
 """
 import hashlib
 import ipaddress
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from PySide6.QtCore import QObject, QThread, Qt, Signal
 from PySide6.QtWidgets import (
@@ -100,13 +100,15 @@ class DiscoveryDialog(QDialog):
     device_added = Signal(object)  # CameraDevice
 
     def __init__(self, parent: Optional[QWidget] = None, default_username: str = "",
-                 discovery_timeout: float = 4.0, enable_port_scan: bool = True):
+                 discovery_timeout: float = 4.0, enable_port_scan: bool = True,
+                 on_device_added: Optional[Callable[[CameraDevice], bool]] = None):
         super().__init__(parent)
         # Configurações ws_discovery_timeout / enable_port_scan (Issue #34)
         self.discovery_timeout = float(discovery_timeout)
         self.default_port_scan = bool(enable_port_scan)
         # Configuração `default_username`; "admin" se o usuário nunca a definiu
         self.default_username = default_username or "admin"
+        self._on_device_added = on_device_added
         self.setWindowTitle("Gerenciamento de Dispositivos e Descoberta de Rede")
         self.resize(780, 520)
         self.discovered_list: List[Dict[str, Any]] = []
@@ -377,18 +379,34 @@ class DiscoveryDialog(QDialog):
     def _on_enrich_progress(self, current: int, total: int, name: str):
         self.lbl_scan_status.setText(f"Consultando ONVIF ({current}/{total}): {name}")
 
+    def _commit_device(self, camera: CameraDevice) -> bool:
+        """Persiste o dispositivo via callback da janela principal (quando fornecido) e emite device_added."""
+        if self._on_device_added is not None:
+            saved = bool(self._on_device_added(camera))
+            if saved:
+                self.device_added.emit(camera)
+            return saved
+        self.device_added.emit(camera)
+        return True
+
     def _on_enrich_finished(self, results: list):
         worker, self.enrich_worker = self.enrich_worker, None
         if worker is not None:
             retire_thread(worker)  # Libera quando o run() terminar de retornar
         self.btn_add_selected.setEnabled(True)
+        added_count = 0
         warnings = []
         for camera, warning in results:
-            self.device_added.emit(camera)
+            if not self._commit_device(camera):
+                continue
+            added_count += 1
             if warning:
                 warnings.append(f"• {camera.name} ({camera.ip}): {warning}")
 
-        msg = f"{len(results)} dispositivo(s) adicionado(s)."
+        if added_count == 0:
+            return
+
+        msg = f"{added_count} dispositivo(s) adicionado(s)."
         if warnings:
             msg += "\n\nAtenção:\n" + "\n".join(warnings)
             QMessageBox.warning(self, "Dispositivos adicionados com avisos", msg)
@@ -445,11 +463,13 @@ class DiscoveryDialog(QDialog):
         preset = self.combo_preset.currentData()
         mfg = "Yoosee" if preset == "yoosee" else ("Intelbras" if preset == "intelbras" else ("Hikvision" if preset == "hikvision" else "Genérico"))
 
+        rtsp_port = self.spin_man_rtsp_port.value()
         rtsp_path = self.txt_man_rtsp_path.text().strip()
         base_id = f"cam_{ip.replace('.', '_').replace(':', '_')}_{self.spin_man_port.value()}"
+        channel_sig = f"{rtsp_port}:{rtsp_path}" if (rtsp_path or rtsp_port != 554) else ""
         dev_id = (
-            f"{base_id}_{hashlib.sha1(rtsp_path.encode('utf-8')).hexdigest()[:6]}"
-            if rtsp_path
+            f"{base_id}_{hashlib.sha1(channel_sig.encode('utf-8')).hexdigest()[:6]}"
+            if channel_sig
             else base_id
         )
 
@@ -458,7 +478,7 @@ class DiscoveryDialog(QDialog):
             name=self.txt_man_name.text().strip() or "Câmera Manual",
             ip=ip,
             port=self.spin_man_port.value(),
-            rtsp_port=self.spin_man_rtsp_port.value(),
+            rtsp_port=rtsp_port,
             rtsp_path=rtsp_path,
             username=self.txt_man_user.text().strip(),
             password=self.txt_man_pass.text(),
@@ -467,7 +487,8 @@ class DiscoveryDialog(QDialog):
             has_ptz=self.chk_man_ptz.isChecked(),
             enabled=True,
         )
-        self.device_added.emit(camera)
+        if not self._commit_device(camera):
+            return
         QMessageBox.information(self, "Sucesso", f"Câmera '{camera.name}' adicionada com sucesso!")
         self.accept()
 
