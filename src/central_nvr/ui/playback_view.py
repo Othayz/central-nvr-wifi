@@ -5,7 +5,8 @@ import datetime
 import logging
 import os
 import subprocess
-from typing import Optional
+from pathlib import Path
+from typing import Optional, Union
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
@@ -35,9 +36,16 @@ class PlaybackWidget(QWidget):
 
     playback_requested = Signal(str, str)  # (camera_name, time_str)
 
-    def __init__(self, parent: Optional[QWidget] = None):
+    def __init__(
+        self,
+        snapshot_dir: Optional[Union[Path, str]] = None,
+        parent: Optional[QWidget] = None,
+    ):
         super().__init__(parent)
         self.camera: Optional[CameraDevice] = None
+        self._snapshot_dir: Optional[Path] = (
+            Path(snapshot_dir).expanduser() if snapshot_dir else None
+        )
         self._setup_ui()
 
     def _setup_ui(self):
@@ -142,21 +150,38 @@ class PlaybackWidget(QWidget):
             self.timeline.set_camera_name("Geral")
         self.refresh_recordings()
 
+    def resolved_snapshot_dir(self) -> Path:
+        """Retorna a pasta de snapshots configurada ou o diretório padrão de dados."""
+        return self._snapshot_dir if self._snapshot_dir is not None else get_data_dir() / "snapshots"
+
+    def set_snapshot_dir(self, snapshot_dir: Optional[Union[Path, str]]) -> None:
+        """Atualiza a pasta de snapshots monitorada pelo painel e recarrega a lista."""
+        self._snapshot_dir = Path(snapshot_dir).expanduser() if snapshot_dir else None
+        self.refresh_recordings()
+
     def refresh_recordings(self):
         """Varre o diretório de dados para listar vídeos e fotos gravados."""
         self.list_recordings.clear()
         base_dir = get_data_dir()
         rec_dir = base_dir / "recordings"
-        snap_dir = base_dir / "snapshots"
-
-        rec_dir.mkdir(parents=True, exist_ok=True)
-        snap_dir.mkdir(parents=True, exist_ok=True)
+        snap_dir = self.resolved_snapshot_dir()
 
         files = []
-        for p in rec_dir.glob("*.mp4"):
-            files.append((p.stat().st_mtime, p, "Vídeo"))
-        for p in snap_dir.glob("*.jpg"):
-            files.append((p.stat().st_mtime, p, "Foto"))
+        try:
+            rec_dir.mkdir(parents=True, exist_ok=True)
+            for p in rec_dir.glob("*.mp4"):
+                st = p.stat()
+                files.append((st.st_mtime, st.st_size, p, "Vídeo"))
+        except OSError as e:
+            logger.warning(f"Não foi possível listar gravações em '{rec_dir}': {e}")
+
+        try:
+            snap_dir.mkdir(parents=True, exist_ok=True)
+            for p in snap_dir.glob("*.jpg"):
+                st = p.stat()
+                files.append((st.st_mtime, st.st_size, p, "Foto"))
+        except OSError as e:
+            logger.warning(f"Não foi possível listar snapshots em '{snap_dir}': {e}")
 
         # Ordenar pelos mais recentes
         files.sort(key=lambda x: x[0], reverse=True)
@@ -167,9 +192,9 @@ class PlaybackWidget(QWidget):
             self.list_recordings.addItem(empty_item)
             return
 
-        for mtime, fpath, ftype in files[:20]:
+        for mtime, size_bytes, fpath, ftype in files[:20]:
             dt = datetime.datetime.fromtimestamp(mtime).strftime("%d/%m/%Y %H:%M:%S")
-            size_mb = fpath.stat().st_size / (1024 * 1024)
+            size_mb = size_bytes / (1024 * 1024)
             icon = "🎥" if ftype == "Vídeo" else "📷"
             item_text = f"{icon} [{ftype}] {fpath.name}\n     Data: {dt} | Tamanho: {size_mb:.2f} MB"
             item = QListWidgetItem(item_text)

@@ -261,7 +261,11 @@ class FullscreenPlayerWindow(QWidget):
         """Salva snapshot direto do frame atual em alta qualidade com sanitização contra Path Traversal."""
         if self.current_frame and not self.current_frame.isNull():
             snap_dir = self.snapshot_dir
-            snap_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                snap_dir.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                self._show_toast("⚠️ Falha ao salvar foto.")
+                return
             ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
             safe_id = re.sub(r'[^a-zA-Z0-9_-]', '_', str(self.camera.id))
             filename = f"snap_{safe_id}_{ts}.jpg"

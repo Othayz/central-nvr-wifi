@@ -343,7 +343,10 @@ class MainWindow(QMainWindow):
         # =====================================================================
         # Aba 3: Painel de Gravações & Playback (Timeline + Vídeos Salvos)
         # =====================================================================
-        self.recordings_panel = PlaybackWidget(parent=self)
+        self.recordings_panel = PlaybackWidget(
+            snapshot_dir=ViewOptions.from_config(self.config_mgr).resolved_snapshot_dir(),
+            parent=self,
+        )
         self.recordings_panel.playback_requested.connect(
             lambda cname, tstr: self._log_event("Playback", f"Reproduzindo {cname} em {tstr}")
         )
@@ -758,7 +761,10 @@ class MainWindow(QMainWindow):
             self.camera_grid.hw_accel = hw_accel
             self.camera_grid.rtsp_transport = self.config_mgr.get("rtsp_transport", DEFAULT_RTSP_TRANSPORT)
             self.camera_grid.set_hidden_timeout(float(self.config_mgr.get("hidden_camera_timeout_min", 5)))
-            self.camera_grid.set_view_options(ViewOptions.from_config(self.config_mgr))
+            view_options = ViewOptions.from_config(self.config_mgr)
+            self.camera_grid.set_view_options(view_options)
+            if hasattr(self, "recordings_panel"):
+                self.recordings_panel.set_snapshot_dir(view_options.resolved_snapshot_dir())
             # Só reabre os streams cujas opções de conexão mudaram (transporte, GPU, buffer)
             self.camera_grid.set_cameras(self.cameras)
             self._reconfigure_periodic_update_checker()
