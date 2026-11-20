@@ -95,6 +95,8 @@ class SupplyChainTest(unittest.TestCase):
         cfg = (ROOT / ".github" / "dependabot.yml").read_text(encoding="utf-8")
         self.assertIn('package-ecosystem: "pip"', cfg)
         self.assertIn('package-ecosystem: "github-actions"', cfg)
+        # Não propor de novo o PySide6 6.12.x, que quebra o app em Python < 3.12 (PR #51)
+        self.assertRegex(cfg, r'dependency-name: "pyside6"\s+versions: \[">=6\.12\.0, <6\.13\.0"\]')
 
 
 if __name__ == "__main__":
