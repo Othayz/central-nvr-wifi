@@ -36,15 +36,34 @@ def parse_arguments() -> argparse.Namespace:
         "--hw-accel",
         choices=["vaapi", "cpu", "cuda", "auto"],
         default=None,
-        help="Força método de aceleração por hardware para decodificação de vídeo",
+        help=(
+            "Força método de aceleração por hardware para decodificação de vídeo "
+            "apenas nesta execução (sem sobrescrever as preferências salvas)"
+        ),
     )
     parser.add_argument(
         "--transport",
         choices=["tcp", "udp"],
         default=None,
-        help="Força protocolo de transporte RTSP",
+        help=(
+            "Força protocolo de transporte RTSP "
+            "apenas nesta execução (sem sobrescrever as preferências salvas)"
+        ),
     )
     return parser.parse_args()
+
+
+def apply_cli_overrides(config_mgr: ConfigManager, args: argparse.Namespace) -> None:
+    """
+    Aplica overrides de CLI (--hw-accel e --transport) apenas em memória para a execução atual,
+    sem persistir nem sobrescrever as preferências salvas em settings.json (Issue #57).
+    """
+    hw_accel = getattr(args, "hw_accel", None)
+    if hw_accel:
+        config_mgr.settings["hw_accel"] = hw_accel
+    transport = getattr(args, "transport", None)
+    if transport:
+        config_mgr.settings["rtsp_transport"] = transport
 
 
 def setup_logging(debug: bool = False):
@@ -183,10 +202,7 @@ def main() -> int:
 
         # Carregar configurações persistentes
         config_mgr = ConfigManager()
-        if args.hw_accel:
-            config_mgr.set("hw_accel", args.hw_accel)
-        if args.transport:
-            config_mgr.set("rtsp_transport", args.transport)
+        apply_cli_overrides(config_mgr, args)
 
         # 1. A janela principal abre imediatamente: a abertura não depende do GitHub (Issue #37)
         window = MainWindow(config_mgr=config_mgr)
