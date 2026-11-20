@@ -214,6 +214,7 @@ class ConfigManager:
         self.config_path = get_config_dir() / "settings.json"
         self.devices_path = get_config_dir() / "devices.json"
         self.settings: Dict[str, Any] = self.DEFAULT_SETTINGS.copy()
+        self._overrides: Dict[str, Any] = {}
         self.devices: List[Dict[str, Any]] = []
         self.load()
 
@@ -295,12 +296,34 @@ class ConfigManager:
         except (OSError, PermissionError) as e:
             logger.debug(f"Não foi possível salvar dispositivos: {e}")
 
-    def get(self, key: str, default: Any = None) -> Any:
+    def set_override(self, key: str, value: Any) -> None:
+        """Define um override apenas em memória para a sessão atual, sem alterar settings.json."""
+        self._overrides[key] = value
+
+    def clear_override(self, key: str) -> None:
+        """Remove o override em memória de uma chave, se houver."""
+        self._overrides.pop(key, None)
+
+    def has_override(self, key: str) -> bool:
+        """Retorna True se a chave tiver um override em memória ativo nesta sessão."""
+        return key in self._overrides
+
+    def get_override(self, key: str, default: Any = None) -> Any:
+        """Retorna o valor do override em memória para a chave, ou default se ausente."""
+        return self._overrides.get(key, default)
+
+    def get_persisted(self, key: str, default: Any = None) -> Any:
+        """Retorna o valor persistido (ou padrão), ignorando overrides efêmeros da sessão."""
         if key == "github_token":
             kr_pat = get_keyring_pat()
             if kr_pat:
                 return kr_pat
         return self.settings.get(key, default)
+
+    def get(self, key: str, default: Any = None) -> Any:
+        if key in self._overrides:
+            return self._overrides[key]
+        return self.get_persisted(key, default)
 
     def _store(self, key: str, value: Any):
         """Grava em memória; o token do GitHub vai para o keyring quando disponível."""
