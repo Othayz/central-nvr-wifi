@@ -142,6 +142,121 @@ class OsdAndSnapshotTest(QtCase):
             self.assertEqual(win.snapshot_dir, Path(tmp))
             win.deleteLater()
 
+    def test_playback_widget_uses_configured_snapshot_dir_and_updates(self):
+        from central_nvr.ui.playback_view import PlaybackWidget
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            data_dir = base / "data"
+            custom_dir = base / "custom_snaps"
+            other_dir = base / "other_snaps"
+            custom_dir.mkdir(parents=True)
+            other_dir.mkdir(parents=True)
+
+            snap_file = custom_dir / "snap_c1_20261120_120000.jpg"
+            snap_file.write_bytes(b"\xff\xd8\xff\xd9")
+            other_file = other_dir / "snap_c2_20261120_120500.jpg"
+            other_file.write_bytes(b"\xff\xd8\xff\xd9")
+
+            with patch("central_nvr.ui.playback_view.get_data_dir", return_value=data_dir):
+                panel = PlaybackWidget(snapshot_dir=custom_dir)
+                self.addCleanup(panel.deleteLater)
+
+                self.assertEqual(panel.resolved_snapshot_dir(), custom_dir)
+                items = [
+                    panel.list_recordings.item(i).text()
+                    for i in range(panel.list_recordings.count())
+                ]
+                self.assertTrue(any("snap_c1_20261120_120000.jpg" in text for text in items))
+                self.assertFalse(any("snap_c2_20261120_120500.jpg" in text for text in items))
+
+                panel.set_snapshot_dir(other_dir)
+                self.assertEqual(panel.resolved_snapshot_dir(), other_dir)
+                items_after = [
+                    panel.list_recordings.item(i).text()
+                    for i in range(panel.list_recordings.count())
+                ]
+                self.assertTrue(any("snap_c2_20261120_120500.jpg" in text for text in items_after))
+                self.assertFalse(any("snap_c1_20261120_120000.jpg" in text for text in items_after))
+
+                panel.set_snapshot_dir(custom_dir)
+                items_back = [
+                    panel.list_recordings.item(i).text()
+                    for i in range(panel.list_recordings.count())
+                ]
+                self.assertTrue(any("snap_c1_20261120_120000.jpg" in text for text in items_back))
+
+                with patch.object(Path, "mkdir", side_effect=PermissionError("sem permissão")), \
+                        self.assertLogs("central_nvr.ui.playback_view", level="WARNING"):
+                    panel.refresh_recordings()
+                self.assertEqual(panel.list_recordings.count(), 1)
+
+    def test_main_window_propagates_snapshot_dir_to_recordings_panel(self):
+        from central_nvr.ui.main_window import MainWindow
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            config_dir = base / "config"
+            data_dir = base / "data"
+            initial_snap_dir = base / "snaps_inicial"
+            updated_snap_dir = base / "snaps_atualizado"
+            config_dir.mkdir(parents=True)
+            data_dir.mkdir(parents=True)
+            initial_snap_dir.mkdir(parents=True)
+            updated_snap_dir.mkdir(parents=True)
+            (updated_snap_dir / "snap_c1_20261120_120000.jpg").write_bytes(b"\xff\xd8\xff\xd9")
+
+            with patch("central_nvr.core.config.get_config_dir", return_value=config_dir), \
+                    patch("central_nvr.core.config.get_data_dir", return_value=data_dir), \
+                    patch("central_nvr.ui.playback_view.get_data_dir", return_value=data_dir):
+                cfg = ConfigManager()
+                cfg.set("periodic_update_check", False)
+                cfg.set("snapshot_dir", str(initial_snap_dir))
+
+                window = MainWindow(config_mgr=cfg)
+                try:
+                    self.app.processEvents()
+                    self.assertEqual(window.recordings_panel.resolved_snapshot_dir(), initial_snap_dir)
+
+                    def _accept_and_update():
+                        cfg.set("snapshot_dir", str(updated_snap_dir))
+                        return 1
+
+                    with patch("central_nvr.ui.main_window.SettingsDialog.exec", side_effect=_accept_and_update):
+                        window._open_settings_dialog()
+
+                    self.assertEqual(window.recordings_panel.resolved_snapshot_dir(), updated_snap_dir)
+                    items = [
+                        window.recordings_panel.list_recordings.item(i).text()
+                        for i in range(window.recordings_panel.list_recordings.count())
+                    ]
+                    self.assertTrue(any("snap_c1_20261120_120000.jpg" in text for text in items))
+                finally:
+                    window.close()
+                    self.app.processEvents()
+                    self.assertTrue(drain_retired_threads(5000))
+                    window.deleteLater()
+                    QCoreApplication.sendPostedEvents(window, QEvent.Type.DeferredDelete)
+                    QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+                    self.app.processEvents()
+
+    def test_fullscreen_take_snapshot_handles_mkdir_oserror(self):
+        from PySide6.QtGui import QImage
+        from central_nvr.ui.fullscreen_view import FullscreenPlayerWindow
+
+        with tempfile.TemporaryDirectory() as tmp:
+            win = FullscreenPlayerWindow(camera=_cam(), snapshot_dir=Path(tmp) / "bloqueado")
+            self.addCleanup(lambda: (win.close(), win.deleteLater()))
+
+            frame = QImage(64, 36, QImage.Format.Format_RGB888)
+            frame.fill(0)
+            win.set_frame(frame)
+
+            with patch.object(Path, "mkdir", side_effect=PermissionError("sem permissão")):
+                win._take_snapshot()
+
+            self.assertIn("Falha ao salvar foto", win.lbl_toast.text())
+
 
 class GridOptionsTest(QtCase):
     def test_options_change_without_buffer_keeps_stream(self):
