@@ -133,6 +133,7 @@ class OnvifClient:
         self.ptz_service_url = f"http://{ip}:{port}/onvif/ptz_service"
         self.event_service_url = f"http://{ip}:{port}/onvif/event_service"
         self.recording_service_url = f"http://{ip}:{port}/onvif/recording_service"
+        self.search_service_url = f"http://{ip}:{port}/onvif/search_service"
         self.replay_service_url = f"http://{ip}:{port}/onvif/replay_service"
 
         self.profiles: List[Dict[str, Any]] = []
@@ -242,6 +243,7 @@ class OnvifClient:
                xmlns:trt="http://www.onvif.org/ver10/media/wsdl"
                xmlns:tptz="http://www.onvif.org/ver20/ptz/wsdl"
                xmlns:trc="http://www.onvif.org/ver10/recording/wsdl"
+               xmlns:tse="http://www.onvif.org/ver10/search/wsdl"
                xmlns:trp="http://www.onvif.org/ver10/replay/wsdl"
                xmlns:tt="http://www.onvif.org/ver10/schema">
     <soap:Header>
@@ -385,6 +387,12 @@ class OnvifClient:
             self.has_edge_storage = True
             caps["recording"] = recording
 
+        search = self._validate_xaddr(self._service_xaddr(capabilities, "Search"))
+        if search:
+            self.search_service_url = search
+            self.has_edge_storage = True
+            caps["search"] = search
+
         replay = self._validate_xaddr(self._service_xaddr(capabilities, "Replay"))
         if replay:
             self.replay_service_url = replay
@@ -472,7 +480,11 @@ class OnvifClient:
 
     def get_recording_summary(self) -> Dict[str, Any]:
         """Obtém resumo das gravações salvas no armazenamento local da câmera (cartão SD)."""
-        root = self._call(self.recording_service_url, "<trc:GetRecordingSummary/>")
+        try:
+            root = self._call(self.search_service_url, "<tse:GetRecordingSummary/>")
+        except OnvifFaultError:
+            root = self._call(self.recording_service_url, "<trc:GetRecordingSummary/>")
+
         summary: Dict[str, Any] = {
             "num_recordings": 0,
             "has_storage": False,
@@ -490,20 +502,50 @@ class OnvifClient:
         return summary
 
     def find_recordings(self, max_matches: int = 20) -> List[Dict[str, Any]]:
-        """Busca a lista de gravações mantidas no cartão SD da câmera para preenchimento de lacunas."""
-        body = f"""<trc:FindRecordings>
-            <trc:Scope>
-                <trc:IncludedSources/>
-            </trc:Scope>
-            <trc:MaxMatches>{int(max_matches)}</trc:MaxMatches>
-        </trc:FindRecordings>"""
+        """Busca a lista de gravações mantidas no cartão SD da câmera via ONVIF Recording Search (tse)."""
+        max_matches_int = int(max_matches)
+        body = f"""<tse:FindRecordings>
+            <tse:Scope>
+                <tt:IncludedSources/>
+            </tse:Scope>
+            <tse:MaxMatches>{max_matches_int}</tse:MaxMatches>
+            <tse:KeepAliveTime>PT10S</tse:KeepAliveTime>
+        </tse:FindRecordings>"""
 
-        root = self._call(self.recording_service_url, body)
-        recordings = []
-        for el in _iter_named(root, "RecordingToken"):
-            token = _text(el)
-            if not token:
-                continue
+        root = self._call(self.search_service_url, body)
+        search_token = _text(_find_named(root, "SearchToken"))
+        tokens: List[str] = []
+
+        if search_token:
+            escaped_search_token = html.escape(search_token)
+            results_body = f"""<tse:GetRecordingSearchResults>
+                <tse:SearchToken>{escaped_search_token}</tse:SearchToken>
+                <tse:MinResults>1</tse:MinResults>
+                <tse:MaxResults>{max_matches_int}</tse:MaxResults>
+                <tse:WaitTime>PT2S</tse:WaitTime>
+            </tse:GetRecordingSearchResults>"""
+            try:
+                results_root = self._call(self.search_service_url, results_body)
+                for el in _iter_named(results_root, "RecordingToken"):
+                    token = _text(el)
+                    if token and token not in tokens:
+                        tokens.append(token)
+            finally:
+                end_body = f"""<tse:EndSearch>
+                    <tse:SearchToken>{escaped_search_token}</tse:SearchToken>
+                </tse:EndSearch>"""
+                try:
+                    self._call(self.search_service_url, end_body)
+                except OnvifError as e:
+                    logger.debug(f"EndSearch falhou para {search_token}: {e}")
+        else:
+            for el in _iter_named(root, "RecordingToken"):
+                token = _text(el)
+                if token and token not in tokens:
+                    tokens.append(token)
+
+        recordings: List[Dict[str, Any]] = []
+        for token in tokens:
             try:
                 replay_uri = self.get_replay_uri(token)
             except OnvifError as e:
