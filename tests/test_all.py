@@ -31,6 +31,7 @@ from central_nvr.core.config import (
 )
 from central_nvr.core.onvif_client import OnvifClient
 from central_nvr.core.stream_worker import StreamWorker
+from central_nvr.core.threads import drain_retired_threads
 from central_nvr.scanner.discovery import get_local_ip_addresses
 from central_nvr.scanner.parser import detect_manufacturer, parse_ws_discovery_response
 
@@ -456,7 +457,7 @@ class TestWifiNvrArchitectureImprovements(unittest.TestCase):
         grid = CameraGridWidget()
         
         # 1. Testar com 1 câmera
-        cams_1 = [CameraDevice(id="c1", name="Cam 1", ip="192.168.1.2")]
+        cams_1 = [CameraDevice(id="c1", name="Cam 1", ip="192.168.1.2", rtsp_url="demo://")]
         grid.set_cameras(cams_1)
         grid.apply_layout("auto")
         self.assertEqual(len(grid.empty_slots), 0)
@@ -465,8 +466,8 @@ class TestWifiNvrArchitectureImprovements(unittest.TestCase):
 
         # 2. Testar com 2 câmeras (1 em cima e 1 embaixo)
         cams_2 = [
-            CameraDevice(id="c1", name="Cam 1", ip="192.168.1.2"),
-            CameraDevice(id="c2", name="Cam 2", ip="192.168.1.3"),
+            CameraDevice(id="c1", name="Cam 1", ip="192.168.1.2", rtsp_url="demo://"),
+            CameraDevice(id="c2", name="Cam 2", ip="192.168.1.3", rtsp_url="demo://"),
         ]
         grid.set_cameras(cams_2)
         grid.apply_layout("auto")
@@ -476,15 +477,16 @@ class TestWifiNvrArchitectureImprovements(unittest.TestCase):
 
         # 3. Testar com 3 câmeras (distribuídas sem slots vazios)
         cams_3 = [
-            CameraDevice(id="c1", name="Cam 1", ip="192.168.1.2"),
-            CameraDevice(id="c2", name="Cam 2", ip="192.168.1.3"),
-            CameraDevice(id="c3", name="Cam 3", ip="192.168.1.4"),
+            CameraDevice(id="c1", name="Cam 1", ip="192.168.1.2", rtsp_url="demo://"),
+            CameraDevice(id="c2", name="Cam 2", ip="192.168.1.3", rtsp_url="demo://"),
+            CameraDevice(id="c3", name="Cam 3", ip="192.168.1.4", rtsp_url="demo://"),
         ]
         grid.set_cameras(cams_3)
         grid.apply_layout("auto")
         self.assertEqual(len(grid.empty_slots), 0)
 
         grid.stop_all()
+        self.assertTrue(drain_retired_threads(5000))
         grid.close()
         grid.deleteLater()
 
@@ -553,13 +555,14 @@ class TestFullscreenView(unittest.TestCase):
 
     def test_camera_view_rename(self):
         from central_nvr.ui.camera_view import CameraViewWidget
-        cam = CameraDevice(id="test-v-rename", name="Câmera Antiga", ip="192.168.1.50")
+        cam = CameraDevice(id="test-v-rename", name="Câmera Antiga", ip="192.168.1.50", rtsp_url="demo://")
         view = CameraViewWidget(cam)
         self.assertIn("Câmera Antiga", view.lbl_title.text())
         view.update_camera_name("Câmera Nova Fachada")
         self.assertIn("Câmera Nova Fachada", view.lbl_title.text())
         self.assertEqual(view.camera.name, "Câmera Nova Fachada")
-        view.stop()
+        view.dispose()
+        self.assertTrue(drain_retired_threads(5000))
         view.close()
         view.deleteLater()
         self.app.processEvents()
@@ -775,6 +778,7 @@ class TestSecurityAuditRemediations(unittest.TestCase):
             id="test-xss",
             name="<img src=x onerror=alert(1)><b>HackerCam</b>",
             ip="192.168.1.77",
+            rtsp_url="demo://",
         )
         view = CameraViewWidget(cam)
 
@@ -798,7 +802,8 @@ class TestSecurityAuditRemediations(unittest.TestCase):
         self.assertIn("&lt;script&gt;", bar.lbl_cam.text())
         self.assertNotIn("<script>", bar.lbl_cam.text())
 
-        view.stop()
+        view.dispose()
+        self.assertTrue(drain_retired_threads(5000))
         view.close()
         view.deleteLater()
         bar.close()

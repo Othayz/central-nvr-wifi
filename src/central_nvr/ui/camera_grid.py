@@ -231,9 +231,9 @@ class CameraGridWidget(QWidget):
         )
         view.selected.connect(self._on_camera_selected)
         view.double_clicked.connect(self._on_camera_double_clicked)
-        view.ptz_requested.connect(lambda cid: self.ptz_requested.emit(cid))
-        view.snapshot_taken.connect(lambda cid, fp: self.snapshot_taken.emit(cid, fp))
-        view.rename_requested.connect(lambda cid, name: self.camera_renamed.emit(cid, name))
+        view.ptz_requested.connect(self.ptz_requested.emit)
+        view.snapshot_taken.connect(self.snapshot_taken.emit)
+        view.rename_requested.connect(self.camera_renamed.emit)
         view.display_state_changed.connect(self.camera_display_state_changed.emit)
         return view
 
@@ -243,16 +243,19 @@ class CameraGridWidget(QWidget):
 
     def _dispose_view(self, view: CameraViewWidget):
         """Encerra o stream e descarta a view de forma segura."""
-        try:
-            view.selected.disconnect()
-            view.double_clicked.disconnect()
-            view.ptz_requested.disconnect()
-            view.snapshot_taken.disconnect()
-            view.rename_requested.disconnect()
-            view.display_state_changed.disconnect()
-        except Exception:
-            pass
-        view.stop()
+        for view_signal in (
+            view.selected,
+            view.double_clicked,
+            view.ptz_requested,
+            view.snapshot_taken,
+            view.rename_requested,
+            view.display_state_changed,
+        ):
+            try:
+                view_signal.disconnect()
+            except (RuntimeError, TypeError):
+                pass
+        view.dispose()
         view.close()
         # Tirar do layout mantendo um pai: assim apply_layout() não a transforma em janela
         # órfã com destruição pendente, e ela é destruída com o grid se o event loop não rodar antes.
@@ -364,6 +367,10 @@ class CameraGridWidget(QWidget):
             self.layout.setColumnStretch(c, 0)
 
         for slot in self.empty_slots:
+            try:
+                slot.add_clicked.disconnect()
+            except (RuntimeError, TypeError):
+                pass
             slot.deleteLater()
         self.empty_slots.clear()
         for cell in self._filler_cells:

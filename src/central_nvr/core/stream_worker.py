@@ -540,10 +540,22 @@ class StreamWorker(QThread):
                     f"rtsp_transport;{transport}|"
                     f"reorder_queue_size;100|"
                     f"buffer_size;2048000|"
-                    f"stimeout;5000000|"
+                    f"timeout;5000000|"
                     f"fflags;+nobuffer+genpts"
                 )
-                cap = cv2.VideoCapture(stream_url, cv2.CAP_FFMPEG)
+                timeout_params = []
+                open_prop = getattr(cv2, "CAP_PROP_OPEN_TIMEOUT_MSEC", None)
+                read_prop = getattr(cv2, "CAP_PROP_READ_TIMEOUT_MSEC", None)
+                if isinstance(open_prop, int) and isinstance(read_prop, int):
+                    timeout_params = [open_prop, 5000, read_prop, 5000]
+                try:
+                    cap = (
+                        cv2.VideoCapture(stream_url, cv2.CAP_FFMPEG, timeout_params)
+                        if timeout_params
+                        else cv2.VideoCapture(stream_url, cv2.CAP_FFMPEG)
+                    )
+                except TypeError:
+                    cap = cv2.VideoCapture(stream_url, cv2.CAP_FFMPEG)
                 cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
             if not cap.isOpened():

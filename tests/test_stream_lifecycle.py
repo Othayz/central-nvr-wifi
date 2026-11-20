@@ -58,6 +58,7 @@ APP_SESSION_SCRIPT = textwrap.dedent("""
 
     sys.argv = ["central-nvr", "--no-update-check"]
     with patch.object(stream_worker.av, "open", unresponsive_camera), \\
+         patch.object(stream_worker, "HAS_CV2", False), \\
          patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.Yes), \\
          patch.object(MainWindow, "show", show_then_operate):
         exit_code = app.main()
@@ -139,7 +140,8 @@ class CameraGridStreamLifecycleTest(unittest.TestCase):
             raise OSError("timeout")
 
         self.addCleanup(unblock.set)
-        with patch.object(stream_worker.av, "open", unresponsive_camera):
+        with patch.object(stream_worker.av, "open", unresponsive_camera), \
+             patch.object(stream_worker, "HAS_CV2", False):
             self.grid.set_cameras([CameraDevice(id="offline", name="Portaria", ip="192.0.2.10")])
             self.assertTrue(stream_is_blocked.wait(5))
 
@@ -232,7 +234,8 @@ class ReconnectCameraTest(unittest.TestCase):
                     sessions["open"] -= 1
 
         self.addCleanup(release_first_session.set)
-        with patch.object(stream_worker.av, "open", camera_session):
+        with patch.object(stream_worker.av, "open", camera_session), \
+             patch.object(stream_worker, "HAS_CV2", False):
             view = CameraViewWidget(CameraDevice(id="wifi", name="Quintal", ip="192.0.2.20"))
             self.assertTrue(first_session_open.wait(5))
 
