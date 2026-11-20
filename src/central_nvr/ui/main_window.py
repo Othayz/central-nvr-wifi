@@ -727,11 +727,20 @@ class MainWindow(QMainWindow):
         dialog.exec()
 
     def _add_discovered_camera(self, camera: CameraDevice):
-        self.config_mgr.add_or_update_device(camera.to_dict())
+        saved = self.config_mgr.add_or_update_device(camera.to_dict())
         self._load_cameras_from_config()
         self.camera_grid.set_cameras(self.cameras)
         self._populate_device_tree()
         self.lbl_sb_streams.setText(f"Câmeras Cadastradas: {len(self.cameras)}")
+        if not saved:
+            err = self.config_mgr.last_write_error or "erro de E/S"
+            self._log_event("Erro", f"Não foi possível salvar o Dispositivo Cadastrado '{camera.name}': {err}")
+            QMessageBox.critical(
+                self,
+                "Erro ao Salvar Dispositivo",
+                f"Não foi possível salvar a lista de dispositivos: {err}",
+            )
+            return
         self._log_event("Dispositivo", f"Câmera '{camera.name}' adicionada ao sistema.")
 
     def _set_theme(self, theme_name: str):

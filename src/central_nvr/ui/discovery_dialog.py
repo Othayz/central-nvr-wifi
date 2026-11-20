@@ -1,6 +1,7 @@
 """
 Diálogo de Descoberta de Rede (WS-Discovery ONVIF e Sondagem de Portas) e Adição de Câmeras.
 """
+import hashlib
 import ipaddress
 from typing import Any, Dict, List, Optional
 
@@ -444,13 +445,21 @@ class DiscoveryDialog(QDialog):
         preset = self.combo_preset.currentData()
         mfg = "Yoosee" if preset == "yoosee" else ("Intelbras" if preset == "intelbras" else ("Hikvision" if preset == "hikvision" else "Genérico"))
 
+        rtsp_path = self.txt_man_rtsp_path.text().strip()
+        base_id = f"cam_{ip.replace('.', '_').replace(':', '_')}_{self.spin_man_port.value()}"
+        dev_id = (
+            f"{base_id}_{hashlib.sha1(rtsp_path.encode('utf-8')).hexdigest()[:6]}"
+            if rtsp_path
+            else base_id
+        )
+
         camera = CameraDevice(
-            id=f"cam_{ip.replace('.', '_')}_{self.spin_man_port.value()}",
+            id=dev_id,
             name=self.txt_man_name.text().strip() or "Câmera Manual",
             ip=ip,
             port=self.spin_man_port.value(),
             rtsp_port=self.spin_man_rtsp_port.value(),
-            rtsp_path=self.txt_man_rtsp_path.text().strip(),
+            rtsp_path=rtsp_path,
             username=self.txt_man_user.text().strip(),
             password=self.txt_man_pass.text(),
             manufacturer=mfg,
