@@ -4,6 +4,7 @@ Suporte completo a movimentação direcional contínua de 8 eixos, zoom contínu
 """
 import logging
 import threading
+import time
 from typing import Callable, Dict, Optional, Tuple
 
 from PySide6.QtCore import Qt, QTimer, Signal
@@ -48,6 +49,7 @@ class PTZControllerWidget(QWidget):
     # Intervalo de renovação do ContinuousMove (o Timeout enviado é de 2 s)
     MOVE_RENEWAL_MS = 1000
     STOP_RETRIES = 2
+    NEGATIVE_CACHE_TTL_SEC = 60.0
 
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent)
@@ -58,6 +60,7 @@ class PTZControllerWidget(QWidget):
         # Cada seleção incrementa a geração; resultados de gerações antigas são descartados
         self._selection_gen = 0
         self._client_cache: Dict[Tuple[str, str, int, str, str], OnvifClient] = {}
+        self._failed_cache: Dict[Tuple[str, str, int, str, str], float] = {}
         self._queues: Dict[object, SerialCommandQueue] = {}
         self._renew_args: Optional[Tuple[float, float, float, str]] = None
         self._move_renewal_timer = QTimer(self)
@@ -265,13 +268,28 @@ class PTZControllerWidget(QWidget):
         self.lbl_cam_target.setText(f"{camera.name}{ptz_status}")
         self.controls_frame.setEnabled(bool(camera.has_ptz))
 
+        if not camera.has_ptz:
+            self.remove_camera(camera.id)
+            return
+
         key = self._client_key(camera)
         cached = self._client_cache.get(key)
         if cached is not None:
             self._adopt_detected_port(cached)
+            active_key = self._client_key(camera)
+            self._evict_camera_keys(camera.id, keep_key=active_key)
             self.client = cached
-            self._request_presets(gen, key, cached)
+            self._request_presets(gen, active_key, cached)
             return
+
+        self._evict_camera_keys(camera.id, keep_key=key)
+
+        failed_at = self._failed_cache.get(key)
+        if failed_at is not None:
+            if time.monotonic() - failed_at < self.NEGATIVE_CACHE_TTL_SEC:
+                self.controls_frame.setEnabled(False)
+                return
+            self._failed_cache.pop(key, None)
 
         def _init_client():
             client = self._probe_client(camera)
@@ -315,7 +333,10 @@ class PTZControllerWidget(QWidget):
     def _on_client_ready(self, gen: int, key: object, client: object):
         """Slot (thread da interface): aceita o cliente só se a seleção ainda for a mesma."""
         if client is not None:
+            self._failed_cache.pop(key, None)
             self._client_cache[key] = client
+        else:
+            self._failed_cache[key] = time.monotonic()
         if gen != self._selection_gen or self.camera is None:
             return
         if client is None:
@@ -324,8 +345,9 @@ class PTZControllerWidget(QWidget):
             return
 
         self._adopt_detected_port(client)
+        active_key = self._client_key(self.camera)
         self.client = client
-        self._request_presets(gen, key, client)
+        self._request_presets(gen, active_key, client)
 
     def _adopt_detected_port(self, client: OnvifClient):
         """
@@ -336,8 +358,32 @@ class PTZControllerWidget(QWidget):
         if self.camera is None or client.port == self.camera.port:
             return
         self.camera.port = client.port
-        self._client_cache[self._client_key(self.camera)] = client
+        new_key = self._client_key(self.camera)
+        self._client_cache[new_key] = client
+        self._evict_camera_keys(self.camera.id, keep_key=new_key)
         self.onvif_port_detected.emit(self.camera.id, int(client.port))
+
+    def _evict_camera_keys(
+        self,
+        camera_id: str,
+        keep_key: Optional[Tuple[str, str, int, str, str]] = None,
+    ) -> None:
+        """Remove entradas antigas de cache e encerra filas seriais obsoletas de um Dispositivo Cadastrado."""
+        all_keys = set(self._client_cache.keys()) | set(self._failed_cache.keys()) | set(self._queues.keys())
+        stale_keys = [
+            k for k in all_keys
+            if isinstance(k, tuple) and len(k) > 0 and k[0] == camera_id and k != keep_key
+        ]
+        for k in stale_keys:
+            self._client_cache.pop(k, None)
+            self._failed_cache.pop(k, None)
+            q = self._queues.pop(k, None)
+            if q is not None:
+                q.shutdown()
+
+    def remove_camera(self, camera_id: str) -> None:
+        """Limpa caches ONVIF e encerra filas seriais PTZ associadas a um Dispositivo Cadastrado."""
+        self._evict_camera_keys(camera_id, keep_key=None)
 
     def _queue_for(self, key: object) -> SerialCommandQueue:
         q = self._queues.get(key)
@@ -347,11 +393,13 @@ class PTZControllerWidget(QWidget):
         return q
 
     def shutdown(self):
-        """Encerra as filas de comandos (chamado ao fechar a janela)."""
+        """Encerra as filas de comandos e limpa os caches (chamado ao fechar a janela)."""
         self._stop_move_renewal()
         for q in self._queues.values():
             q.shutdown()
         self._queues.clear()
+        self._client_cache.clear()
+        self._failed_cache.clear()
 
     # ------------------------------------------------------------------
     # Envio serial de comandos (Issue #23)
