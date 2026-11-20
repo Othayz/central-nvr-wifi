@@ -591,23 +591,34 @@ class MainWindow(QMainWindow):
             self.camera_grid.set_cameras(self.cameras)
             self._populate_device_tree()
             self.lbl_sb_streams.setText(f"Câmeras Cadastradas: {len(self.cameras)}")
-            if not self.cameras:
-                self.ptz_panel.set_camera(None)
-                if hasattr(self, "recordings_panel"):
-                    self.recordings_panel.set_camera(None)
+            self._sync_selected_camera_panels()
             self._log_event("Dispositivo", f"Câmera '{cam_name}' removida com sucesso.")
+
+    def _sync_selected_camera_panels(self):
+        """Sincroniza os painéis PTZ e de Gravações com a seleção atual da grade (Issue #52)."""
+        selected_id = self.camera_grid.selected_camera_id
+        if selected_id and any(c.id == selected_id for c in self.cameras):
+            self._select_camera_by_id(selected_id)
+        else:
+            self.ptz_panel.set_camera(None)
+            if hasattr(self, "recordings_panel"):
+                self.recordings_panel.set_camera(None)
 
     def _on_camera_selected(self, camera_id: str):
         """Quando o usuário clica em um viewport no grid."""
         self._select_camera_by_id(camera_id)
 
-    def _select_camera_by_id(self, camera_id: str):
-        cam = next((c for c in self.cameras if c.id == camera_id), None)
+    def _select_camera_by_id(self, camera_id: Optional[str]):
+        cam = next((c for c in self.cameras if c.id == camera_id), None) if camera_id else None
         if cam:
             self.ptz_panel.set_camera(cam)
             if hasattr(self, "recordings_panel"):
                 self.recordings_panel.set_camera(cam)
             self.camera_grid.select_camera(camera_id)
+        else:
+            self.ptz_panel.set_camera(None)
+            if hasattr(self, "recordings_panel"):
+                self.recordings_panel.set_camera(None)
 
     def _on_ptz_requested(self, camera_id: str):
         self._select_camera_by_id(camera_id)
