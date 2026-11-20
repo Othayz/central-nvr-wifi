@@ -303,6 +303,110 @@ class PTZControllerTest(unittest.TestCase):
         self.widget.set_camera(None)
         self.assertFalse(self.widget.controls_frame.isEnabled())
 
+    def test_no_ptz_camera_does_not_probe_or_emit_failure(self):
+        """#54: Dispositivo Cadastrado sem PTZ não inicia sondagem ONVIF nem emite command_failed."""
+        failures = []
+        self.widget.command_failed.connect(lambda cam, msg: failures.append((cam, msg)))
+
+        cam = _camera("no_ptz", "10.0.0.9")
+        cam.has_ptz = False
+
+        for _ in range(3):
+            self.widget.set_camera(cam)
+            _pump(self.app, 0.05)
+            self.widget.set_camera(None)
+            self.widget.set_camera(cam)
+
+        _pump(self.app, 0.15)
+        self.assertEqual(FakeOnvifClient.init_count, 0)
+        self.assertIsNone(self.widget.client)
+        self.assertFalse(self.widget.controls_frame.isEnabled())
+        self.assertEqual(failures, [])
+
+    def test_negative_cache_avoids_repeated_probes_and_expires_after_ttl(self):
+        """#54: falha de sondagem ONVIF entra em cache negativo e só re-sonda após o TTL."""
+        FakeOnvifClient.responding_ports = set()
+        failures = []
+        self.widget.command_failed.connect(lambda cam, msg: failures.append((cam, msg)))
+
+        cam_a = _camera("a", "10.0.0.1")
+        self.widget.set_camera(cam_a)
+        self.assertTrue(_wait_until(self.app, lambda: len(failures) == 1))
+        self.assertFalse(self.widget.controls_frame.isEnabled())
+        self.assertIsNone(self.widget.client)
+        first_init_count = FakeOnvifClient.init_count
+        self.assertGreater(first_init_count, 0)
+
+        # Selecionar outra câmera (ou None) e retornar: cache negativo evita nova sondagem e spam
+        self.widget.set_camera(None)
+        self.widget.set_camera(cam_a)
+        _pump(self.app, 0.15)
+        self.assertEqual(FakeOnvifClient.init_count, first_init_count)
+        self.assertEqual(len(failures), 1)
+        self.assertFalse(self.widget.controls_frame.isEnabled())
+        self.assertIsNone(self.widget.client)
+
+        # Expirar o TTL do cache negativo permite nova sondagem
+        key = self.widget._client_key(cam_a)
+        self.assertIn(key, self.widget._failed_cache)
+        self.widget._failed_cache[key] -= self.widget.NEGATIVE_CACHE_TTL_SEC + 1.0
+
+        self.widget.set_camera(cam_a)
+        self.assertTrue(_wait_until(self.app, lambda: len(failures) == 2))
+        self.assertGreater(FakeOnvifClient.init_count, first_init_count)
+
+    def test_credential_change_and_remove_camera_evict_cache_and_shutdown_queues(self):
+        """#54: editar credenciais/porta ou remover câmera limpa caches e encerra filas seriais antigas."""
+        cam_a = _camera("a", "10.0.0.1")
+        self.widget.set_camera(cam_a)
+        self.assertTrue(_wait_until(self.app, lambda: self.widget.client is not None))
+
+        self.widget._stop_ptz()
+        self.assertTrue(_wait_until(self.app, lambda: len(FakeOnvifClient.calls) >= 1))
+
+        key_1 = self.widget._client_key(cam_a)
+        self.assertIn(key_1, self.widget._client_cache)
+        self.assertIn(key_1, self.widget._queues)
+        old_queue_1 = self.widget._queues[key_1]
+        self.assertTrue(old_queue_1._thread.is_alive())
+
+        # Editar senha invalida a chave antiga e encerra a fila serial antiga
+        cam_a.password = "nova"
+        self.widget.set_camera(cam_a)
+        self.assertNotIn(key_1, self.widget._client_cache)
+        self.assertNotIn(key_1, self.widget._queues)
+        self.assertTrue(_wait_until(self.app, lambda: not old_queue_1._thread.is_alive()))
+        self.assertTrue(_wait_until(self.app, lambda: self.widget.client is not None))
+
+        # Novo comando cria fila para a chave nova; remove_camera limpa tudo e encerra a thread
+        self.widget._stop_ptz()
+        self.assertTrue(_wait_until(self.app, lambda: len(FakeOnvifClient.calls) >= 2))
+        key_2 = self.widget._client_key(cam_a)
+        self.assertIn(key_2, self.widget._client_cache)
+        self.assertIn(key_2, self.widget._queues)
+        old_queue_2 = self.widget._queues[key_2]
+        self.assertTrue(old_queue_2._thread.is_alive())
+
+        self.widget.remove_camera("a")
+        self.assertNotIn(key_2, self.widget._client_cache)
+        self.assertNotIn(key_2, self.widget._queues)
+        self.assertFalse(any(k[0] == "a" for k in self.widget._failed_cache))
+        self.assertTrue(_wait_until(self.app, lambda: not old_queue_2._thread.is_alive()))
+
+    def test_detected_port_evicts_old_port_key_and_queue(self):
+        """#54: adotar porta ONVIF detectada limpa a chave da porta anterior de caches e filas."""
+        FakeOnvifClient.responding_ports = {5000}
+        cam = _camera("a", "10.0.0.1")
+        old_key = self.widget._client_key(cam)
+        self.widget.set_camera(cam)
+        self.assertTrue(_wait_until(self.app, lambda: self.widget.client is not None))
+        new_key = self.widget._client_key(cam)
+        self.assertNotEqual(old_key, new_key)
+        self.assertNotIn(old_key, self.widget._client_cache)
+        self.assertNotIn(old_key, self.widget._queues)
+        self.assertIn(new_key, self.widget._client_cache)
+        self.assertIn(new_key, self.widget._queues)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -6,6 +6,7 @@ Sincronização dos painéis PTZ e de Gravações ao remover um Dispositivo Cada
 import os
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -176,6 +177,32 @@ class CameraRemovalSelectionSyncTest(unittest.TestCase):
         self.assertIsNone(self.window.ptz_panel.camera)
         self.assertFalse(self.window.ptz_panel.controls_frame.isEnabled())
         self.assertIsNone(self.window.recordings_panel.camera)
+
+    def test_removing_camera_cleans_ptz_cache_and_queue(self):
+        """#54: remover Dispositivo Cadastrado limpa cache ONVIF e encerra a SerialCommandQueue."""
+        self.window._select_camera_by_id("B")
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline and self.window.ptz_panel.client is None:
+            self.app.processEvents()
+            time.sleep(0.01)
+        self.assertIsNotNone(self.window.ptz_panel.client)
+
+        cam_b = self.window.ptz_panel.camera
+        key_b = self.window.ptz_panel._client_key(cam_b)
+        self.assertIn(key_b, self.window.ptz_panel._client_cache)
+        self.assertIn(key_b, self.window.ptz_panel._queues)
+        old_queue = self.window.ptz_panel._queues[key_b]
+
+        self.window._remove_camera_by_id("B")
+        self.app.processEvents()
+
+        self.assertNotIn(key_b, self.window.ptz_panel._client_cache)
+        self.assertNotIn(key_b, self.window.ptz_panel._queues)
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline and old_queue._thread.is_alive():
+            self.app.processEvents()
+            time.sleep(0.01)
+        self.assertFalse(old_queue._thread.is_alive())
 
 
 if __name__ == "__main__":

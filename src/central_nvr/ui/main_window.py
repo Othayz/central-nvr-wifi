@@ -592,6 +592,7 @@ class MainWindow(QMainWindow):
             self._populate_device_tree()
             self.lbl_sb_streams.setText(f"Câmeras Cadastradas: {len(self.cameras)}")
             self._sync_selected_camera_panels()
+            self.ptz_panel.remove_camera(cam_id)
             self._log_event("Dispositivo", f"Câmera '{cam_name}' removida com sucesso.")
 
     def _sync_selected_camera_panels(self):
