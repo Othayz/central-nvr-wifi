@@ -269,7 +269,7 @@ class CameraViewWidget(QFrame):
                 color: #FFFFFF;
             }
         """)
-        self.btn_ptz.clicked.connect(lambda: self.ptz_requested.emit(self.camera.id))
+        self.btn_ptz.clicked.connect(self._on_ptz_clicked)
         bottom_bar.addWidget(self.btn_ptz)
 
         # Botão Maximizar (Grid 1x1)
@@ -292,7 +292,7 @@ class CameraViewWidget(QFrame):
                 color: #FFFFFF;
             }
         """)
-        self.btn_fullscreen.clicked.connect(lambda: self.double_clicked.emit(self.camera.id))
+        self.btn_fullscreen.clicked.connect(self._on_maximize_clicked)
         bottom_bar.addWidget(self.btn_fullscreen)
 
         # Botão Tela Cheia Real (Sem menus)
@@ -319,6 +319,12 @@ class CameraViewWidget(QFrame):
         bottom_bar.addWidget(self.btn_truescreen)
 
         main_layout.addLayout(bottom_bar)
+
+    def _on_ptz_clicked(self):
+        self.ptz_requested.emit(self.camera.id)
+
+    def _on_maximize_clicked(self):
+        self.double_clicked.emit(self.camera.id)
 
     def prompt_rename(self):
         """Abre janela de diálogo para renomear a câmera e emite sinal."""
@@ -804,7 +810,12 @@ class CameraViewWidget(QFrame):
             except Exception:
                 pass
 
-        self._restart_after = None
+        if self._restart_after is not None:
+            try:
+                self._restart_after.finished.disconnect(self._on_previous_session_finished)
+            except (RuntimeError, TypeError):
+                pass
+            self._restart_after = None
         if self.worker:
             w = self.worker
             self.worker = None
@@ -818,6 +829,26 @@ class CameraViewWidget(QFrame):
             # interface) nem deixá-la ser destruída junto com este widget (abortaria o processo).
             w.request_stop()
             retire_thread(w)
+
+    def dispose(self):
+        """Para timers e stream e desconecta sinais internos para quebrar ciclos de referência."""
+        self.stop()
+        self._watchdog.stop()
+        self._hidden_timer.stop()
+        for internal_signal in (
+            self._watchdog.timeout,
+            self._hidden_timer.timeout,
+            self.lbl_title.customContextMenuRequested,
+            self.btn_stream_profile.clicked,
+            self.btn_snapshot.clicked,
+            self.btn_ptz.clicked,
+            self.btn_fullscreen.clicked,
+            self.btn_truescreen.clicked,
+        ):
+            try:
+                internal_signal.disconnect()
+            except (RuntimeError, TypeError):
+                pass
 
     def reconnect(self):
         """

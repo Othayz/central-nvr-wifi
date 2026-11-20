@@ -8,6 +8,7 @@ import sys
 import unittest
 from unittest.mock import patch
 
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
 
 from PySide6.QtCore import QCoreApplication, QEvent
@@ -88,15 +89,20 @@ class ViewLabelTest(unittest.TestCase):
     def setUp(self):
         # Sem rede: o worker real fica tentando abrir e falha logo
         self.patcher = patch.object(sw.av, "open", side_effect=OSError("offline"))
+        self.cv2_patcher = patch.object(sw, "HAS_CV2", False)
         self.patcher.start()
+        self.cv2_patcher.start()
         self.view = CameraViewWidget(_camera())
 
     def tearDown(self):
-        self.view.stop()
-        drain_retired_threads(5000)
-        self.view.deleteLater()
-        QCoreApplication.sendPostedEvents(self.view, QEvent.Type.DeferredDelete)
-        self.patcher.stop()
+        try:
+            self.view.dispose()
+            self.assertTrue(drain_retired_threads(5000))
+            self.view.deleteLater()
+            QCoreApplication.sendPostedEvents(self.view, QEvent.Type.DeferredDelete)
+        finally:
+            self.cv2_patcher.stop()
+            self.patcher.stop()
 
     def test_label_does_not_change_to_sd_before_connecting(self):
         self.view._toggle_stream_profile()
