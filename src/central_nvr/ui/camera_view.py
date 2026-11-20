@@ -570,6 +570,7 @@ class CameraViewWidget(QFrame):
         if self._stalled:
             self._stalled = False
             self._set_live(True)
+            self._update_hw_accel_badge()
         if hasattr(self, "_fullscreen_win") and self._fullscreen_win and self._fullscreen_win.isVisible():
             self._fullscreen_win.set_frame(
                 q_img,
@@ -580,8 +581,8 @@ class CameraViewWidget(QFrame):
         self.update()
 
     def effective_hw_accel_label(self) -> str:
-        """Retorna o rótulo real de aceleração desta câmera (CPU quando fora de STREAMING ou em software)."""
-        if self.connection_state != ConnectionState.STREAMING or not self.stats.hw_accel_active:
+        """Retorna o rótulo real de aceleração desta câmera (CPU quando fora de ao vivo ou em software)."""
+        if not self.is_live() or not self.stats.hw_accel_active:
             return "CPU"
         if getattr(self.stats, "hw_accel_backend", ""):
             return self.stats.hw_accel_backend
@@ -724,6 +725,7 @@ class CameraViewWidget(QFrame):
             self.lbl_status.setText("SEM SINAL")
             self.lbl_status.setStyleSheet("color: #F87171; background-color: rgba(153, 27, 27, 0.9); padding: 3px 6px; border-radius: 4px; font-size: 10px; font-weight: bold;")
             self._set_live(False)
+            self._update_hw_accel_badge()
 
     def _on_state_changed(self, state: ConnectionState, message: str):
         """Atualiza a indicação visual de conexão."""

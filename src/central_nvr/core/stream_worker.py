@@ -111,12 +111,21 @@ except ImportError:
 _opencv_lock = threading.Lock()
 
 VAAPI_DEVICE_PATH = "/dev/dri/renderD128"
+CUDA_DEVICE_PATHS = ("/dev/nvidiactl", "/dev/nvidia0")
 
 
 def is_vaapi_supported() -> bool:
     """Verifica se o dispositivo de aceleração gráfica por hardware VA-API (/dev/dri/renderD128) está acessível."""
     try:
         return os.path.exists(VAAPI_DEVICE_PATH) and os.access(VAAPI_DEVICE_PATH, os.R_OK)
+    except Exception:
+        return False
+
+
+def is_cuda_supported() -> bool:
+    """Verifica se há dispositivo NVIDIA/CUDA acessível no host Linux."""
+    try:
+        return any(os.path.exists(p) and os.access(p, os.R_OK) for p in CUDA_DEVICE_PATHS)
     except Exception:
         return False
 
@@ -219,6 +228,7 @@ class StreamWorker(QThread):
 
         # Estatísticas e Métricas de QoS
         self.stats = StreamStats()
+        self._pyav_hwaccel_backend = ""
         self._frame_count = 0
         self._bytes_count = 0
         self._last_stats_calc = time.time()
@@ -402,7 +412,8 @@ class StreamWorker(QThread):
         self.stats.latency_ms = 0.0
         self.stats.jitter_ms = 0.0
         self.stats.hw_accel_active = False
-        self.stats_updated.emit(self.stats)
+        self.stats.hw_accel_backend = ""
+        self.stats_updated.emit(replace(self.stats))
 
     def _connect_once(self) -> StreamOutcome:
         """
@@ -467,16 +478,18 @@ class StreamWorker(QThread):
     )
 
     @staticmethod
-    def _hwaccel_label(hwaccel_cfg: Any) -> str:
+    def _hwaccel_label(hwaccel_cfg: Any, fallback_label: str = "") -> str:
         """Retorna o rótulo de exibição correspondente ao HWAccel configurado."""
         if hwaccel_cfg is None:
             return ""
-        dev_type = str(
-            getattr(hwaccel_cfg, "device_type", None)
-            or getattr(hwaccel_cfg, "name", "")
-            or ""
-        ).lower()
-        if dev_type == "vaapi":
+        config = getattr(hwaccel_cfg, "config", None)
+        raw_dev = getattr(config, "device_type", None) if config is not None else None
+        if raw_dev is None:
+            raw_dev = getattr(hwaccel_cfg, "device_type", None) or getattr(hwaccel_cfg, "name", "")
+        if hasattr(raw_dev, "name"):
+            raw_dev = raw_dev.name
+        dev_type = str(raw_dev or fallback_label or "").strip().lower()
+        if dev_type in ("vaapi", "va-api"):
             return "VA-API"
         if dev_type == "cuda":
             return "CUDA"
@@ -486,6 +499,7 @@ class StreamWorker(QThread):
 
     def _build_pyav_hwaccel(self):
         """Constrói a configuração HWAccel do PyAV quando o backend real de GPU está disponível."""
+        self._pyav_hwaccel_backend = ""
         hw_mode = (self.hw_accel or "").lower()
         if hw_mode == "cpu" or not HAS_AV:
             return None
@@ -506,13 +520,18 @@ class StreamWorker(QThread):
 
         try:
             if hw_mode in ("vaapi", "auto") and is_vaapi_supported() and "vaapi" in available:
-                return hwaccel_mod.HWAccel(
-                    "vaapi", device=VAAPI_DEVICE_PATH, allow_software_fallback=True
+                cfg = hwaccel_mod.HWAccel(
+                    "vaapi", device=VAAPI_DEVICE_PATH, allow_software_fallback=False
                 )
-            if hw_mode in ("cuda", "auto") and "cuda" in available:
-                return hwaccel_mod.HWAccel("cuda", allow_software_fallback=True)
+                self._pyav_hwaccel_backend = "VA-API"
+                return cfg
+            if hw_mode in ("cuda", "auto") and is_cuda_supported() and "cuda" in available:
+                cfg = hwaccel_mod.HWAccel("cuda", allow_software_fallback=False)
+                self._pyav_hwaccel_backend = "CUDA"
+                return cfg
         except Exception as e:
             logger.debug(f"Falha ao criar configuração HWAccel ({hw_mode}): {e}")
+            self._pyav_hwaccel_backend = ""
             return None
 
         return None
@@ -522,6 +541,24 @@ class StreamWorker(QThread):
         """Indica se a exceção de av.open corresponde a incompatibilidade/erro de inicialização de hardware."""
         if isinstance(exc, (ConnectionError, TimeoutError, EOFError)):
             return False
+
+        msg = str(exc).lower()
+        exc_filename = str(getattr(exc, "filename", None) or "").lower()
+        hw_tokens = ("hwaccel", "hwdevice", "vaapi", "drm", "cuda", "nvdec", "device", "/dev/dri", "hardware")
+        net_tokens = (
+            "rtsp",
+            "http://",
+            "https://",
+            "rtmp://",
+            "connection",
+            "timed out",
+            "timeout",
+            "unreachable",
+            "offline",
+            "refused",
+            "name or service",
+        )
+        is_network_err = "://" in exc_filename or any(tok in msg for tok in net_tokens)
 
         av_error = getattr(av, "error", None) if HAS_AV else None
         if av_error is not None:
@@ -546,20 +583,22 @@ class StreamWorker(QThread):
             if non_hw_types and isinstance(exc, non_hw_types):
                 return False
 
-            unknown_err_cls = getattr(av_error, "UnknownError", None)
-            if isinstance(unknown_err_cls, type) and isinstance(exc, unknown_err_cls):
-                return True
+            hw_av_types = tuple(
+                t for t in (
+                    getattr(av_error, "UnknownError", None),
+                    getattr(av_error, "ExternalError", None),
+                )
+                if isinstance(t, type)
+            )
+            if hw_av_types and isinstance(exc, hw_av_types):
+                return not is_network_err
 
         if isinstance(exc, (TypeError, RuntimeError, NotImplementedError)):
             return True
 
-        msg = str(exc).lower()
-        hw_tokens = ("hwaccel", "hwdevice", "vaapi", "drm", "cuda", "nvdec", "device", "/dev/dri", "hardware")
-        net_tokens = ("rtsp", "connection", "timed out", "timeout", "unreachable", "offline", "refused", "name or service")
-
         if isinstance(exc, OSError):
             err_no = getattr(exc, "errno", None)
-            if err_no in cls._NETWORK_ERRNOS or any(tok in msg for tok in net_tokens):
+            if err_no in cls._NETWORK_ERRNOS or is_network_err:
                 return False
             av_os_err = getattr(av_error, "OSError", None) if av_error is not None else None
             if isinstance(av_os_err, type) and isinstance(exc, av_os_err):
@@ -623,6 +662,7 @@ class StreamWorker(QThread):
         }
 
         hwaccel_cfg = self._build_pyav_hwaccel()
+        hwaccel_backend = self._hwaccel_label(hwaccel_cfg, self._pyav_hwaccel_backend)
         attempts = [hwaccel_cfg, None] if hwaccel_cfg is not None else [None]
         frames_seen = 0
 
@@ -662,7 +702,8 @@ class StreamWorker(QThread):
                 if not video_stream:
                     return StreamOutcome.NOT_CONNECTED
 
-                if active_hw is None:
+                is_hw = bool(active_hw is not None and getattr(video_stream.codec_context, "is_hwaccel", False))
+                if not is_hw:
                     try:
                         video_stream.thread_type = "AUTO"
                     except Exception:
@@ -678,9 +719,11 @@ class StreamWorker(QThread):
                 else:
                     self.stats.codec = raw_codec or VideoCodec.UNKNOWN.value
 
-                is_hw = bool(active_hw is not None and getattr(video_stream.codec_context, "is_hwaccel", False))
                 self.stats.hw_accel_active = is_hw
-                self.stats.hw_accel_backend = self._hwaccel_label(active_hw) if is_hw else ""
+                self.stats.hw_accel_backend = (
+                    self._hwaccel_label(active_hw, hwaccel_backend) if is_hw else ""
+                )
+                self.stats_updated.emit(replace(self.stats))
                 self._announce_streaming(f"Ao Vivo ({self.stats.codec} {self.stats.transport_mode})")
 
                 self._last_frame_ts = time.time()
@@ -732,7 +775,9 @@ class StreamWorker(QThread):
 
                     is_hw = bool(active_hw is not None and getattr(video_stream.codec_context, "is_hwaccel", False))
                     self.stats.hw_accel_active = is_hw
-                    self.stats.hw_accel_backend = self._hwaccel_label(active_hw) if is_hw else ""
+                    self.stats.hw_accel_backend = (
+                        self._hwaccel_label(active_hw, hwaccel_backend) if is_hw else ""
+                    )
 
                     for frame in decoded_frames:
                         if not self._keep_reading():
@@ -774,6 +819,14 @@ class StreamWorker(QThread):
         cap = None
         frames_seen = 0
         try:
+            hw_prop = getattr(cv2, "CAP_PROP_HW_ACCELERATION", None)
+            vaapi_val = getattr(cv2, "VIDEO_ACCELERATION_VAAPI", None)
+            want_vaapi = (
+                isinstance(hw_prop, int)
+                and isinstance(vaapi_val, int)
+                and (self.hw_accel or "").lower() in ("vaapi", "auto")
+                and is_vaapi_supported()
+            )
             with _opencv_lock:
                 # buffer_size de 2MB (2048000 bytes) para evitar descarte de pacotes UDP em rajadas de I-Frames
                 os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
@@ -788,14 +841,30 @@ class StreamWorker(QThread):
                 read_prop = getattr(cv2, "CAP_PROP_READ_TIMEOUT_MSEC", None)
                 if isinstance(open_prop, int) and isinstance(read_prop, int):
                     timeout_params = [open_prop, 5000, read_prop, 5000]
-                try:
-                    cap = (
-                        cv2.VideoCapture(stream_url, cv2.CAP_FFMPEG, timeout_params)
-                        if timeout_params
-                        else cv2.VideoCapture(stream_url, cv2.CAP_FFMPEG)
-                    )
-                except TypeError:
-                    cap = cv2.VideoCapture(stream_url, cv2.CAP_FFMPEG)
+
+                # CAP_PROP_HW_ACCELERATION precisa ser passado no construtor do VideoCapture (FFmpeg)
+                if want_vaapi:
+                    hw_params = [*timeout_params, hw_prop, vaapi_val]
+                    try:
+                        cap = cv2.VideoCapture(stream_url, cv2.CAP_FFMPEG, hw_params)
+                    except TypeError:
+                        cap = None
+                    if cap is not None and not cap.isOpened():
+                        try:
+                            cap.release()
+                        except Exception:
+                            pass
+                        cap = None
+
+                if cap is None:
+                    try:
+                        cap = (
+                            cv2.VideoCapture(stream_url, cv2.CAP_FFMPEG, timeout_params)
+                            if timeout_params
+                            else cv2.VideoCapture(stream_url, cv2.CAP_FFMPEG)
+                        )
+                    except TypeError:
+                        cap = cv2.VideoCapture(stream_url, cv2.CAP_FFMPEG)
                 cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
             if not cap.isOpened():
@@ -803,17 +872,15 @@ class StreamWorker(QThread):
 
             self.stats.hw_accel_active = False
             self.stats.hw_accel_backend = ""
-            if hasattr(cv2, "CAP_PROP_HW_ACCELERATION") and hasattr(cv2, "VIDEO_ACCELERATION_VAAPI"):
-                if (self.hw_accel or "").lower() in ("vaapi", "auto") and is_vaapi_supported():
-                    cap.set(cv2.CAP_PROP_HW_ACCELERATION, cv2.VIDEO_ACCELERATION_VAAPI)
-                    if cap.get(cv2.CAP_PROP_HW_ACCELERATION) == cv2.VIDEO_ACCELERATION_VAAPI:
-                        self.stats.hw_accel_active = True
-                        self.stats.hw_accel_backend = "VA-API"
+            if want_vaapi and cap.get(hw_prop) == vaapi_val:
+                self.stats.hw_accel_active = True
+                self.stats.hw_accel_backend = "VA-API"
 
             self.stats.codec = self._detect_opencv_codec(cap, stream_url)
             self._bytes_count = 0
             self.stats.bitrate_kbps = 0.0
 
+            self.stats_updated.emit(replace(self.stats))
             self._announce_streaming(f"Ao Vivo (OpenCV {self.stats.transport_mode})")
             self._last_frame_ts = time.time()
 
@@ -862,16 +929,19 @@ class StreamWorker(QThread):
         Gera um fluxo de vídeo de teste com movimentação e overlay dinâmico.
         Garante que a UI funcione perfeitamente com feedback visual mesmo sem câmera física ligada.
         """
-        self.state_changed.emit(ConnectionState.STREAMING, "Sinal de Demonstração (Ativo)")
         self.stats.codec = "H.264 (Simulado)"
         self.stats.transport_mode = "TCP (Local)"
         self.stats.hw_accel_active = False
         self.stats.hw_accel_backend = ""
         self._bytes_count = 0
         self.stats.bitrate_kbps = 0.0
+        self.stats.latency_ms = 0.0
+        self.stats.jitter_ms = 0.0
         w, h = 640, 360
         self.stats.width = w
         self.stats.height = h
+        self.stats_updated.emit(replace(self.stats))
+        self.state_changed.emit(ConnectionState.STREAMING, "Sinal de Demonstração (Ativo)")
 
         target_fps = 25.0
         frame_interval = 1.0 / target_fps
@@ -901,10 +971,8 @@ class StreamWorker(QThread):
                 y1, y2 = max(0, obj_y - 20), min(h, obj_y + 20)
                 grid[y1:y2, x1:x2] = [40, 160, 220]  # Caixa azul ciano de detecção
 
-            latency = 18.0 + 4.0 * math.sin(t)
-
             if grid is not None:
-                self._process_and_emit_frame(grid, w, h, latency)
+                self._process_and_emit_frame(grid, w, h, 0.0)
 
             elapsed = time.time() - start_loop
             sleep_time = max(0.001, frame_interval - elapsed)
@@ -960,11 +1028,12 @@ class StreamWorker(QThread):
         now = time.time()
         time_diff = now - self._last_stats_calc
 
-        # Calcular jitter de rede (variação do intervalo esperado entre frames)
-        fps_target = max(1.0, self.stats.fps or 25.0)
-        expected_interval_ms = 1000.0 / fps_target
-        jitter_instant = abs(latency_ms - expected_interval_ms)
-        self.stats.jitter_ms = round(0.85 * self.stats.jitter_ms + 0.15 * jitter_instant, 1)
+        # Calcular jitter de rede (variação do intervalo esperado entre frames) apenas com intervalo medido
+        if latency_ms > 0.0:
+            fps_target = max(1.0, self.stats.fps or 25.0)
+            expected_interval_ms = 1000.0 / fps_target
+            jitter_instant = abs(latency_ms - expected_interval_ms)
+            self.stats.jitter_ms = round(0.85 * self.stats.jitter_ms + 0.15 * jitter_instant, 1)
 
         if time_diff >= 0.5:
             fps = self._frame_count / time_diff

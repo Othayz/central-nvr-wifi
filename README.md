@@ -1,6 +1,6 @@
 # Central NVR WiFi - Sistema Desktop Linux para Monitoramento e Controle ONVIF / RTSP
 
-Aplicativo desktop profissional para Linux projetado para descoberta de rede, streaming de vídeo de baixa latência com aceleração por hardware (VA-API), controle direcional PTZ e gerenciamento em mosaico (Grid) de Câmeras IP e NVRs.
+Aplicativo desktop profissional para Linux projetado para descoberta de rede, streaming de vídeo RTSP de baixa latência com aceleração por hardware quando disponível (VA-API / CUDA, com fallback automático para CPU), controle direcional PTZ e gerenciamento em mosaico (Grid) de Câmeras IP e NVRs.
 
 ---
 
@@ -9,7 +9,7 @@ Aplicativo desktop profissional para Linux projetado para descoberta de rede, st
 | Camada | Tecnologia | Justificativa Técnica |
 | :--- | :--- | :--- |
 | **Interface Gráfica (GUI)** | **PySide6 (Qt 6)** | Renderização acelerada por GPU, layouts responsivos dinâmicos (1x1, 2x2, 3x3), suporte nativo a monitores High-DPI e estilização limpa em Dark Mode. |
-| **Decodificação de Vídeo** | **PyAV / FFmpeg (VA-API)** | Decodificação direta de streams RTSP H.264 / H.265 via hardware Linux (Intel QuickSync, AMD Radeon via `/dev/dri/renderD128`) com buffer ultrabaixo (<150ms). |
+| **Decodificação de Vídeo** | **PyAV / FFmpeg (HWAccel / CPU)** | Decodificação direta de streams RTSP H.264 / H.265 via `av.codec.hwaccel.HWAccel` (VA-API via `/dev/dri/renderD128` quando suportado pelo FFmpeg compilado, ou NVIDIA CUDA/NVDEC) com fallback automático para decodificação por software (CPU) e buffer configurável (padrão 150 ms). |
 | **Descoberta de Rede** | **WS-Discovery Nativo (UDP Multicast)** | Envio RFC-compliant de sondas SOAP para `239.255.255.250:3702` (escopos ONVIF `NetworkVideoTransmitter`), combinado com sondagem de portas TCP (554, 8899, 37777 e 8000) em cada sub-rede local. |
 | **Controle ONVIF / PTZ** | **Cliente SOAP com WS-Security** | Implementação com autenticação `UsernameToken` (SHA-1 Password Digest e Nonce), resolução dinâmica de URLs RTSP e controle de Pan, Tilt, Zoom e Presets. |
 | **Distribuição Universal** | **AppImage** | Formato portátil autocontido compatível com qualquer distribuição Linux (Ubuntu, Debian, Fedora, Arch, openSUSE e sistemas imutáveis como SteamOS e Bazzite). |
@@ -161,7 +161,7 @@ em `~/.local/bin/central-nvr.AppImage` e o atalho do menu passa a apontar para e
 ## 5. Principais Recursos e Funcionalidades
 
 - **Varredura Automática ONVIF (WS-Discovery):** Encontra instantaneamente câmeras Intelbras, Hikvision, Dahua, Reolink e marcas compatíveis na rede local via UDP Multicast (`239.255.255.250:3702`).
-- **Player de Baixa Latência com VA-API:** Decodificação direta por hardware acelerado pela GPU (Intel/AMD) com tempo de resposta < 150ms.
+- **Player RTSP de Baixa Latência (HWAccel / CPU):** Decodificação acelerada por hardware (VA-API/CUDA quando disponível no FFmpeg e no host) com fallback automático para CPU e exibição real do decodificador ativo no OSD.
 - **Visualização em Mosaico (Grid 1x1, 2x2, 3x3):** Permite alternar rapidamente entre visualização de 1, 4 ou 9 câmeras simultâneas. Clique duplo em qualquer câmera para modo foco/maximizado.
 - **Controle PTZ Direcional:** D-Pad de 8 direções, Zoom In/Out, controle de velocidade e gerenciamento de posições salvas (Presets).
 - **Captura de Snapshots e Gravações:** Botão dedicado no OSD de cada câmera para salvar fotos e registrar eventos.
