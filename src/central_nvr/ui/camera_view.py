@@ -177,7 +177,7 @@ class CameraViewWidget(QFrame):
         self.lbl_motion.hide()
         top_bar.addWidget(self.lbl_motion)
 
-        self.lbl_hw_accel = QLabel("VA-API" if self.hw_accel == "vaapi" else "CPU")
+        self.lbl_hw_accel = QLabel("CPU")
         self.lbl_hw_accel.setStyleSheet("color: #38BDF8; background-color: rgba(15, 23, 42, 0.85); padding: 3px 6px; border-radius: 4px; font-size: 10px; font-weight: bold;")
         top_bar.addWidget(self.lbl_hw_accel)
 
@@ -191,8 +191,9 @@ class CameraViewWidget(QFrame):
         # Bottom Bar do OSD
         bottom_bar = QHBoxLayout()
 
-        self.lbl_metrics = QLabel("0.0 FPS | 0 kbps | 0 ms")
+        self.lbl_metrics = QLabel("")
         self.lbl_metrics.setStyleSheet("color: #94A3B8; background-color: rgba(15, 23, 42, 0.85); padding: 3px 8px; border-radius: 4px; font-size: 10px; font-family: monospace;")
+        self._render_metrics()
         bottom_bar.addWidget(self.lbl_metrics)
 
         # Aviso temporário (ex.: sub-stream indisponível)
@@ -577,9 +578,15 @@ class CameraViewWidget(QFrame):
             )
         self.update()
 
+    def _update_hw_accel_badge(self):
+        """Atualiza o selo de aceleração de hardware conforme o estado real do decodificador."""
+        if hasattr(self, "lbl_hw_accel"):
+            self.lbl_hw_accel.setText("VA-API" if self.stats.hw_accel_active else "CPU")
+
     def _on_stats_updated(self, stats: StreamStats):
-        """Atualiza a exibição de FPS, Bitrate, Codec e QoS no OSD."""
+        """Atualiza a exibição de FPS, Bitrate, Codec, aceleração de hardware e QoS no OSD."""
         self.stats = stats
+        self._update_hw_accel_badge()
         self._render_metrics()
 
     def _render_metrics(self):
@@ -590,7 +597,7 @@ class CameraViewWidget(QFrame):
             parts.append(datetime.datetime.now().strftime("%H:%M:%S"))
         if self.options.show_osd_fps:
             parts.append(f"{stats.fps} FPS")
-        if self.options.show_osd_bitrate:
+        if self.options.show_osd_bitrate and stats.bitrate_kbps > 0:
             parts.append(f"{int(stats.bitrate_kbps)} kbps")
         parts.append(stats.codec if stats.codec else "H.264")
         if stats.jitter_ms > 0:
@@ -713,11 +720,16 @@ class CameraViewWidget(QFrame):
             self._last_frame_monotonic = time.monotonic()
             self._set_live(True)
         elif state == ConnectionState.PAUSED:
+            self.stats.hw_accel_active = False
             self._publish_display_state("Pausada")
         elif state == ConnectionState.CONNECTING and self.current_frame is None:
+            self.stats.hw_accel_active = False
             self._publish_display_state("Conectando")
         else:
+            self.stats.hw_accel_active = False
             self._set_live(False)
+
+        self._update_hw_accel_badge()
 
         if state == ConnectionState.STREAMING:
             self.lbl_status.setText("AO VIVO")

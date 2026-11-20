@@ -397,6 +397,7 @@ class StreamWorker(QThread):
         self.stats.bitrate_kbps = 0.0
         self.stats.latency_ms = 0.0
         self.stats.jitter_ms = 0.0
+        self.stats.hw_accel_active = False
         self.stats_updated.emit(self.stats)
 
     def _connect_once(self) -> StreamOutcome:
@@ -442,6 +443,99 @@ class StreamWorker(QThread):
             return TransportMode.AUTO_UDP.value if transport == "udp" else TransportMode.AUTO_TCP_FALLBACK.value
         return TransportMode.UDP.value if transport == "udp" else TransportMode.TCP.value
 
+    def _build_pyav_hwaccel(self):
+        """Constrói a configuração HWAccel do PyAV via Host Delegation quando disponível."""
+        hw_mode = (self.hw_accel or "").lower()
+        if hw_mode == "cpu" or not HAS_AV:
+            return None
+
+        codec_mod = getattr(av, "codec", None)
+        hwaccel_mod = getattr(codec_mod, "hwaccel", None) if codec_mod is not None else None
+        if (
+            hwaccel_mod is None
+            or not hasattr(hwaccel_mod, "HWAccel")
+            or not hasattr(hwaccel_mod, "hwdevices_available")
+        ):
+            return None
+
+        try:
+            available = set(hwaccel_mod.hwdevices_available())
+        except Exception:
+            return None
+
+        try:
+            if hw_mode in ("vaapi", "auto") and is_vaapi_supported():
+                if "vaapi" in available:
+                    return hwaccel_mod.HWAccel(
+                        "vaapi", device=VAAPI_DEVICE_PATH, allow_software_fallback=True
+                    )
+                if "drm" in available:
+                    return hwaccel_mod.HWAccel(
+                        "drm", device=VAAPI_DEVICE_PATH, allow_software_fallback=True
+                    )
+            if hw_mode == "cuda" and "cuda" in available:
+                return hwaccel_mod.HWAccel("cuda", allow_software_fallback=True)
+        except Exception as e:
+            logger.debug(f"Falha ao criar configuração HWAccel ({hw_mode}): {e}")
+            return None
+
+        return None
+
+    @staticmethod
+    def _is_hw_init_error(exc: Exception) -> bool:
+        """Indica se a exceção de av.open corresponde a incompatibilidade/erro de inicialização de hardware."""
+        if isinstance(exc, (TypeError, ValueError, RuntimeError, NotImplementedError)):
+            return True
+        if isinstance(exc, OSError):
+            return False
+        av_error = getattr(av, "error", None) if HAS_AV else None
+        if av_error is not None:
+            http_types = tuple(
+                t for t in (
+                    getattr(av_error, "HTTPError", None),
+                    getattr(av_error, "HTTPClientError", None),
+                )
+                if isinstance(t, type)
+            )
+            if http_types and isinstance(exc, http_types):
+                return False
+        msg = str(exc).lower()
+        return any(tok in msg for tok in ("hwaccel", "hwdevice", "vaapi", "drm", "cuda", "nvdec", "device"))
+
+    @staticmethod
+    def _detect_opencv_codec(cap, stream_url: str) -> str:
+        """Detecta o codec apenas quando informado por CAP_PROP_FOURCC ou explicitamente na URL."""
+        fourcc_str = ""
+        fourcc_prop = getattr(cv2, "CAP_PROP_FOURCC", None)
+        if fourcc_prop is not None:
+            try:
+                raw_fourcc = cap.get(fourcc_prop)
+                if isinstance(raw_fourcc, (int, float)) and raw_fourcc > 0:
+                    fourcc_int = int(raw_fourcc)
+                    fourcc_str = "".join(
+                        chr((fourcc_int >> (8 * i)) & 0xFF) for i in range(4)
+                    ).strip("\x00 ").upper()
+            except Exception:
+                fourcc_str = ""
+
+        if fourcc_str:
+            if "HEVC" in fourcc_str or "265" in fourcc_str or "HVC" in fourcc_str or "HEV" in fourcc_str:
+                return VideoCodec.H265_HEVC.value
+            if "264" in fourcc_str or "AVC" in fourcc_str:
+                return VideoCodec.H264.value
+            if "MJPG" in fourcc_str or "JPEG" in fourcc_str:
+                return VideoCodec.MJPEG.value
+
+        url_lower = (stream_url or "").lower()
+        if "hevc" in url_lower or "265" in url_lower:
+            return VideoCodec.H265_HEVC.value
+        if "h264" in url_lower or "264" in url_lower:
+            return VideoCodec.H264.value
+        if "mjpeg" in url_lower or "mjpg" in url_lower:
+            return VideoCodec.MJPEG.value
+
+        return VideoCodec.UNKNOWN.value
+
     def _run_pyav_stream(self, stream_url: str, transport: str = "udp") -> StreamOutcome:
         """Consome o fluxo utilizando PyAV (libav / FFmpeg) com suporte nativo a H.265 (HEVC) e UDP."""
         container_options = {
@@ -454,18 +548,44 @@ class StreamWorker(QThread):
             **_pyav_socket_timeout_option(),
         }
 
+        hwaccel_cfg = self._build_pyav_hwaccel()
         container = None
         frames_seen = 0
         try:
             try:
-                container = av.open(stream_url, mode="r", options=container_options, timeout=5.0)
+                if hwaccel_cfg is not None:
+                    try:
+                        container = av.open(
+                            stream_url,
+                            mode="r",
+                            options=container_options,
+                            timeout=5.0,
+                            hwaccel=hwaccel_cfg,
+                        )
+                    except av.HTTPUnauthorizedError:
+                        return StreamOutcome.AUTH_FAILED
+                    except Exception as hw_err:
+                        if not self._is_hw_init_error(hw_err):
+                            raise
+                        logger.debug(
+                            f"Fallback para decodificação em software (CPU) em {self.camera.name}: {hw_err}"
+                        )
+                        hwaccel_cfg = None
+                        if not self._keep_reading():
+                            return StreamOutcome.STOPPED
+                        container = av.open(stream_url, mode="r", options=container_options, timeout=5.0)
+                else:
+                    container = av.open(stream_url, mode="r", options=container_options, timeout=5.0)
             except av.HTTPUnauthorizedError:
                 return StreamOutcome.AUTH_FAILED
             video_stream = next((s for s in container.streams if s.type == "video"), None)
             if not video_stream:
                 return StreamOutcome.NOT_CONNECTED
 
-            video_stream.thread_type = "AUTO"
+            try:
+                video_stream.thread_type = "AUTO"
+            except Exception:
+                pass
             raw_codec = video_stream.codec_context.name.upper()
             if "HEVC" in raw_codec or "265" in raw_codec:
                 self.stats.codec = VideoCodec.H265_HEVC.value
@@ -476,8 +596,9 @@ class StreamWorker(QThread):
             else:
                 self.stats.codec = raw_codec or VideoCodec.UNKNOWN.value
 
-            vaapi_ok = (self.hw_accel == "vaapi" and is_vaapi_supported())
-            self.stats.hw_accel_active = vaapi_ok
+            self.stats.hw_accel_active = bool(
+                hwaccel_cfg is not None and getattr(video_stream.codec_context, "is_hwaccel", False)
+            )
             self._announce_streaming(f"Ao Vivo ({self.stats.codec} {self.stats.transport_mode})")
 
             self._last_frame_ts = time.time()
@@ -498,7 +619,18 @@ class StreamWorker(QThread):
 
                 self._bytes_count += packet.size or 0
 
-                for frame in packet.decode():
+                try:
+                    decoded_frames = list(packet.decode())
+                except Exception as decode_err:
+                    self.stats.dropped_frames += 1
+                    logger.debug(f"Pacote corrompido descartado em {self.camera.name}: {decode_err}")
+                    continue
+
+                self.stats.hw_accel_active = bool(
+                    hwaccel_cfg is not None and getattr(video_stream.codec_context, "is_hwaccel", False)
+                )
+
+                for frame in decoded_frames:
                     if not self._keep_reading():
                         break
 
@@ -561,21 +693,17 @@ class StreamWorker(QThread):
             if not cap.isOpened():
                 return StreamOutcome.NOT_CONNECTED
 
+            self.stats.hw_accel_active = False
             if hasattr(cv2, "CAP_PROP_HW_ACCELERATION") and hasattr(cv2, "VIDEO_ACCELERATION_VAAPI"):
-                if self.hw_accel == "vaapi" and is_vaapi_supported():
+                if (self.hw_accel or "").lower() in ("vaapi", "auto") and is_vaapi_supported():
                     cap.set(cv2.CAP_PROP_HW_ACCELERATION, cv2.VIDEO_ACCELERATION_VAAPI)
-                    self.stats.hw_accel_active = (cap.get(cv2.CAP_PROP_HW_ACCELERATION) == cv2.VIDEO_ACCELERATION_VAAPI)
-                else:
-                    self.stats.hw_accel_active = False
-            else:
-                self.stats.hw_accel_active = (self.hw_accel == "vaapi" and is_vaapi_supported())
+                    self.stats.hw_accel_active = (
+                        cap.get(cv2.CAP_PROP_HW_ACCELERATION) == cv2.VIDEO_ACCELERATION_VAAPI
+                    )
 
-            mfg = (self.camera.manufacturer or "").lower()
-            url_lower = stream_url.lower()
-            if "hevc" in url_lower or "265" in url_lower or "yoosee" in mfg:
-                self.stats.codec = VideoCodec.H265_HEVC.value
-            else:
-                self.stats.codec = VideoCodec.H264.value
+            self.stats.codec = self._detect_opencv_codec(cap, stream_url)
+            self._bytes_count = 0
+            self.stats.bitrate_kbps = 0.0
 
             self._announce_streaming(f"Ao Vivo (OpenCV {self.stats.transport_mode})")
             self._last_frame_ts = time.time()
@@ -596,9 +724,6 @@ class StreamWorker(QThread):
                 h, w, _ = frame_rgb.shape
                 self.stats.width = w
                 self.stats.height = h
-
-                # Estimativa de fluxo comprimido realista para H.264/H.265 (~1.5-2.0 Mbps)
-                self._bytes_count += max(2000, (w * h * 3) // 200)
 
                 self._process_and_emit_frame(frame_rgb, w, h, delta_ms)
                 frames_seen += 1
@@ -631,7 +756,9 @@ class StreamWorker(QThread):
         self.state_changed.emit(ConnectionState.STREAMING, "Sinal de Demonstração (Ativo)")
         self.stats.codec = "H.264 (Simulado)"
         self.stats.transport_mode = "TCP (Local)"
-        self.stats.hw_accel_active = True
+        self.stats.hw_accel_active = False
+        self._bytes_count = 0
+        self.stats.bitrate_kbps = 0.0
         w, h = 640, 360
         self.stats.width = w
         self.stats.height = h
@@ -664,7 +791,6 @@ class StreamWorker(QThread):
                 y1, y2 = max(0, obj_y - 20), min(h, obj_y + 20)
                 grid[y1:y2, x1:x2] = [40, 160, 220]  # Caixa azul ciano de detecção
 
-            self._bytes_count += 3500  # ~700 kbps estimado
             latency = 18.0 + 4.0 * math.sin(t)
 
             if grid is not None:
