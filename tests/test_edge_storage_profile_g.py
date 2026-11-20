@@ -18,17 +18,32 @@ from unittest.mock import MagicMock, patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
 
-from PySide6.QtWidgets import QApplication
-
 from central_nvr.core.camera import CameraDevice
+from central_nvr.core.config import ConfigManager
 from central_nvr.core.onvif_client import (
     OnvifClient,
     OnvifFaultError,
     OnvifTimeoutError,
 )
-from central_nvr.core.threads import drain_retired_threads
-from central_nvr.ui import playback_view
-from central_nvr.ui.playback_view import EdgeStorageWorker, PlaybackWidget
+
+try:
+    from PySide6.QtCore import QCoreApplication, QEvent
+    from PySide6.QtWidgets import QApplication
+    from central_nvr.core.threads import drain_retired_threads
+    from central_nvr.ui import playback_view
+    from central_nvr.ui.main_window import MainWindow
+    from central_nvr.ui.playback_view import EdgeStorageWorker, PlaybackWidget
+    HAS_PYSIDE6 = True
+except ImportError:
+    QCoreApplication = None
+    QEvent = None
+    QApplication = None
+    drain_retired_threads = None
+    playback_view = None
+    MainWindow = None
+    EdgeStorageWorker = None
+    PlaybackWidget = None
+    HAS_PYSIDE6 = False
 
 ENV = '<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" {ns}><s:Body>{body}</s:Body></s:Envelope>'
 NS = (
@@ -266,7 +281,8 @@ class ProfileGSearchFlowTest(unittest.TestCase):
 
         # Verifica payload de FindRecordings, GetRecordingSearchResults e EndSearch com escape XML
         find_xml = self.calls[2][1]
-        self.assertIn("<tt:IncludedSources/>", find_xml)
+        self.assertIn("<tse:Scope/>", find_xml)
+        self.assertNotIn("IncludedSources", find_xml)
         self.assertIn("<tse:MaxMatches>10</tse:MaxMatches>", find_xml)
         self.assertIn("<tse:KeepAliveTime>PT10S</tse:KeepAliveTime>", find_xml)
 
@@ -360,18 +376,150 @@ class ProfileGSearchFlowTest(unittest.TestCase):
         self.assertNotIn("GetRecordingSearchResults", "".join(xml for _, xml in self.calls))
         self.assertNotIn("EndSearch", "".join(xml for _, xml in self.calls))
 
+    def test_get_recording_summary_falls_back_to_trc_on_http_404(self):
+        def handler(url, xml):
+            if "tse:GetRecordingSummary" in xml:
+                return _http_response(404, "<html>Not Found</html>")
+            if "trc:GetRecordingSummary" in xml:
+                return _http_response(200, SUMMARY_RESPONSE)
+            raise AssertionError(f"Requisição inesperada: {url} {xml}")
 
-def _camera() -> CameraDevice:
+        self._mock_post(handler)
+
+        summary = self.client.get_recording_summary()
+        self.assertEqual(summary["num_recordings"], 3)
+        self.assertTrue(summary["has_storage"])
+        self.assertEqual(len(self.calls), 2)
+        self.assertEqual(self.calls[0][0], "http://10.0.0.5:80/onvif/search_service")
+        self.assertEqual(self.calls[1][0], "http://10.0.0.5:80/onvif/recording_service")
+        self.assertIn("<trc:GetRecordingSummary/>", self.calls[1][1])
+
+    def test_find_recordings_falls_back_to_recording_service_on_http_404(self):
+        def handler(url, xml):
+            if "tse:FindRecordings" in xml:
+                return _http_response(404, "Not Found")
+            if "trc:FindRecordings" in xml:
+                return _http_response(200, FIND_RECORDINGS_LEGACY_RESPONSE)
+            if "trp:GetReplayUri" in xml:
+                token = "legacy_a" if "legacy_a" in xml else "legacy_b"
+                return _http_response(200, _replay_uri_response(token))
+            raise AssertionError(f"Requisição inesperada: {url} {xml}")
+
+        self._mock_post(handler)
+
+        recs = self.client.find_recordings(max_matches=10)
+        self.assertEqual([r["token"] for r in recs], ["legacy_a", "legacy_b"])
+        self.assertEqual(self.calls[0][0], "http://10.0.0.5:80/onvif/search_service")
+        self.assertEqual(self.calls[1][0], "http://10.0.0.5:80/onvif/recording_service")
+        self.assertIn("<trc:Scope/>", self.calls[1][1])
+        self.assertNotIn("IncludedSources", self.calls[1][1])
+
+    def test_find_recordings_loops_while_search_state_is_searching(self):
+        search_batches = [
+            ENV.format(
+                ns=NS,
+                body="""
+<tse:GetRecordingSearchResultsResponse>
+  <tse:ResultList>
+    <tt:SearchState>Searching</tt:SearchState>
+  </tse:ResultList>
+</tse:GetRecordingSearchResultsResponse>""",
+            ),
+            ENV.format(
+                ns=NS,
+                body="""
+<tse:GetRecordingSearchResultsResponse>
+  <tse:ResultList>
+    <tt:SearchState>Searching</tt:SearchState>
+    <tt:RecordingInformation><tt:RecordingToken>rec_001</tt:RecordingToken></tt:RecordingInformation>
+  </tse:ResultList>
+</tse:GetRecordingSearchResultsResponse>""",
+            ),
+            ENV.format(
+                ns=NS,
+                body="""
+<tse:GetRecordingSearchResultsResponse>
+  <tse:ResultList>
+    <tt:SearchState>Completed</tt:SearchState>
+    <tt:RecordingInformation><tt:RecordingToken>rec_002</tt:RecordingToken></tt:RecordingInformation>
+    <tt:RecordingInformation><tt:RecordingToken>rec_003</tt:RecordingToken></tt:RecordingInformation>
+  </tse:ResultList>
+</tse:GetRecordingSearchResultsResponse>""",
+            ),
+        ]
+        batch_idx = 0
+        results_requests = []
+
+        def handler(url, xml):
+            nonlocal batch_idx
+            if "tse:FindRecordings" in xml:
+                return _http_response(200, FIND_RECORDINGS_TOKEN_RESPONSE)
+            if "tse:GetRecordingSearchResults" in xml:
+                results_requests.append(xml)
+                resp_xml = search_batches[batch_idx]
+                batch_idx += 1
+                return _http_response(200, resp_xml)
+            if "tse:EndSearch" in xml:
+                return _http_response(200, END_SEARCH_RESPONSE)
+            if "trp:GetReplayUri" in xml:
+                for tok in ("rec_001", "rec_002", "rec_003"):
+                    if tok in xml:
+                        return _http_response(200, _replay_uri_response(tok))
+            raise AssertionError(f"Requisição inesperada: {url} {xml}")
+
+        self._mock_post(handler)
+
+        recs = self.client.find_recordings(max_matches=5)
+        self.assertEqual([r["token"] for r in recs], ["rec_001", "rec_002", "rec_003"])
+        self.assertEqual(len(results_requests), 3)
+        self.assertIn("<tse:MaxResults>5</tse:MaxResults>", results_requests[0])
+        self.assertIn("<tse:MaxResults>5</tse:MaxResults>", results_requests[1])
+        self.assertIn("<tse:MaxResults>4</tse:MaxResults>", results_requests[2])
+        end_calls = [xml for _, xml in self.calls if "<tse:EndSearch>" in xml]
+        self.assertEqual(len(end_calls), 1)
+
+    def test_find_recordings_aborts_when_should_abort_triggers(self):
+        abort_flag = {"stop": False}
+
+        def handler(url, xml):
+            if "tse:FindRecordings" in xml:
+                return _http_response(200, FIND_RECORDINGS_TOKEN_RESPONSE)
+            if "tse:GetRecordingSearchResults" in xml:
+                abort_flag["stop"] = True
+                return _http_response(
+                    200,
+                    ENV.format(
+                        ns=NS,
+                        body="""
+<tse:GetRecordingSearchResultsResponse>
+  <tse:ResultList>
+    <tt:SearchState>Searching</tt:SearchState>
+    <tt:RecordingInformation><tt:RecordingToken>rec_001</tt:RecordingToken></tt:RecordingInformation>
+  </tse:ResultList>
+</tse:GetRecordingSearchResultsResponse>""",
+                    ),
+                )
+            raise AssertionError(f"Não deveria continuar após abortar: {url} {xml}")
+
+        self._mock_post(handler)
+
+        recs = self.client.find_recordings(max_matches=10, should_abort=lambda: abort_flag["stop"])
+        self.assertEqual(recs, [])
+        self.assertEqual(len(self.calls), 2)
+
+
+def _camera(cam_id: str = "cam_10_0_0_5", name: str = "Câmera Garagem", ip: str = "10.0.0.5") -> CameraDevice:
     return CameraDevice(
-        id="cam_10_0_0_5",
-        name="Câmera Garagem",
-        ip="10.0.0.5",
+        id=cam_id,
+        name=name,
+        ip=ip,
         port=80,
         username="admin",
         password="secret",
     )
 
 
+@unittest.skipUnless(HAS_PYSIDE6, "PySide6 não disponível neste ambiente")
 class PlaybackEdgeStorageAsyncTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -497,7 +645,9 @@ class PlaybackEdgeStorageAsyncTest(unittest.TestCase):
         self.assertTrue(self.widget.btn_sync_sd.isEnabled())
         self.assertEqual(self.widget.btn_sync_sd.text(), "💾 Cartão SD (Profile G)")
         self.assertIsNone(self.widget._edge_worker)
-        self.assertIn("Sem resposta em 3.0s", self.msgbox.warning.call_args[0][2])
+        warn_text = self.msgbox.warning.call_args[0][2]
+        self.assertIn("Câmera Garagem", warn_text)
+        self.assertIn("Sem resposta em 3.0s", warn_text)
         self.assertTrue(drain_retired_threads(5000))
 
     def test_check_edge_storage_summary_only_and_empty_results(self):
@@ -523,7 +673,9 @@ class PlaybackEdgeStorageAsyncTest(unittest.TestCase):
             self.widget._check_edge_storage()
             self._wait_until(lambda: self.msgbox.information.called)
 
-        self.assertIn("5 gravações", self.msgbox.information.call_args[0][2])
+        summary_text = self.msgbox.information.call_args[0][2]
+        self.assertIn("Câmera Garagem", summary_text)
+        self.assertIn("5 gravações", summary_text)
         self.assertTrue(self.widget.btn_sync_sd.isEnabled())
         self.assertTrue(drain_retired_threads(5000))
 
@@ -577,6 +729,137 @@ class PlaybackEdgeStorageAsyncTest(unittest.TestCase):
             self.assertTrue(drain_retired_threads(5000))
             self.app.processEvents()
 
+        self.msgbox.information.assert_not_called()
+        self.msgbox.warning.assert_not_called()
+
+    def test_set_camera_cancels_active_query_restores_button_and_suppresses_stale_dialog(self):
+        cam_a = _camera("cam_a", "Câmera A", "10.0.0.5")
+        cam_b = _camera("cam_b", "Câmera B", "10.0.0.6")
+        started_a = threading.Event()
+        release_a = threading.Event()
+        calls = []
+
+        class SwitchingOnvifClient:
+            def __init__(self, ip, port=80, username="", password="", timeout=3.0):
+                self.ip = ip
+
+            def get_capabilities(self):
+                calls.append((self.ip, "get_capabilities"))
+                if self.ip == cam_a.ip:
+                    started_a.set()
+                    release_a.wait(timeout=3.0)
+                return {}
+
+            def get_recording_summary(self):
+                calls.append((self.ip, "get_recording_summary"))
+                return {"num_recordings": 1, "has_storage": True, "earliest_time": "", "latest_time": ""}
+
+            def find_recordings(self, max_matches=20, should_abort=None):
+                calls.append((self.ip, "find_recordings"))
+                return [{"token": f"rec_{self.ip}", "replay_uri": f"rtsp://{self.ip}:554/r1"}]
+
+        self.widget.set_camera(cam_a)
+        with patch.object(playback_view, "OnvifClient", SwitchingOnvifClient):
+            self.widget._check_edge_storage()
+            self.assertTrue(started_a.wait(timeout=2.0))
+            self.assertFalse(self.widget.btn_sync_sd.isEnabled())
+
+            # Trocar para Câmera B cancela a consulta de A e restaura o botão imediatamente
+            self.widget.set_camera(cam_b)
+            self.assertIsNone(self.widget._edge_worker)
+            self.assertTrue(self.widget.btn_sync_sd.isEnabled())
+            self.assertEqual(self.widget.btn_sync_sd.text(), "💾 Cartão SD (Profile G)")
+
+            # Libera Câmera A: worker interrompido não avança nem exibe QMessageBox
+            release_a.set()
+            self.assertTrue(drain_retired_threads(5000))
+            self.app.processEvents()
+            self.msgbox.information.assert_not_called()
+            self.msgbox.warning.assert_not_called()
+            self.assertEqual(calls, [(cam_a.ip, "get_capabilities")])
+
+            # Agora consultar Câmera B funciona normalmente
+            self.widget._check_edge_storage()
+            self._wait_until(lambda: self.msgbox.information.called)
+            body = self.msgbox.information.call_args[0][2]
+            self.assertIn("Câmera B", body)
+            self.assertIn(f"rec_{cam_b.ip}", body)
+
+            # Remover câmera (set_camera(None)) durante consulta ativa também cancela e restaura o botão
+            self.msgbox.information.reset_mock()
+            started_a.clear()
+            release_a.clear()
+            self.widget.set_camera(cam_a)
+            self.widget._check_edge_storage()
+            self.assertTrue(started_a.wait(timeout=2.0))
+            self.widget.set_camera(None)
+            self.assertIsNone(self.widget._edge_worker)
+            self.assertTrue(self.widget.btn_sync_sd.isEnabled())
+            release_a.set()
+            self.assertTrue(drain_retired_threads(5000))
+            self.app.processEvents()
+            self.msgbox.information.assert_not_called()
+            self.msgbox.warning.assert_not_called()
+
+    def test_closing_main_window_shuts_down_recordings_panel_and_aborts_worker_between_steps(self):
+        started = threading.Event()
+        release = threading.Event()
+        called_steps = []
+
+        class SlowMultiStepClient:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def get_capabilities(self):
+                called_steps.append("get_capabilities")
+                started.set()
+                release.wait(timeout=3.0)
+                return {}
+
+            def get_recording_summary(self):
+                called_steps.append("get_recording_summary")
+                return {"num_recordings": 1, "has_storage": True, "earliest_time": "", "latest_time": ""}
+
+            def find_recordings(self, max_matches=20, should_abort=None):
+                called_steps.append("find_recordings")
+                return []
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            config_dir = base / "config"
+            data_dir = base / "data"
+            config_dir.mkdir(parents=True)
+            data_dir.mkdir(parents=True)
+
+            with patch("central_nvr.core.config.get_config_dir", return_value=config_dir), \
+                    patch("central_nvr.core.config.get_data_dir", return_value=data_dir), \
+                    patch("central_nvr.core.config.is_keyring_available", return_value=False), \
+                    patch.object(playback_view, "get_data_dir", return_value=data_dir), \
+                    patch.object(playback_view, "OnvifClient", SlowMultiStepClient):
+                cfg = ConfigManager()
+                cfg.set("periodic_update_check", False)
+
+                window = MainWindow(config_mgr=cfg)
+                try:
+                    self.app.processEvents()
+                    window.recordings_panel.set_camera(_camera())
+                    window.recordings_panel._check_edge_storage()
+                    self.assertTrue(started.wait(timeout=2.0))
+
+                    # Fechar a MainWindow deve cancelar o worker filho em recordings_panel
+                    window.close()
+                    self.assertIsNone(window.recordings_panel._edge_worker)
+                    release.set()
+                    self.assertTrue(drain_retired_threads(5000))
+                    self.app.processEvents()
+                finally:
+                    release.set()
+                    window.deleteLater()
+                    QCoreApplication.sendPostedEvents(window, QEvent.Type.DeferredDelete)
+                    QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+                    self.app.processEvents()
+
+        self.assertEqual(called_steps, ["get_capabilities"])
         self.msgbox.information.assert_not_called()
         self.msgbox.warning.assert_not_called()
 

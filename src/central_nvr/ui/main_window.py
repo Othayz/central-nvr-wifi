@@ -843,4 +843,6 @@ class MainWindow(QMainWindow):
         # threads filhas desta janela são tratadas no encerramento do processo (app.main).
         self.camera_grid.stop_all()
         self.ptz_panel.shutdown()
+        if hasattr(self, "recordings_panel"):
+            self.recordings_panel.shutdown()
         super().closeEvent(event)
