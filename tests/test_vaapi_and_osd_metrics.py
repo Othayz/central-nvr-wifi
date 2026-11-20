@@ -3,24 +3,46 @@
 Testes da Issue #31: decodificação VA-API real via PyAV HWAccel (Host Delegation)
 e eliminação de métricas/estados fabricados no OSD de cada Dispositivo Cadastrado.
 """
+import errno
 import os
 import sys
+import tempfile
 import types
 import unittest
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
 
-import numpy as np
-from PySide6.QtCore import QCoreApplication, QEvent
-from PySide6.QtWidgets import QApplication
+try:
+    import numpy as np
+    HAS_NUMPY = True
+except ImportError:
+    np = None
+    HAS_NUMPY = False
 
 import central_nvr.core.stream_worker as sw
 from central_nvr.core.camera import CameraDevice, ConnectionState, StreamStats
+from central_nvr.core.config import ConfigManager
 from central_nvr.core.stream_worker import StreamOutcome, StreamWorker, VAAPI_DEVICE_PATH, VideoCodec
-from central_nvr.core.threads import drain_retired_threads
-from central_nvr.ui.camera_view import CameraViewWidget, ViewOptions
+
+try:
+    from PySide6.QtCore import QCoreApplication, QEvent
+    from PySide6.QtWidgets import QApplication
+    from central_nvr.core.threads import drain_retired_threads
+    from central_nvr.ui.camera_view import CameraViewWidget, ViewOptions
+    from central_nvr.ui.main_window import MainWindow
+    HAS_PYSIDE6 = True
+except ImportError:
+    QCoreApplication = None
+    QEvent = None
+    QApplication = None
+    drain_retired_threads = None
+    CameraViewWidget = None
+    ViewOptions = None
+    MainWindow = None
+    HAS_PYSIDE6 = False
 
 
 def _camera(manufacturer: str = "Genérico", rtsp_url: str = "") -> CameraDevice:
@@ -120,17 +142,35 @@ class BuildPyavHwaccelTest(unittest.TestCase):
             self.assertEqual(cfg.device, VAAPI_DEVICE_PATH)
             self.assertTrue(cfg.allow_software_fallback)
 
-    def test_vaapi_and_auto_fallback_to_drm_device_via_host_delegation(self):
-        for mode in ("vaapi", "auto"):
-            fake_av, _ = self._fake_av(["cuda", "drm"])
-            worker = StreamWorker(camera=_camera(), hw_accel=mode)
-            with patch.object(sw, "HAS_AV", True), patch.object(sw, "av", fake_av), \
-                    patch.object(sw, "is_vaapi_supported", return_value=True):
-                cfg = worker._build_pyav_hwaccel()
-            self.assertIsNotNone(cfg, mode)
-            self.assertEqual(cfg.device_type, "drm")
-            self.assertEqual(cfg.device, VAAPI_DEVICE_PATH)
-            self.assertTrue(cfg.allow_software_fallback)
+    def test_vaapi_does_not_fallback_to_drm_and_auto_falls_back_to_cuda(self):
+        # Sem "vaapi" em hwdevices_available(), modo vaapi não deve usar "drm" (não ativa libva x86_64)
+        fake_av_drm_only, _ = self._fake_av(["drm"])
+        worker_vaapi = StreamWorker(camera=_camera(), hw_accel="vaapi")
+        with patch.object(sw, "HAS_AV", True), patch.object(sw, "av", fake_av_drm_only), \
+                patch.object(sw, "is_vaapi_supported", return_value=True):
+            self.assertIsNone(worker_vaapi._build_pyav_hwaccel())
+
+        # Modo auto cai para "cuda" quando VA-API não está disponível no PyAV
+        fake_av_cuda, _ = self._fake_av(["drm", "cuda"])
+        worker_auto = StreamWorker(camera=_camera(), hw_accel="auto")
+        with patch.object(sw, "HAS_AV", True), patch.object(sw, "av", fake_av_cuda), \
+                patch.object(sw, "is_vaapi_supported", return_value=True):
+            cfg = worker_auto._build_pyav_hwaccel()
+        self.assertIsNotNone(cfg)
+        self.assertEqual(cfg.device_type, "cuda")
+        self.assertIsNone(cfg.device)
+        self.assertTrue(cfg.allow_software_fallback)
+
+    def test_real_pyav_hwdevices_available_integration(self):
+        if not sw.HAS_AV:
+            self.skipTest("PyAV não disponível neste ambiente")
+        worker = StreamWorker(camera=_camera(), hw_accel="auto")
+        cfg = worker._build_pyav_hwaccel()
+        hwaccel_mod = getattr(getattr(sw.av, "codec", None), "hwaccel", None)
+        if cfg is not None and hwaccel_mod is not None:
+            available = set(hwaccel_mod.hwdevices_available())
+            self.assertIn(cfg.device_type, available)
+            self.assertNotEqual(cfg.device_type, "drm")
 
     def test_vaapi_returns_none_when_dri_device_unsupported(self):
         fake_av, _ = self._fake_av(["vaapi", "drm"])
@@ -164,14 +204,18 @@ class BuildPyavHwaccelTest(unittest.TestCase):
             self.assertIsNone(worker._build_pyav_hwaccel())
 
 
+@unittest.skipUnless(HAS_NUMPY and sw.HAS_AV, "PyAV/NumPy não disponíveis neste ambiente")
 class PyavStreamHwaccelAndDecodeTest(unittest.TestCase):
-    def test_passes_hwaccel_to_av_open_and_reflects_codec_context_is_hwaccel(self):
-        sentinel_hw = object()
+    def test_passes_hwaccel_to_av_open_skips_auto_threading_and_reflects_backend(self):
+        sentinel_hw = types.SimpleNamespace(device_type="vaapi")
         open_calls = []
+        created_containers = []
 
         def fake_open(url, mode="r", options=None, timeout=5.0, hwaccel=None):
             open_calls.append(hwaccel)
-            return FakeContainer([FakePacket()], codec_name="hevc", is_hwaccel=True)
+            c = FakeContainer([FakePacket()], codec_name="hevc", is_hwaccel=True)
+            created_containers.append(c)
+            return c
 
         worker = StreamWorker(camera=_camera(), hw_accel="vaapi")
         worker._is_running = True
@@ -182,7 +226,134 @@ class PyavStreamHwaccelAndDecodeTest(unittest.TestCase):
         self.assertEqual(outcome, StreamOutcome.ENDED)
         self.assertEqual(open_calls, [sentinel_hw])
         self.assertTrue(worker.stats.hw_accel_active)
+        self.assertEqual(worker.stats.hw_accel_backend, "VA-API")
         self.assertEqual(worker.stats.codec, VideoCodec.H265_HEVC.value)
+        # Com HWAccel ativo, thread_type="AUTO" não deve ser forçado
+        self.assertNotEqual(created_containers[0].streams[0].thread_type, "AUTO")
+
+    def test_software_mode_enables_auto_thread_type(self):
+        c = FakeContainer([FakePacket()], codec_name="h264", is_hwaccel=False)
+        worker = StreamWorker(camera=_camera(), hw_accel="cpu")
+        worker._is_running = True
+        with patch.object(sw.av, "open", return_value=c):
+            outcome = worker._run_pyav_stream("rtsp://192.0.2.31:554/onvif1", transport="tcp")
+        self.assertEqual(outcome, StreamOutcome.ENDED)
+        self.assertEqual(c.streams[0].thread_type, "AUTO")
+
+    def test_real_pyav_hw_errors_fallback_while_network_and_auth_errors_do_not_retry(self):
+        sentinel_hw = types.SimpleNamespace(device_type="vaapi")
+
+        # av.error.UnknownError e av.error.OSError (EIO em /dev/dri) devem cair para software
+        hw_errors = []
+        unknown_cls = getattr(getattr(sw.av, "error", None), "UnknownError", None)
+        if isinstance(unknown_cls, type):
+            hw_errors.append(unknown_cls(1313558101, "Unknown error occurred"))
+        av_os_cls = getattr(getattr(sw.av, "error", None), "OSError", None)
+        if isinstance(av_os_cls, type):
+            hw_errors.append(av_os_cls(errno.EIO, "Input/output error"))
+
+        for exc in hw_errors:
+            calls = []
+
+            def open_with_hw_error(url, mode="r", options=None, timeout=5.0, **kwargs):
+                calls.append(kwargs.get("hwaccel"))
+                if "hwaccel" in kwargs:
+                    raise exc
+                return FakeContainer([FakePacket()], codec_name="h264", is_hwaccel=False)
+
+            worker = StreamWorker(camera=_camera(), hw_accel="vaapi")
+            worker._is_running = True
+            with patch.object(worker, "_build_pyav_hwaccel", return_value=sentinel_hw), \
+                    patch.object(sw.av, "open", side_effect=open_with_hw_error):
+                outcome = worker._run_pyav_stream("rtsp://192.0.2.31:554/onvif1", transport="tcp")
+            self.assertEqual(outcome, StreamOutcome.ENDED, repr(exc))
+            self.assertEqual(calls, [sentinel_hw, None], repr(exc))
+
+        # Erros de rede, HTTP e ValueError genérico de URL NÃO devem disparar segundo av.open
+        non_hw_errors = [
+            ConnectionRefusedError(errno.ECONNREFUSED, "Connection refused"),
+            TimeoutError("timed out"),
+        ]
+        av_val_cls = getattr(getattr(sw.av, "error", None), "ValueError", None)
+        if isinstance(av_val_cls, type):
+            non_hw_errors.append(av_val_cls(errno.EINVAL, "Invalid argument"))
+        http_404_cls = getattr(getattr(sw.av, "error", None), "HTTPNotFoundError", None)
+        if isinstance(http_404_cls, type):
+            non_hw_errors.append(http_404_cls(404, "Not Found"))
+
+        for exc in non_hw_errors:
+            calls = []
+
+            def open_with_net_error(url, mode="r", options=None, timeout=5.0, **kwargs):
+                calls.append(kwargs.get("hwaccel"))
+                raise exc
+
+            worker = StreamWorker(camera=_camera(), hw_accel="vaapi")
+            worker._is_running = True
+            with patch.object(worker, "_build_pyav_hwaccel", return_value=sentinel_hw), \
+                    patch.object(sw.av, "open", side_effect=open_with_net_error):
+                outcome = worker._run_pyav_stream("rtsp://192.0.2.31:554/onvif1", transport="tcp")
+            self.assertEqual(outcome, StreamOutcome.NOT_CONNECTED, repr(exc))
+            self.assertEqual(calls, [sentinel_hw], repr(exc))
+
+        # HTTPUnauthorizedError retorna AUTH_FAILED na primeira tentativa sem retry
+        auth_calls = []
+
+        def open_with_auth(url, mode="r", options=None, timeout=5.0, **kwargs):
+            auth_calls.append(kwargs.get("hwaccel"))
+            raise sw.av.HTTPUnauthorizedError(401, "Unauthorized")
+
+        worker_auth = StreamWorker(camera=_camera(), hw_accel="vaapi")
+        worker_auth._is_running = True
+        with patch.object(worker_auth, "_build_pyav_hwaccel", return_value=sentinel_hw), \
+                patch.object(sw.av, "open", side_effect=open_with_auth):
+            outcome = worker_auth._run_pyav_stream("rtsp://192.0.2.31:554/onvif1", transport="tcp")
+        self.assertEqual(outcome, StreamOutcome.AUTH_FAILED)
+        self.assertEqual(auth_calls, [sentinel_hw])
+
+    def test_persistent_decode_failure_on_hw_falls_back_to_software_and_limits_sw_errors(self):
+        sentinel_hw = types.SimpleNamespace(device_type="vaapi")
+        open_calls = []
+
+        def open_failing_hw_decode(url, mode="r", options=None, timeout=5.0, **kwargs):
+            hw = kwargs.get("hwaccel")
+            open_calls.append(hw)
+            if hw is not None:
+                return FakeContainer([FakePacket(fail=True) for _ in range(10)], codec_name="hevc", is_hwaccel=True)
+            return FakeContainer([FakePacket(fail=False)], codec_name="hevc", is_hwaccel=False)
+
+        worker = StreamWorker(camera=_camera(), hw_accel="vaapi")
+        worker._is_running = True
+        with patch.object(worker, "_build_pyav_hwaccel", return_value=sentinel_hw), \
+                patch.object(sw.av, "open", side_effect=open_failing_hw_decode):
+            outcome = worker._run_pyav_stream("rtsp://192.0.2.31:554/onvif1", transport="tcp")
+
+        self.assertEqual(outcome, StreamOutcome.ENDED)
+        self.assertEqual(open_calls, [sentinel_hw, None])
+        self.assertFalse(worker.stats.hw_accel_active)
+        self.assertEqual(worker.stats.dropped_frames, StreamWorker.MAX_HW_STARTUP_DECODE_ERRORS)
+
+        # Em software, excesso de erros consecutivos encerra o laço em vez de ficar preso
+        worker_sw = StreamWorker(camera=_camera(), hw_accel="cpu")
+        worker_sw._is_running = True
+        many_bad = FakeContainer([FakePacket(fail=True) for _ in range(50)], codec_name="h264")
+        with patch.object(sw.av, "open", return_value=many_bad):
+            outcome_sw = worker_sw._run_pyav_stream("rtsp://192.0.2.31:554/onvif1", transport="tcp")
+        self.assertEqual(outcome_sw, StreamOutcome.NOT_CONNECTED)
+        self.assertEqual(worker_sw.stats.dropped_frames, StreamWorker.MAX_CONSECUTIVE_DECODE_ERRORS)
+
+    def test_stats_updated_emits_copy_not_shared_worker_stats_instance(self):
+        worker = StreamWorker(camera=_camera(), hw_accel="cpu")
+        worker._is_running = True
+        worker._last_stats_calc = 0.0
+        emitted = []
+        worker.stats_updated.connect(emitted.append)
+
+        with patch.object(sw.av, "open", return_value=FakeContainer([FakePacket()], codec_name="h264")):
+            worker._run_pyav_stream("rtsp://192.0.2.31:554/onvif1", transport="tcp")
+
+        self.assertEqual(len(emitted), 1)
+        self.assertIsNot(emitted[0], worker.stats)
 
     def test_hwaccel_active_is_false_when_decoder_falls_back_to_software(self):
         sentinel_hw = object()
@@ -255,6 +426,7 @@ class PyavStreamHwaccelAndDecodeTest(unittest.TestCase):
         self.assertEqual(len(emitted_frames), 2)
 
 
+@unittest.skipUnless(HAS_NUMPY, "NumPy não disponível neste ambiente")
 class OpenCVAndDemoTruthfulnessTest(unittest.TestCase):
     def _make_fake_cv2(self, *, with_hw_props=True, hw_get_val=0, fourcc_val=0):
         frame_bgr = np.zeros((72, 128, 3), dtype=np.uint8)
@@ -324,6 +496,14 @@ class OpenCVAndDemoTruthfulnessTest(unittest.TestCase):
             worker._run_opencv_stream("rtsp://192.0.2.31:554/h264Preview_01_main", transport="tcp")
         self.assertEqual(worker.stats.codec, VideoCodec.H264.value)
 
+    def test_opencv_ignores_264_and_265_in_credentials_host_or_port(self):
+        fake_cv2, _ = self._make_fake_cv2(with_hw_props=True, hw_get_val=0, fourcc_val=0)
+        worker = StreamWorker(camera=_camera(), hw_accel="cpu")
+        worker._is_running = True
+        with patch.object(sw, "cv2", fake_cv2):
+            worker._run_opencv_stream("rtsp://admin:pass264@192.0.2.31:8265/live/ch0", transport="tcp")
+        self.assertEqual(worker.stats.codec, VideoCodec.UNKNOWN.value)
+
     def test_demo_stream_does_not_fabricate_hw_accel_or_bitrate(self):
         worker = StreamWorker(camera=_camera(rtsp_url="demo://"), hw_accel="vaapi")
         worker._is_running = True
@@ -341,6 +521,7 @@ class OpenCVAndDemoTruthfulnessTest(unittest.TestCase):
         self.assertEqual(worker._bytes_count, 0)
 
 
+@unittest.skipUnless(HAS_PYSIDE6, "PySide6 não disponível neste ambiente")
 class CameraViewOsdMetricsTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -389,6 +570,69 @@ class CameraViewOsdMetricsTest(unittest.TestCase):
 
         view._on_state_changed(ConnectionState.DISCONNECTED, "Desconectado")
         self.assertEqual(view.lbl_hw_accel.text(), "CPU")
+
+    def test_hw_accel_badge_shows_cuda_and_does_not_mutate_shared_stats(self):
+        view = self._make_view(hw_accel="cuda")
+        view._on_state_changed(ConnectionState.STREAMING, "Ao Vivo")
+
+        shared_stats = StreamStats(
+            fps=25.0,
+            bitrate_kbps=1500.0,
+            codec="H.265 / HEVC",
+            hw_accel_active=True,
+            hw_accel_backend="CUDA",
+        )
+        view._on_stats_updated(shared_stats)
+        self.assertEqual(view.lbl_hw_accel.text(), "CUDA")
+
+        # Mudança de estado altera o selo para CPU sem mutar shared_stats.hw_accel_active
+        view._on_state_changed(ConnectionState.CONNECTING, "Conectando")
+        self.assertEqual(view.lbl_hw_accel.text(), "CPU")
+        self.assertTrue(shared_stats.hw_accel_active)
+
+    def test_main_window_status_bar_reflects_real_hw_accel_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            cfg_dir = base / "config"
+            data_dir = base / "data"
+            cfg_dir.mkdir(parents=True)
+            data_dir.mkdir(parents=True)
+
+            with patch("central_nvr.core.config.get_config_dir", return_value=cfg_dir), \
+                    patch("central_nvr.core.config.get_data_dir", return_value=data_dir), \
+                    patch("central_nvr.core.config.is_keyring_available", return_value=False), \
+                    patch("central_nvr.ui.playback_view.get_data_dir", return_value=data_dir):
+                cfg = ConfigManager()
+                cfg.set("periodic_update_check", False)
+                cfg.set("hw_accel", "vaapi")
+                cfg.add_or_update_device(_camera().to_dict())
+
+                window = MainWindow(config_mgr=cfg)
+                try:
+                    self.app.processEvents()
+                    self.assertIn("Configurado", window.lbl_sb_hw.text())
+                    self.assertNotIn("(Ativo)", window.lbl_sb_hw.text())
+
+                    view = window.camera_grid.camera_views["cam-31"]
+                    view._on_state_changed(ConnectionState.STREAMING, "Ao Vivo")
+                    self.assertIn("Fallback CPU", window.lbl_sb_hw.text())
+
+                    view._on_stats_updated(
+                        StreamStats(fps=25.0, hw_accel_active=True, hw_accel_backend="VA-API")
+                    )
+                    self.assertEqual(window.lbl_sb_hw.text(), "Aceleração: VA-API (Ativo)")
+
+                    cfg.set("hw_accel", "cpu")
+                    window._update_hw_status_label()
+                    self.assertEqual(window.lbl_sb_hw.text(), "Decodificação: CPU (Software)")
+                finally:
+                    window.close()
+                    self.app.processEvents()
+                    self.assertTrue(drain_retired_threads(5000))
+                    window.deleteLater()
+                    QCoreApplication.sendPostedEvents(window, QEvent.Type.DeferredDelete)
+                    QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+                    self.app.processEvents()
 
     def test_render_metrics_omits_kbps_when_bitrate_not_measured(self):
         view = self._make_view(

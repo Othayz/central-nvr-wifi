@@ -67,6 +67,7 @@ class CameraViewWidget(QFrame):
 
     # Estado exibido ("Ao Vivo", "Sem sinal", "Pausada", "Conectando") para a árvore lateral
     display_state_changed = Signal(str, str)  # (camera_id, estado)
+    hw_accel_changed = Signal(str, str)  # (camera_id, "VA-API" / "CUDA" / "CPU")
     selected = Signal(str)  # camera_id
     double_clicked = Signal(str)  # camera_id
     ptz_requested = Signal(str)  # camera_id
@@ -578,10 +579,23 @@ class CameraViewWidget(QFrame):
             )
         self.update()
 
+    def effective_hw_accel_label(self) -> str:
+        """Retorna o rótulo real de aceleração desta câmera (CPU quando fora de STREAMING ou em software)."""
+        if self.connection_state != ConnectionState.STREAMING or not self.stats.hw_accel_active:
+            return "CPU"
+        if getattr(self.stats, "hw_accel_backend", ""):
+            return self.stats.hw_accel_backend
+        return "CUDA" if (self.hw_accel or "").lower() == "cuda" else "VA-API"
+
     def _update_hw_accel_badge(self):
         """Atualiza o selo de aceleração de hardware conforme o estado real do decodificador."""
+        label = self.effective_hw_accel_label()
+        prev = getattr(self, "_hw_accel_label", None)
+        self._hw_accel_label = label
         if hasattr(self, "lbl_hw_accel"):
-            self.lbl_hw_accel.setText("VA-API" if self.stats.hw_accel_active else "CPU")
+            self.lbl_hw_accel.setText(label)
+        if prev != label:
+            self.hw_accel_changed.emit(self.camera.id, label)
 
     def _on_stats_updated(self, stats: StreamStats):
         """Atualiza a exibição de FPS, Bitrate, Codec, aceleração de hardware e QoS no OSD."""
@@ -720,13 +734,10 @@ class CameraViewWidget(QFrame):
             self._last_frame_monotonic = time.monotonic()
             self._set_live(True)
         elif state == ConnectionState.PAUSED:
-            self.stats.hw_accel_active = False
             self._publish_display_state("Pausada")
         elif state == ConnectionState.CONNECTING and self.current_frame is None:
-            self.stats.hw_accel_active = False
             self._publish_display_state("Conectando")
         else:
-            self.stats.hw_accel_active = False
             self._set_live(False)
 
         self._update_hw_accel_badge()

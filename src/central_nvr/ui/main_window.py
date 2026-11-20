@@ -123,6 +123,7 @@ class MainWindow(QMainWindow):
         self.camera_grid.layout_mode_changed.connect(self._on_layout_mode_changed_by_grid)
         self.camera_grid.camera_renamed.connect(self._on_camera_renamed)
         self.camera_grid.camera_display_state_changed.connect(self._on_camera_display_state_changed)
+        self.camera_grid.camera_hw_accel_changed.connect(self._on_camera_hw_accel_changed)
         right_vbox.addWidget(self.camera_grid, stretch=1)
 
         self.splitter.addWidget(self.right_workspace)
@@ -376,7 +377,7 @@ class MainWindow(QMainWindow):
         """Configura a barra de status inferior."""
         status_bar = self.statusBar()
         
-        self.lbl_sb_hw = QLabel(f"Aceleração: {self.config_mgr.get('hw_accel', 'vaapi').upper()} (Ativo)")
+        self.lbl_sb_hw = QLabel(self._format_hw_accel_status())
         self.lbl_sb_hw.setStyleSheet("color: #38BDF8; font-weight: 600; padding: 0 8px;")
         status_bar.addWidget(self.lbl_sb_hw)
 
@@ -494,10 +495,37 @@ class MainWindow(QMainWindow):
         ptz_tag = " [PTZ]" if cam.has_ptz else ""
         item.setText(0, f"[{state}] {cam.name} ({cam.ip}){ptz_tag}")
 
+    def _format_hw_accel_status(self) -> str:
+        """Formata o status real de aceleração na barra inferior sem afirmar hardware ativo antes de confirmar."""
+        hw_pref = (self.config_mgr.get("hw_accel", "vaapi") or "vaapi").lower()
+        if hw_pref == "cpu":
+            return "Decodificação: CPU (Software)"
+
+        views = list(self.camera_grid.camera_views.values()) if hasattr(self, "camera_grid") else []
+        live_views = [v for v in views if v.is_live()]
+        active_backends = sorted({
+            v.effective_hw_accel_label()
+            for v in live_views
+            if v.effective_hw_accel_label() != "CPU"
+        })
+        if active_backends:
+            return f"Aceleração: {' / '.join(active_backends)} (Ativo)"
+        if live_views:
+            return f"Aceleração: {hw_pref.upper()} (Fallback CPU)"
+        return f"Aceleração: {hw_pref.upper()} (Configurado)"
+
+    def _update_hw_status_label(self):
+        if hasattr(self, "lbl_sb_hw"):
+            self.lbl_sb_hw.setText(self._format_hw_accel_status())
+
+    def _on_camera_hw_accel_changed(self, _camera_id: str, _label: str):
+        self._update_hw_status_label()
+
     def _on_camera_display_state_changed(self, camera_id: str, state: str):
         cam = next((c for c in self.cameras if c.id == camera_id), None)
         if cam:
             self._render_tree_item(cam, state)
+        self._update_hw_status_label()
 
     def _on_camera_renamed(self, camera_id: str, new_name: str):
         """Atualiza o nome da câmera em todos os componentes do sistema e salva nas configurações."""
@@ -757,7 +785,6 @@ class MainWindow(QMainWindow):
             if theme != self.current_theme:
                 self._set_theme(theme)  # aplica o QSS, atualiza o menu e registra no log
             hw_accel = self.config_mgr.get("hw_accel", "vaapi")
-            self.lbl_sb_hw.setText(f"Aceleração: {hw_accel.upper()} (Ativo)")
             self.camera_grid.hw_accel = hw_accel
             self.camera_grid.rtsp_transport = self.config_mgr.get("rtsp_transport", DEFAULT_RTSP_TRANSPORT)
             self.camera_grid.set_hidden_timeout(float(self.config_mgr.get("hidden_camera_timeout_min", 5)))
@@ -767,6 +794,7 @@ class MainWindow(QMainWindow):
                 self.recordings_panel.set_snapshot_dir(view_options.resolved_snapshot_dir())
             # Só reabre os streams cujas opções de conexão mudaram (transporte, GPU, buffer)
             self.camera_grid.set_cameras(self.cameras)
+            self._update_hw_status_label()
             self._reconfigure_periodic_update_checker()
 
 

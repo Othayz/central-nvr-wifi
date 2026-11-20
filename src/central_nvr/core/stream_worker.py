@@ -2,13 +2,17 @@
 Worker de Streaming RTSP de Baixa Latência com suporte a VA-API / Aceleração de Hardware,
 Transporte Adaptativo (Auto-Fallback UDP/TCP), Métricas de QoS (Jitter/Perda) e Detecção de Movimento Integrada.
 """
+from dataclasses import replace
 from enum import Enum
+import errno
 import logging
 import math
 import os
 import random
+import re
 import threading
 import time
+import urllib.parse
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 # Tentar importar numpy
@@ -443,8 +447,45 @@ class StreamWorker(QThread):
             return TransportMode.AUTO_UDP.value if transport == "udp" else TransportMode.AUTO_TCP_FALLBACK.value
         return TransportMode.UDP.value if transport == "udp" else TransportMode.TCP.value
 
+    MAX_HW_STARTUP_DECODE_ERRORS = 3
+    MAX_CONSECUTIVE_DECODE_ERRORS = 15
+
+    _NETWORK_ERRNOS = frozenset(
+        getattr(errno, name)
+        for name in (
+            "ECONNREFUSED",
+            "ECONNRESET",
+            "ECONNABORTED",
+            "ETIMEDOUT",
+            "ENETUNREACH",
+            "EHOSTUNREACH",
+            "EHOSTDOWN",
+            "EPIPE",
+            "ENETDOWN",
+        )
+        if hasattr(errno, name)
+    )
+
+    @staticmethod
+    def _hwaccel_label(hwaccel_cfg: Any) -> str:
+        """Retorna o rótulo de exibição correspondente ao HWAccel configurado."""
+        if hwaccel_cfg is None:
+            return ""
+        dev_type = str(
+            getattr(hwaccel_cfg, "device_type", None)
+            or getattr(hwaccel_cfg, "name", "")
+            or ""
+        ).lower()
+        if dev_type == "vaapi":
+            return "VA-API"
+        if dev_type == "cuda":
+            return "CUDA"
+        if dev_type:
+            return dev_type.upper()
+        return ""
+
     def _build_pyav_hwaccel(self):
-        """Constrói a configuração HWAccel do PyAV via Host Delegation quando disponível."""
+        """Constrói a configuração HWAccel do PyAV quando o backend real de GPU está disponível."""
         hw_mode = (self.hw_accel or "").lower()
         if hw_mode == "cpu" or not HAS_AV:
             return None
@@ -464,16 +505,11 @@ class StreamWorker(QThread):
             return None
 
         try:
-            if hw_mode in ("vaapi", "auto") and is_vaapi_supported():
-                if "vaapi" in available:
-                    return hwaccel_mod.HWAccel(
-                        "vaapi", device=VAAPI_DEVICE_PATH, allow_software_fallback=True
-                    )
-                if "drm" in available:
-                    return hwaccel_mod.HWAccel(
-                        "drm", device=VAAPI_DEVICE_PATH, allow_software_fallback=True
-                    )
-            if hw_mode == "cuda" and "cuda" in available:
+            if hw_mode in ("vaapi", "auto") and is_vaapi_supported() and "vaapi" in available:
+                return hwaccel_mod.HWAccel(
+                    "vaapi", device=VAAPI_DEVICE_PATH, allow_software_fallback=True
+                )
+            if hw_mode in ("cuda", "auto") and "cuda" in available:
                 return hwaccel_mod.HWAccel("cuda", allow_software_fallback=True)
         except Exception as e:
             logger.debug(f"Falha ao criar configuração HWAccel ({hw_mode}): {e}")
@@ -481,30 +517,63 @@ class StreamWorker(QThread):
 
         return None
 
-    @staticmethod
-    def _is_hw_init_error(exc: Exception) -> bool:
+    @classmethod
+    def _is_hw_init_error(cls, exc: Exception) -> bool:
         """Indica se a exceção de av.open corresponde a incompatibilidade/erro de inicialização de hardware."""
-        if isinstance(exc, (TypeError, ValueError, RuntimeError, NotImplementedError)):
-            return True
-        if isinstance(exc, OSError):
+        if isinstance(exc, (ConnectionError, TimeoutError, EOFError)):
             return False
+
         av_error = getattr(av, "error", None) if HAS_AV else None
         if av_error is not None:
-            http_types = tuple(
+            non_hw_types = tuple(
                 t for t in (
                     getattr(av_error, "HTTPError", None),
                     getattr(av_error, "HTTPClientError", None),
+                    getattr(av_error, "HTTPServerError", None),
+                    getattr(av_error, "HTTPUnauthorizedError", None),
+                    getattr(av_error, "HTTPForbiddenError", None),
+                    getattr(av_error, "HTTPNotFoundError", None),
+                    getattr(av_error, "HTTPBadRequestError", None),
+                    getattr(av_error, "HTTPTooManyRequestsError", None),
+                    getattr(av_error, "EOFError", None),
+                    getattr(av_error, "ExitError", None),
+                    getattr(av_error, "ImmediateExitError", None),
+                    getattr(av_error, "ProtocolNotFoundError", None),
+                    getattr(av_error, "InvalidDataError", None),
                 )
                 if isinstance(t, type)
             )
-            if http_types and isinstance(exc, http_types):
+            if non_hw_types and isinstance(exc, non_hw_types):
                 return False
+
+            unknown_err_cls = getattr(av_error, "UnknownError", None)
+            if isinstance(unknown_err_cls, type) and isinstance(exc, unknown_err_cls):
+                return True
+
+        if isinstance(exc, (TypeError, RuntimeError, NotImplementedError)):
+            return True
+
         msg = str(exc).lower()
-        return any(tok in msg for tok in ("hwaccel", "hwdevice", "vaapi", "drm", "cuda", "nvdec", "device"))
+        hw_tokens = ("hwaccel", "hwdevice", "vaapi", "drm", "cuda", "nvdec", "device", "/dev/dri", "hardware")
+        net_tokens = ("rtsp", "connection", "timed out", "timeout", "unreachable", "offline", "refused", "name or service")
+
+        if isinstance(exc, OSError):
+            err_no = getattr(exc, "errno", None)
+            if err_no in cls._NETWORK_ERRNOS or any(tok in msg for tok in net_tokens):
+                return False
+            av_os_err = getattr(av_error, "OSError", None) if av_error is not None else None
+            if isinstance(av_os_err, type) and isinstance(exc, av_os_err):
+                return True
+            return any(tok in msg for tok in hw_tokens) or isinstance(exc, PermissionError)
+
+        if isinstance(exc, ValueError):
+            return any(tok in msg for tok in hw_tokens)
+
+        return any(tok in msg for tok in hw_tokens)
 
     @staticmethod
     def _detect_opencv_codec(cap, stream_url: str) -> str:
-        """Detecta o codec apenas quando informado por CAP_PROP_FOURCC ou explicitamente na URL."""
+        """Detecta o codec apenas quando informado por CAP_PROP_FOURCC ou explicitamente no path/query da URL."""
         fourcc_str = ""
         fourcc_prop = getattr(cv2, "CAP_PROP_FOURCC", None)
         if fourcc_prop is not None:
@@ -526,12 +595,17 @@ class StreamWorker(QThread):
             if "MJPG" in fourcc_str or "JPEG" in fourcc_str:
                 return VideoCodec.MJPEG.value
 
-        url_lower = (stream_url or "").lower()
-        if "hevc" in url_lower or "265" in url_lower:
+        try:
+            parsed = urllib.parse.urlparse(stream_url or "")
+            path_query = f"{parsed.path}?{parsed.query}".lower()
+        except ValueError:
+            path_query = ""
+
+        if re.search(r"hevc|h\.?265", path_query):
             return VideoCodec.H265_HEVC.value
-        if "h264" in url_lower or "264" in url_lower:
+        if re.search(r"h\.?264|avc", path_query):
             return VideoCodec.H264.value
-        if "mjpeg" in url_lower or "mjpg" in url_lower:
+        if re.search(r"mjpeg|mjpg", path_query):
             return VideoCodec.MJPEG.value
 
         return VideoCodec.UNKNOWN.value
@@ -549,115 +623,149 @@ class StreamWorker(QThread):
         }
 
         hwaccel_cfg = self._build_pyav_hwaccel()
-        container = None
+        attempts = [hwaccel_cfg, None] if hwaccel_cfg is not None else [None]
         frames_seen = 0
-        try:
+
+        for active_hw in attempts:
+            if not self._keep_reading():
+                return StreamOutcome.STOPPED
+
+            container = None
+            retry_in_software = False
             try:
-                if hwaccel_cfg is not None:
-                    try:
-                        container = av.open(
-                            stream_url,
-                            mode="r",
-                            options=container_options,
-                            timeout=5.0,
-                            hwaccel=hwaccel_cfg,
-                        )
-                    except av.HTTPUnauthorizedError:
-                        return StreamOutcome.AUTH_FAILED
-                    except Exception as hw_err:
-                        if not self._is_hw_init_error(hw_err):
-                            raise
-                        logger.debug(
-                            f"Fallback para decodificação em software (CPU) em {self.camera.name}: {hw_err}"
-                        )
-                        hwaccel_cfg = None
-                        if not self._keep_reading():
-                            return StreamOutcome.STOPPED
-                        container = av.open(stream_url, mode="r", options=container_options, timeout=5.0)
-                else:
-                    container = av.open(stream_url, mode="r", options=container_options, timeout=5.0)
-            except av.HTTPUnauthorizedError:
-                return StreamOutcome.AUTH_FAILED
-            video_stream = next((s for s in container.streams if s.type == "video"), None)
-            if not video_stream:
-                return StreamOutcome.NOT_CONNECTED
-
-            try:
-                video_stream.thread_type = "AUTO"
-            except Exception:
-                pass
-            raw_codec = video_stream.codec_context.name.upper()
-            if "HEVC" in raw_codec or "265" in raw_codec:
-                self.stats.codec = VideoCodec.H265_HEVC.value
-            elif "264" in raw_codec or "AVC" in raw_codec:
-                self.stats.codec = VideoCodec.H264.value
-            elif "MJPEG" in raw_codec or "JPEG" in raw_codec:
-                self.stats.codec = VideoCodec.MJPEG.value
-            else:
-                self.stats.codec = raw_codec or VideoCodec.UNKNOWN.value
-
-            self.stats.hw_accel_active = bool(
-                hwaccel_cfg is not None and getattr(video_stream.codec_context, "is_hwaccel", False)
-            )
-            self._announce_streaming(f"Ao Vivo ({self.stats.codec} {self.stats.transport_mode})")
-
-            self._last_frame_ts = time.time()
-
-            for packet in container.demux(video_stream):
-                if not self._keep_reading():
-                    break
-
-                self._update_pause_state()
-                if self._is_paused:
-                    # Continua lendo para manter a sessão RTSP viva, mas sem decodificar
-                    self._await_keyframe = True
-                    continue
-                if self._await_keyframe:
-                    if not getattr(packet, "is_keyframe", True):
-                        continue
-                    self._await_keyframe = False
-
-                self._bytes_count += packet.size or 0
-
                 try:
-                    decoded_frames = list(packet.decode())
-                except Exception as decode_err:
-                    self.stats.dropped_frames += 1
-                    logger.debug(f"Pacote corrompido descartado em {self.camera.name}: {decode_err}")
-                    continue
+                    if active_hw is not None:
+                        try:
+                            container = av.open(
+                                stream_url,
+                                mode="r",
+                                options=container_options,
+                                timeout=5.0,
+                                hwaccel=active_hw,
+                            )
+                        except av.HTTPUnauthorizedError:
+                            return StreamOutcome.AUTH_FAILED
+                        except Exception as hw_err:
+                            if not self._is_hw_init_error(hw_err):
+                                raise
+                            logger.debug(
+                                f"Fallback para decodificação em software (CPU) em {self.camera.name}: {hw_err}"
+                            )
+                            retry_in_software = True
+                            continue
+                    else:
+                        container = av.open(stream_url, mode="r", options=container_options, timeout=5.0)
+                except av.HTTPUnauthorizedError:
+                    return StreamOutcome.AUTH_FAILED
 
-                self.stats.hw_accel_active = bool(
-                    hwaccel_cfg is not None and getattr(video_stream.codec_context, "is_hwaccel", False)
-                )
+                video_stream = next((s for s in container.streams if s.type == "video"), None)
+                if not video_stream:
+                    return StreamOutcome.NOT_CONNECTED
 
-                for frame in decoded_frames:
+                if active_hw is None:
+                    try:
+                        video_stream.thread_type = "AUTO"
+                    except Exception:
+                        pass
+
+                raw_codec = video_stream.codec_context.name.upper()
+                if "HEVC" in raw_codec or "265" in raw_codec:
+                    self.stats.codec = VideoCodec.H265_HEVC.value
+                elif "264" in raw_codec or "AVC" in raw_codec:
+                    self.stats.codec = VideoCodec.H264.value
+                elif "MJPEG" in raw_codec or "JPEG" in raw_codec:
+                    self.stats.codec = VideoCodec.MJPEG.value
+                else:
+                    self.stats.codec = raw_codec or VideoCodec.UNKNOWN.value
+
+                is_hw = bool(active_hw is not None and getattr(video_stream.codec_context, "is_hwaccel", False))
+                self.stats.hw_accel_active = is_hw
+                self.stats.hw_accel_backend = self._hwaccel_label(active_hw) if is_hw else ""
+                self._announce_streaming(f"Ao Vivo ({self.stats.codec} {self.stats.transport_mode})")
+
+                self._last_frame_ts = time.time()
+                consecutive_decode_errors = 0
+
+                for packet in container.demux(video_stream):
                     if not self._keep_reading():
                         break
 
-                    now = time.time()
-                    delta_ms = max(0.0, (now - self._last_frame_ts) * 1000.0)
-                    self._last_frame_ts = now
+                    self._update_pause_state()
+                    if self._is_paused:
+                        # Continua lendo para manter a sessão RTSP viva, mas sem decodificar
+                        self._await_keyframe = True
+                        continue
+                    if self._await_keyframe:
+                        if not getattr(packet, "is_keyframe", True):
+                            continue
+                        self._await_keyframe = False
 
-                    # Converter frame para RGB
-                    img_rgb = frame.to_ndarray(format="rgb24")
-                    h, w, ch = img_rgb.shape
-                    self.stats.width = w
-                    self.stats.height = h
+                    self._bytes_count += packet.size or 0
 
-                    self._process_and_emit_frame(img_rgb, w, h, delta_ms)
-                    frames_seen += 1
-                    self._connected_once = True
+                    try:
+                        decoded_frames = list(packet.decode())
+                    except Exception as decode_err:
+                        self.stats.dropped_frames += 1
+                        consecutive_decode_errors += 1
+                        logger.debug(f"Pacote corrompido descartado em {self.camera.name}: {decode_err}")
+                        if (
+                            active_hw is not None
+                            and frames_seen == 0
+                            and consecutive_decode_errors >= self.MAX_HW_STARTUP_DECODE_ERRORS
+                        ):
+                            logger.debug(
+                                f"Falha persistente na decodificação por hardware em {self.camera.name}; "
+                                "alternando para software (CPU)."
+                            )
+                            retry_in_software = True
+                            break
+                        if consecutive_decode_errors >= self.MAX_CONSECUTIVE_DECODE_ERRORS:
+                            logger.warning(
+                                f"Excesso de erros consecutivos de decodificação ({consecutive_decode_errors}) "
+                                f"em {self.camera.name}; reiniciando stream."
+                            )
+                            break
+                        continue
 
-            return self._end_outcome(frames_seen)
-        except Exception as e:
-            logger.debug(f"PyAV stream error for {self.camera.name} via {transport}: {e}")
-            return self._end_outcome(frames_seen)
-        finally:
-            if container is not None:
-                try:
-                    container.close()
-                except Exception:
-                    pass
+                    if decoded_frames:
+                        consecutive_decode_errors = 0
+
+                    is_hw = bool(active_hw is not None and getattr(video_stream.codec_context, "is_hwaccel", False))
+                    self.stats.hw_accel_active = is_hw
+                    self.stats.hw_accel_backend = self._hwaccel_label(active_hw) if is_hw else ""
+
+                    for frame in decoded_frames:
+                        if not self._keep_reading():
+                            break
+
+                        now = time.time()
+                        delta_ms = max(0.0, (now - self._last_frame_ts) * 1000.0)
+                        self._last_frame_ts = now
+
+                        # Converter frame para RGB
+                        img_rgb = frame.to_ndarray(format="rgb24")
+                        h, w, ch = img_rgb.shape
+                        self.stats.width = w
+                        self.stats.height = h
+
+                        self._process_and_emit_frame(img_rgb, w, h, delta_ms)
+                        frames_seen += 1
+                        self._connected_once = True
+
+                if retry_in_software:
+                    continue
+                return self._end_outcome(frames_seen)
+            except Exception as e:
+                logger.debug(f"PyAV stream error for {self.camera.name} via {transport}: {e}")
+                return self._end_outcome(frames_seen)
+            finally:
+                if container is not None:
+                    try:
+                        container.close()
+                    except Exception:
+                        pass
+
+        return self._end_outcome(frames_seen)
 
     def _run_opencv_stream(self, stream_url: str, transport: str = "udp") -> StreamOutcome:
         """Consome o fluxo utilizando OpenCV VideoCapture como fallback resiliente."""
@@ -694,12 +802,13 @@ class StreamWorker(QThread):
                 return StreamOutcome.NOT_CONNECTED
 
             self.stats.hw_accel_active = False
+            self.stats.hw_accel_backend = ""
             if hasattr(cv2, "CAP_PROP_HW_ACCELERATION") and hasattr(cv2, "VIDEO_ACCELERATION_VAAPI"):
                 if (self.hw_accel or "").lower() in ("vaapi", "auto") and is_vaapi_supported():
                     cap.set(cv2.CAP_PROP_HW_ACCELERATION, cv2.VIDEO_ACCELERATION_VAAPI)
-                    self.stats.hw_accel_active = (
-                        cap.get(cv2.CAP_PROP_HW_ACCELERATION) == cv2.VIDEO_ACCELERATION_VAAPI
-                    )
+                    if cap.get(cv2.CAP_PROP_HW_ACCELERATION) == cv2.VIDEO_ACCELERATION_VAAPI:
+                        self.stats.hw_accel_active = True
+                        self.stats.hw_accel_backend = "VA-API"
 
             self.stats.codec = self._detect_opencv_codec(cap, stream_url)
             self._bytes_count = 0
@@ -757,6 +866,7 @@ class StreamWorker(QThread):
         self.stats.codec = "H.264 (Simulado)"
         self.stats.transport_mode = "TCP (Local)"
         self.stats.hw_accel_active = False
+        self.stats.hw_accel_backend = ""
         self._bytes_count = 0
         self.stats.bitrate_kbps = 0.0
         w, h = 640, 360
@@ -866,7 +976,8 @@ class StreamWorker(QThread):
             self.stats.frames_received += self._frame_count
             self.stats.motion_detected = self._motion_active
 
-            self.stats_updated.emit(self.stats)
+            # Emite snapshot imutável/cópia para evitar corrida com a thread da UI
+            self.stats_updated.emit(replace(self.stats))
 
             self._frame_count = 0
             self._bytes_count = 0
