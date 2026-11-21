@@ -67,6 +67,7 @@ class CameraViewWidget(QFrame):
 
     # Estado exibido ("Ao Vivo", "Sem sinal", "Pausada", "Conectando") para a árvore lateral
     display_state_changed = Signal(str, str)  # (camera_id, estado)
+    hw_accel_changed = Signal(str, str)  # (camera_id, "VA-API" / "CUDA" / "CPU")
     selected = Signal(str)  # camera_id
     double_clicked = Signal(str)  # camera_id
     ptz_requested = Signal(str)  # camera_id
@@ -177,7 +178,7 @@ class CameraViewWidget(QFrame):
         self.lbl_motion.hide()
         top_bar.addWidget(self.lbl_motion)
 
-        self.lbl_hw_accel = QLabel("VA-API" if self.hw_accel == "vaapi" else "CPU")
+        self.lbl_hw_accel = QLabel("CPU")
         self.lbl_hw_accel.setStyleSheet("color: #38BDF8; background-color: rgba(15, 23, 42, 0.85); padding: 3px 6px; border-radius: 4px; font-size: 10px; font-weight: bold;")
         top_bar.addWidget(self.lbl_hw_accel)
 
@@ -191,8 +192,9 @@ class CameraViewWidget(QFrame):
         # Bottom Bar do OSD
         bottom_bar = QHBoxLayout()
 
-        self.lbl_metrics = QLabel("0.0 FPS | 0 kbps | 0 ms")
+        self.lbl_metrics = QLabel("")
         self.lbl_metrics.setStyleSheet("color: #94A3B8; background-color: rgba(15, 23, 42, 0.85); padding: 3px 8px; border-radius: 4px; font-size: 10px; font-family: monospace;")
+        self._render_metrics()
         bottom_bar.addWidget(self.lbl_metrics)
 
         # Aviso temporário (ex.: sub-stream indisponível)
@@ -568,6 +570,7 @@ class CameraViewWidget(QFrame):
         if self._stalled:
             self._stalled = False
             self._set_live(True)
+            self._update_hw_accel_badge()
         if hasattr(self, "_fullscreen_win") and self._fullscreen_win and self._fullscreen_win.isVisible():
             self._fullscreen_win.set_frame(
                 q_img,
@@ -577,9 +580,28 @@ class CameraViewWidget(QFrame):
             )
         self.update()
 
+    def effective_hw_accel_label(self) -> str:
+        """Retorna o rótulo real de aceleração desta câmera (CPU quando fora de ao vivo ou em software)."""
+        if not self.is_live() or not self.stats.hw_accel_active:
+            return "CPU"
+        if getattr(self.stats, "hw_accel_backend", ""):
+            return self.stats.hw_accel_backend
+        return "CUDA" if (self.hw_accel or "").lower() == "cuda" else "VA-API"
+
+    def _update_hw_accel_badge(self):
+        """Atualiza o selo de aceleração de hardware conforme o estado real do decodificador."""
+        label = self.effective_hw_accel_label()
+        prev = getattr(self, "_hw_accel_label", None)
+        self._hw_accel_label = label
+        if hasattr(self, "lbl_hw_accel"):
+            self.lbl_hw_accel.setText(label)
+        if prev != label:
+            self.hw_accel_changed.emit(self.camera.id, label)
+
     def _on_stats_updated(self, stats: StreamStats):
-        """Atualiza a exibição de FPS, Bitrate, Codec e QoS no OSD."""
+        """Atualiza a exibição de FPS, Bitrate, Codec, aceleração de hardware e QoS no OSD."""
         self.stats = stats
+        self._update_hw_accel_badge()
         self._render_metrics()
 
     def _render_metrics(self):
@@ -590,7 +612,7 @@ class CameraViewWidget(QFrame):
             parts.append(datetime.datetime.now().strftime("%H:%M:%S"))
         if self.options.show_osd_fps:
             parts.append(f"{stats.fps} FPS")
-        if self.options.show_osd_bitrate:
+        if self.options.show_osd_bitrate and stats.bitrate_kbps > 0:
             parts.append(f"{int(stats.bitrate_kbps)} kbps")
         parts.append(stats.codec if stats.codec else "H.264")
         if stats.jitter_ms > 0:
@@ -703,6 +725,7 @@ class CameraViewWidget(QFrame):
             self.lbl_status.setText("SEM SINAL")
             self.lbl_status.setStyleSheet("color: #F87171; background-color: rgba(153, 27, 27, 0.9); padding: 3px 6px; border-radius: 4px; font-size: 10px; font-weight: bold;")
             self._set_live(False)
+            self._update_hw_accel_badge()
 
     def _on_state_changed(self, state: ConnectionState, message: str):
         """Atualiza a indicação visual de conexão."""
@@ -718,6 +741,8 @@ class CameraViewWidget(QFrame):
             self._publish_display_state("Conectando")
         else:
             self._set_live(False)
+
+        self._update_hw_accel_badge()
 
         if state == ConnectionState.STREAMING:
             self.lbl_status.setText("AO VIVO")

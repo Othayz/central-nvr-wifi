@@ -8,8 +8,9 @@
   <description>
     <p>
       Central NVR WiFi é uma solução completa para visualização e monitoramento de câmeras de segurança IP
-      em redes locais e Wi-Fi. O aplicativo oferece streaming de vídeo de baixa latência via RTSP com aceleração
-      de hardware (VA-API), descoberta automática de dispositivos compatíveis com ONVIF, controle motorizado PTZ
+      em redes locais e Wi-Fi. O aplicativo oferece streaming de vídeo RTSP de baixa latência com suporte a
+      aceleração de hardware (VA-API/CUDA quando disponível no ambiente, com fallback automático para CPU),
+      descoberta automática de dispositivos compatíveis com ONVIF, controle motorizado PTZ
       (Pan-Tilt-Zoom), detecção de movimento e gerenciamento de gravações.
     </p>
     <p>Funcionalidades principais:</p>

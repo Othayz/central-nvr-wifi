@@ -32,6 +32,7 @@ class StreamStats:
     height: int = 0
     codec: str = "H.264"
     hw_accel_active: bool = False
+    hw_accel_backend: str = ""
     frames_received: int = 0
     dropped_frames: int = 0
     transport_mode: str = "TCP"

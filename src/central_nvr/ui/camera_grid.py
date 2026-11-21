@@ -115,6 +115,7 @@ class CameraGridWidget(QWidget):
     layout_mode_changed = Signal(str)  # "auto", "1x1", "2x2", "3x3"
     camera_renamed = Signal(str, str)  # (camera_id, new_name)
     camera_display_state_changed = Signal(str, str)  # (camera_id, "Ao Vivo" / "Sem sinal" / ...)
+    camera_hw_accel_changed = Signal(str, str)  # (camera_id, "VA-API" / "CUDA" / "CPU")
 
     def __init__(
         self,
@@ -235,6 +236,7 @@ class CameraGridWidget(QWidget):
         view.snapshot_taken.connect(self.snapshot_taken.emit)
         view.rename_requested.connect(self.camera_renamed.emit)
         view.display_state_changed.connect(self.camera_display_state_changed.emit)
+        view.hw_accel_changed.connect(self.camera_hw_accel_changed.emit)
         return view
 
     def display_state_of(self, camera_id: str) -> str:
@@ -250,6 +252,7 @@ class CameraGridWidget(QWidget):
             view.snapshot_taken,
             view.rename_requested,
             view.display_state_changed,
+            view.hw_accel_changed,
         ):
             try:
                 view_signal.disconnect()
