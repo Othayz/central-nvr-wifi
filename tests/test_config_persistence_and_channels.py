@@ -466,10 +466,9 @@ class ConfigWriteErrorsAndMainWindowTest(unittest.TestCase):
         cfg.set("periodic_update_check", False)
         window = MainWindow(config_mgr=cfg)
         self.app.processEvents()
+        dlg = None
         try:
             dlg = DiscoveryDialog(parent=window, on_device_added=window._add_discovered_camera)
-            self.addCleanup(dlg.deleteLater)
-            self.addCleanup(dlg.close)
 
             dlg.txt_man_ip.setText("192.0.2.50")
             dlg.spin_man_port.setValue(80)
@@ -511,6 +510,9 @@ class ConfigWriteErrorsAndMainWindowTest(unittest.TestCase):
             log_entries = [window.list_logs.item(i).text() for i in range(window.list_logs.count())]
             self.assertTrue(any("somente leitura" in entry for entry in log_entries))
         finally:
+            if dlg is not None:
+                dlg.close()
+                dlg.deleteLater()
             window.close()
             self.app.processEvents()
             drained = drain_retired_threads(5000)
@@ -533,6 +535,7 @@ class ConfigWriteErrorsAndMainWindowTest(unittest.TestCase):
         })
         window = MainWindow(config_mgr=cfg)
         self.app.processEvents()
+        sdlg = None
         try:
             with patch.object(cfg_mod, "_secure_write_json", side_effect=PermissionError("disco travado")), \
                     patch("central_nvr.ui.main_window.QMessageBox.critical") as critical_mock:
@@ -549,7 +552,6 @@ class ConfigWriteErrorsAndMainWindowTest(unittest.TestCase):
             self.assertEqual(len(window.cameras), 1)
 
             sdlg = SettingsDialog(config_mgr=cfg, parent=window)
-            self.addCleanup(sdlg.deleteLater)
             with patch.object(cfg_mod, "_secure_write_json", side_effect=PermissionError("disco travado")), \
                     patch("central_nvr.ui.settings_dialog.QMessageBox.critical") as critical_mock, \
                     patch("central_nvr.ui.settings_dialog.QMessageBox.information") as info_mock, \
@@ -559,6 +561,9 @@ class ConfigWriteErrorsAndMainWindowTest(unittest.TestCase):
             info_mock.assert_not_called()
             accept_mock.assert_not_called()
         finally:
+            if sdlg is not None:
+                sdlg.close()
+                sdlg.deleteLater()
             window.close()
             self.app.processEvents()
             drained = drain_retired_threads(5000)
