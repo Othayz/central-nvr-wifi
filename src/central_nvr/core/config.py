@@ -276,6 +276,7 @@ class ConfigManager:
         self.settings: Dict[str, Any] = self.DEFAULT_SETTINGS.copy()
         self.settings["snapshot_dir"] = str(data_dir / "snapshots")
         self.settings["recordings_dir"] = str(data_dir / "recordings")
+        self._overrides: Dict[str, Any] = {}
         self.devices: List[Dict[str, Any]] = []
         self._keyring_synced: Dict[str, str] = {}
         self.last_write_error: Optional[str] = None
@@ -403,12 +404,34 @@ class ConfigManager:
         """Salva a lista de câmeras/dispositivos cadastrados sanitizando senhas se keyring ativo (SEC-01)."""
         return self._persist_devices(self.devices)
 
-    def get(self, key: str, default: Any = None) -> Any:
+    def set_override(self, key: str, value: Any) -> None:
+        """Define um override apenas em memória para a sessão atual, sem alterar settings.json."""
+        self._overrides[key] = value
+
+    def clear_override(self, key: str) -> None:
+        """Remove o override em memória de uma chave, se houver."""
+        self._overrides.pop(key, None)
+
+    def has_override(self, key: str) -> bool:
+        """Retorna True se a chave tiver um override em memória ativo nesta sessão."""
+        return key in self._overrides
+
+    def get_override(self, key: str, default: Any = None) -> Any:
+        """Retorna o valor do override em memória para a chave, ou default se ausente."""
+        return self._overrides.get(key, default)
+
+    def get_persisted(self, key: str, default: Any = None) -> Any:
+        """Retorna o valor persistido (ou padrão), ignorando overrides efêmeros da sessão."""
         if key == "github_token":
             kr_pat = get_keyring_pat()
             if kr_pat:
                 return kr_pat
         return self.settings.get(key, default)
+
+    def get(self, key: str, default: Any = None) -> Any:
+        if key in self._overrides:
+            return self._overrides[key]
+        return self.get_persisted(key, default)
 
     def _store(self, key: str, value: Any):
         """Grava em memória; o token do GitHub vai para o keyring quando disponível."""

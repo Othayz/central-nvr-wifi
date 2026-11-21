@@ -2,13 +2,14 @@
 Painel Integrado de Gravações, Snapshots e Histórico de Eventos com suporte a temas.
 """
 import datetime
+import inspect
 import logging
 import os
 import subprocess
 from pathlib import Path
 from typing import Optional, Union
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QObject, Qt, QThread, Signal
 from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
@@ -24,9 +25,63 @@ from PySide6.QtWidgets import (
 
 from central_nvr.core.camera import CameraDevice
 from central_nvr.core.config import get_data_dir
+from central_nvr.core.onvif_client import OnvifClient
+from central_nvr.core.threads import retire_thread
 from central_nvr.ui.timeline_bar import TimelineBarWidget
 
 logger = logging.getLogger(__name__)
+
+_BTN_SYNC_SD_LABEL = "💾 Cartão SD (Profile G)"
+
+
+class EdgeStorageWorker(QThread):
+    """Consulta gravações locais (ONVIF Profile G) do Dispositivo Cadastrado fora da thread da UI."""
+
+    query_finished = Signal(object, object, str)  # (summary, recordings, error_message)
+
+    def __init__(self, camera: CameraDevice, parent: Optional[QObject] = None):
+        super().__init__(parent)
+        self._ip = camera.ip
+        self._port = camera.port
+        self._username = camera.username
+        self._password = camera.password
+        self.camera_name = camera.name
+
+    def run(self):
+        if self.isInterruptionRequested():
+            return
+        try:
+            client = OnvifClient(
+                ip=self._ip,
+                port=self._port,
+                username=self._username,
+                password=self._password,
+                timeout=3.0,
+            )
+            client.get_capabilities()
+            if self.isInterruptionRequested():
+                return
+            summary = client.get_recording_summary()
+            if self.isInterruptionRequested():
+                return
+
+            find_kwargs = {"max_matches": 10}
+            try:
+                sig = inspect.signature(client.find_recordings)
+                if "should_abort" in sig.parameters or any(
+                    p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+                ):
+                    find_kwargs["should_abort"] = self.isInterruptionRequested
+            except (TypeError, ValueError):
+                pass
+
+            recs = client.find_recordings(**find_kwargs)
+            if self.isInterruptionRequested():
+                return
+            self.query_finished.emit(summary, recs, "")
+        except Exception as e:
+            if not self.isInterruptionRequested():
+                self.query_finished.emit(None, None, str(e))
 
 
 class PlaybackWidget(QWidget):
@@ -46,6 +101,7 @@ class PlaybackWidget(QWidget):
         self._snapshot_dir: Optional[Path] = (
             Path(snapshot_dir).expanduser() if snapshot_dir else None
         )
+        self._edge_worker: Optional[EdgeStorageWorker] = None
         self._setup_ui()
 
     def _setup_ui(self):
@@ -104,12 +160,12 @@ class PlaybackWidget(QWidget):
         btn_open_folder.clicked.connect(self._open_media_folder)
         ctrl_layout.addWidget(btn_open_folder)
 
-        btn_sync_sd = QPushButton("💾 Cartão SD (Profile G)")
-        btn_sync_sd.setProperty("class", "card-action-btn")
-        btn_sync_sd.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn_sync_sd.setToolTip("Consultar gravações mantidas no armazenamento local (Cartão SD) da câmera")
-        btn_sync_sd.clicked.connect(self._check_edge_storage)
-        ctrl_layout.addWidget(btn_sync_sd)
+        self.btn_sync_sd = QPushButton(_BTN_SYNC_SD_LABEL)
+        self.btn_sync_sd.setProperty("class", "card-action-btn")
+        self.btn_sync_sd.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_sync_sd.setToolTip("Consultar gravações mantidas no armazenamento local (Cartão SD) da câmera")
+        self.btn_sync_sd.clicked.connect(self._check_edge_storage)
+        ctrl_layout.addWidget(self.btn_sync_sd)
 
         layout.addLayout(ctrl_layout)
 
@@ -141,6 +197,11 @@ class PlaybackWidget(QWidget):
 
     def set_camera(self, camera: Optional[CameraDevice]):
         """Atualiza a câmera selecionada no painel de gravações."""
+        prev_id = self.camera.id if self.camera is not None else None
+        new_id = camera.id if camera is not None else None
+        if prev_id != new_id:
+            self._cancel_edge_storage()
+
         self.camera = camera
         if camera:
             self.lbl_cam_name.setText(f"{camera.name} ({camera.ip})")
@@ -225,41 +286,89 @@ class PlaybackWidget(QWidget):
         self.playback_requested.emit(cam_name, time_str)
 
     def _check_edge_storage(self):
-        """Consulta o serviço ONVIF Profile G da câmera para listar gravações locais no cartão SD."""
+        """Consulta de forma assíncrona o serviço ONVIF Profile G do Dispositivo Cadastrado."""
         if not self.camera:
             QMessageBox.information(self, "Edge Storage", "Selecione uma câmera para consultar gravações no cartão SD.")
             return
+        if self._edge_worker is not None:
+            return
 
-        from central_nvr.core.onvif_client import OnvifClient
-        try:
-            client = OnvifClient(
-                ip=self.camera.ip,
-                port=self.camera.port,
-                username=self.camera.username,
-                password=self.camera.password,
-                timeout=3.0,
+        self.btn_sync_sd.setEnabled(False)
+        self.btn_sync_sd.setText("Consultando SD...")
+
+        worker = EdgeStorageWorker(self.camera, parent=self)
+        self._edge_worker = worker
+        worker.query_finished.connect(self._on_edge_storage_result)
+        worker.start()
+
+    def _restore_sync_sd_button(self):
+        self.btn_sync_sd.setEnabled(True)
+        self.btn_sync_sd.setText(_BTN_SYNC_SD_LABEL)
+
+    def _on_edge_storage_result(self, summary, recs, error_msg: str):
+        """Recebe o resultado da consulta ao Cartão SD na thread principal e atualiza a UI."""
+        sender = self.sender()
+        if sender is not None and sender is not self._edge_worker:
+            return
+        if self._edge_worker is None and sender is not None:
+            return
+
+        worker, self._edge_worker = self._edge_worker, None
+        camera_name = worker.camera_name if worker is not None else (self.camera.name if self.camera else "")
+        if worker is not None:
+            try:
+                worker.query_finished.disconnect(self._on_edge_storage_result)
+            except (RuntimeError, TypeError):
+                pass
+            retire_thread(worker)
+
+        self._restore_sync_sd_button()
+        cam_suffix = f" ({camera_name})" if camera_name else ""
+
+        if error_msg:
+            QMessageBox.warning(
+                self,
+                "ONVIF Profile G",
+                f"Falha na consulta ao serviço de Edge Storage{cam_suffix}: {error_msg}",
             )
-            client.get_capabilities()
-            summary = client.get_recording_summary()
-            recs = client.find_recordings(max_matches=10)
+            return
 
-            if recs:
-                lines = [f"Gravações encontradas no cartão SD ({self.camera.name}):", ""]
-                for i, r in enumerate(recs, 1):
-                    lines.append(f"{i}. Token: {r.get('token')}")
-                    lines.append(f"   Replay RTSP: {r.get('replay_uri') or 'Nativo'}")
-                QMessageBox.information(self, "ONVIF Profile G - Cartão SD", "\n".join(lines))
-            elif summary.get("num_recordings", 0) > 0:
-                msg = (
-                    f"A câmera reportou {summary['num_recordings']} gravações no cartão SD.\n"
-                    f"Histórico de: {summary.get('earliest_time', 'N/A')} até {summary.get('latest_time', 'N/A')}."
-                )
-                QMessageBox.information(self, "ONVIF Profile G - Cartão SD", msg)
-            else:
-                QMessageBox.information(
-                    self,
-                    "ONVIF Profile G - Cartão SD",
-                    f"Nenhuma gravação no cartão SD ou o dispositivo ({self.camera.name}) não expõe ONVIF Profile G."
-                )
-        except Exception as e:
-            QMessageBox.warning(self, "ONVIF Profile G", f"Falha na consulta ao serviço de Edge Storage: {e}")
+        if recs:
+            lines = [f"Gravações encontradas no cartão SD{cam_suffix}:", ""]
+            for i, r in enumerate(recs, 1):
+                lines.append(f"{i}. Token: {r.get('token')}")
+                lines.append(f"   Replay RTSP: {r.get('replay_uri') or 'Nativo'}")
+            QMessageBox.information(self, "ONVIF Profile G - Cartão SD", "\n".join(lines))
+        elif summary and summary.get("num_recordings", 0) > 0:
+            msg = (
+                f"A câmera{cam_suffix} reportou {summary['num_recordings']} gravações no cartão SD.\n"
+                f"Histórico de: {summary.get('earliest_time') or 'N/A'} até {summary.get('latest_time') or 'N/A'}."
+            )
+            QMessageBox.information(self, "ONVIF Profile G - Cartão SD", msg)
+        else:
+            QMessageBox.information(
+                self,
+                "ONVIF Profile G - Cartão SD",
+                f"Nenhuma gravação no cartão SD ou o dispositivo{cam_suffix} não expõe ONVIF Profile G.",
+            )
+
+    def _cancel_edge_storage(self):
+        """Desvincula e aposenta uma consulta Profile G em andamento sem bloquear a interface."""
+        worker, self._edge_worker = self._edge_worker, None
+        if worker is None:
+            return
+        try:
+            worker.query_finished.disconnect(self._on_edge_storage_result)
+        except (RuntimeError, TypeError):
+            pass
+        worker.requestInterruption()
+        retire_thread(worker)
+        self._restore_sync_sd_button()
+
+    def shutdown(self):
+        """Encerra consultas Profile G pendentes quando a janela principal fecha."""
+        self._cancel_edge_storage()
+
+    def closeEvent(self, event):
+        self.shutdown()
+        super().closeEvent(event)
