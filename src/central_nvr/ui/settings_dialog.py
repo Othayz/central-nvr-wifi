@@ -355,7 +355,15 @@ class SettingsDialog(QDialog):
     def _save_values(self):
         values = self.collect_values()
         # Uma única gravação de settings.json (antes eram ~14, uma por chave)
-        self.config_mgr.update(values)
+        saved = self.config_mgr.update(values)
+        if saved is False:
+            err = getattr(self.config_mgr, "last_write_error", None) or "erro de E/S"
+            QMessageBox.critical(
+                self,
+                "Erro ao Salvar Configurações",
+                f"Não foi possível salvar as configurações: {err}",
+            )
+            return
 
         # Limpa o override de CLI somente para chaves que o usuário alterou explicitamente na tela
         clear_override = getattr(self.config_mgr, "clear_override", None)

@@ -7,6 +7,7 @@ download seguro com validação SHA-256 e substituição atômica de executávei
 from dataclasses import dataclass, field
 import datetime
 import hashlib
+import json
 import logging
 import os
 from pathlib import Path
@@ -166,17 +167,30 @@ def find_best_asset_for_system(assets: List[ReleaseAsset]) -> Optional[ReleaseAs
 
 
 def resolve_github_token(token: Optional[str] = None) -> Optional[str]:
-    """Token explícito, ou GITHUB_TOKEN do ambiente, ou `github_token` das configurações."""
+    """Token explícito, ou GITHUB_TOKEN do ambiente, ou `github_token` do keyring/settings.json (somente leitura)."""
     if token and token.strip():
         return token.strip()
     env_token = os.environ.get("GITHUB_TOKEN", "").strip()
     if env_token:
         return env_token
     try:
-        from central_nvr.core.config import ConfigManager
-        return ConfigManager().get("github_token", "").strip() or None
+        from central_nvr.core.config import get_config_dir, get_keyring_pat, is_keyring_available
+
+        if is_keyring_available():
+            kr_pat = get_keyring_pat()
+            if kr_pat and str(kr_pat).strip():
+                return str(kr_pat).strip()
+
+        settings_path = get_config_dir() / "settings.json"
+        if settings_path.exists():
+            saved_settings = json.loads(settings_path.read_text(encoding="utf-8"))
+            if isinstance(saved_settings, dict):
+                file_token = str(saved_settings.get("github_token") or "").strip()
+                if file_token:
+                    return file_token
     except Exception:
         return None
+    return None
 
 
 def github_auth_headers(url: str, token: Optional[str]) -> Dict[str, str]:
