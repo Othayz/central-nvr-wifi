@@ -161,6 +161,7 @@ class MainWindow(QMainWindow):
         self.camera_grid.set_cameras(self.cameras)
         initial_layout = self.config_mgr.get("grid_layout", "auto")
         self.camera_grid.set_layout_mode(initial_layout)
+        self._sync_selected_camera_panels()
 
     def _create_top_header(self) -> QWidget:
         """Cria a barra superior com ações de layout, scan e configurações."""
@@ -788,6 +789,7 @@ class MainWindow(QMainWindow):
         self._update_hw_status_label()
         self._populate_device_tree()
         self.lbl_sb_streams.setText(f"Câmeras Cadastradas: {len(self.cameras)}")
+        self._sync_selected_camera_panels()
         self._log_event("Dispositivo", f"Câmera '{camera.name}' adicionada ao sistema.")
         return True
 
