@@ -668,7 +668,7 @@ class StreamWorker(QThread):
 
         for active_hw in attempts:
             if not self._keep_reading():
-                return StreamOutcome.STOPPED
+                return self._end_outcome(frames_seen)
 
             container = None
             retry_in_software = False
