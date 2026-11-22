@@ -199,7 +199,8 @@ class ProfileGSearchFlowTest(unittest.TestCase):
         self.calls = []
 
     def _mock_post(self, handler):
-        def post(url, data, headers, timeout):
+        def post(url, data, headers, timeout, allow_redirects=True):
+            self.assertFalse(allow_redirects)
             xml = data.decode("utf-8")
             self.calls.append((url, xml))
             return handler(url, xml)

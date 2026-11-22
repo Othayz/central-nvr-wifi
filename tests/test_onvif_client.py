@@ -219,7 +219,8 @@ class TransportErrorsTest(unittest.TestCase):
         self.assertEqual(self.client.profiles, [])
 
     def test_connect_and_initialize_true_with_real_profiles(self):
-        def post(url, data, headers, timeout):
+        def post(url, data, headers, timeout, allow_redirects=True):
+            self.assertFalse(allow_redirects)
             body = data.decode("utf-8")
             if "GetDeviceInformation" in body:
                 return _response(200, DEVICE_INFO_DEFAULT_NS)
@@ -232,6 +233,103 @@ class TransportErrorsTest(unittest.TestCase):
         self.client._session.post.side_effect = post
         self.assertTrue(self.client.connect_and_initialize())
         self.assertEqual(self.client.device_info["manufacturer"], "ACME")
+
+
+class _RecordingRedirectAdapter(requests.adapters.BaseAdapter):
+    """Adapter HTTP real em memória que simula redirecionamentos e registra todas as requisições."""
+
+    def __init__(self, status_code: int, location: str, target_body: str = DEVICE_INFO_DEFAULT_NS):
+        super().__init__()
+        self.status_code = status_code
+        self.location = location
+        self.target_body = target_body
+        self.sent_requests = []
+
+    def send(self, request, stream=False, timeout=None, verify=True, cert=None, proxies=None):
+        self.sent_requests.append(request)
+        resp = requests.Response()
+        resp.url = request.url
+        resp.request = request
+        resp.encoding = "utf-8"
+        if len(self.sent_requests) == 1:
+            resp.status_code = self.status_code
+            resp.headers["Location"] = self.location
+            resp._content = b""
+        else:
+            resp.status_code = 200
+            resp._content = self.target_body.encode("utf-8")
+        return resp
+
+    def close(self):
+        pass
+
+
+class SecurityRedirectAndXAddrTest(unittest.TestCase):
+    """Regressão da Issue #79: bloqueio de redirecionamentos HTTP e esquemas/prefixos inválidos em XAddr."""
+
+    def _client_with_redirect(self, status_code: int, location: str):
+        client = OnvifClient(ip="10.0.0.5", port=80, username="admin", password="segredo")
+        adapter = _RecordingRedirectAdapter(status_code=status_code, location=location)
+        client._session.mount("http://", adapter)
+        client._session.mount("https://", adapter)
+        return client, adapter
+
+    def test_redirect_307_does_not_resend_soap_body_to_other_host(self):
+        client, adapter = self._client_with_redirect(307, "http://evil.example.com/steal")
+        with self.assertRaises(OnvifResponseError):
+            client.get_device_information()
+        self.assertEqual(len(adapter.sent_requests), 1)
+        self.assertEqual(adapter.sent_requests[0].url, "http://10.0.0.5:80/onvif/device_service")
+
+    def test_redirect_308_does_not_resend_soap_body_to_other_host(self):
+        client, adapter = self._client_with_redirect(308, "http://evil.example.com/steal")
+        with self.assertRaises(OnvifResponseError):
+            client.get_device_information()
+        self.assertEqual(len(adapter.sent_requests), 1)
+        self.assertEqual(adapter.sent_requests[0].url, "http://10.0.0.5:80/onvif/device_service")
+
+    def test_redirect_302_is_rejected_without_following(self):
+        client, adapter = self._client_with_redirect(302, "http://127.0.0.1:8080/admin")
+        with self.assertRaises(OnvifResponseError):
+            client.get_capabilities()
+        self.assertEqual(len(adapter.sent_requests), 1)
+        self.assertEqual(adapter.sent_requests[0].url, "http://10.0.0.5:80/onvif/device_service")
+
+    def test_redirect_301_and_303_are_rejected_without_following(self):
+        for status in (301, 303):
+            with self.subTest(status=status):
+                client, adapter = self._client_with_redirect(status, "http://127.0.0.1/interno")
+                with self.assertRaises(OnvifResponseError):
+                    client.get_capabilities()
+                self.assertEqual(len(adapter.sent_requests), 1)
+
+    def test_validate_xaddr_rejects_non_http_schemes_and_protocol_relative(self):
+        client = OnvifClient(ip="10.0.0.5", port=80)
+        invalid_xaddrs = [
+            "ftp://10.0.0.5/onvif/media_service",
+            "file:///etc/passwd",
+            "file://10.0.0.5/etc/passwd",
+            "//evil.com/onvif/media_service",
+            "//10.0.0.5/onvif/media_service",
+        ]
+        for xaddr in invalid_xaddrs:
+            with self.subTest(xaddr=xaddr):
+                self.assertIsNone(client._validate_xaddr(xaddr))
+
+    def test_validate_xaddr_accepts_http_https_and_single_slash_relative(self):
+        client = OnvifClient(ip="10.0.0.5", port=8080)
+        self.assertEqual(
+            client._validate_xaddr("http://10.0.0.5:8080/onvif/media_service"),
+            "http://10.0.0.5:8080/onvif/media_service",
+        )
+        self.assertEqual(
+            client._validate_xaddr("https://10.0.0.5/onvif/media_service"),
+            "https://10.0.0.5/onvif/media_service",
+        )
+        self.assertEqual(
+            client._validate_xaddr("/onvif/media_service"),
+            "http://10.0.0.5:8080/onvif/media_service",
+        )
 
 
 class CleanupDecisionsTest(unittest.TestCase):

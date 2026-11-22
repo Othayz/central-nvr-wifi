@@ -151,15 +151,18 @@ class OnvifClient:
 
     def _validate_xaddr(self, xaddr: str) -> Optional[str]:
         """
-        Valida que o endpoint XAddr recebido possui host estritamente correspondente ao IP
-        configurado da câmera, bloqueando requisições SOAP para terceiros (Anti-SSRF).
+        Valida que o endpoint XAddr recebido usa esquema HTTP(S) e possui host estritamente
+        correspondente ao IP configurado da câmera, bloqueando requisições SOAP para terceiros (Anti-SSRF).
         """
         if not xaddr:
             return None
         try:
-            if xaddr.startswith("/"):
+            if xaddr.startswith("/") and not xaddr.startswith("//"):
                 return f"http://{self.ip}:{self.port}{xaddr}"
             parsed = urllib.parse.urlparse(xaddr)
+            if parsed.scheme.lower() not in ("http", "https"):
+                logger.warning(f"Anti-SSRF: Esquema XAddr rejeitado: {parsed.scheme}")
+                return None
             if parsed.hostname and parsed.hostname == self.ip:
                 return xaddr
             logger.warning(
@@ -263,6 +266,7 @@ class OnvifClient:
                 data=envelope.encode("utf-8"),
                 headers=headers,
                 timeout=self.timeout,
+                allow_redirects=False,
             )
         except requests.exceptions.Timeout as e:
             raise OnvifTimeoutError(f"Sem resposta de {service_url} em {self.timeout}s") from e
@@ -273,6 +277,10 @@ class OnvifClient:
 
         if resp.status_code == 200:
             return resp.text
+        if 300 <= resp.status_code < 400:
+            raise OnvifResponseError(
+                f"Redirecionamento HTTP {resp.status_code} recusado por segurança em {service_url}"
+            )
         if resp.status_code == 401:
             raise OnvifAuthError(f"HTTP 401 em {service_url}: credenciais recusadas")
 
