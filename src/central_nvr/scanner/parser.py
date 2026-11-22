@@ -86,48 +86,47 @@ def parse_ws_discovery_response(xml_data: str, source_ip: str = "") -> Optional[
     return devices[0] if devices else None
 
 
+def _parse_valid_xaddr(ep: str, source_ip: str) -> Optional[Tuple[str, str, int]]:
+    """Valida um XAddr contra URLs malformadas e Anti-SSRF, retornando (endpoint, host, porta)."""
+    try:
+        parsed = urllib.parse.urlparse(ep)
+        scheme = parsed.scheme.lower()
+        if scheme not in ("http", "https") or not parsed.hostname:
+            logger.debug(f"XAddr inválido ignorado ({ep!r}): esquema ou hostname ausente")
+            return None
+        if source_ip and parsed.hostname != source_ip:
+            logger.warning(
+                f"Anti-SSRF: Endpoint XAddr divergente descartado no discovery "
+                f"({parsed.hostname} != {source_ip})"
+            )
+            return None
+        port = parsed.port or (443 if scheme == "https" else 80)
+        return ep, parsed.hostname, port
+    except ValueError as e:
+        logger.debug(f"XAddr malformado ignorado ({ep!r}): {e}")
+        return None
+
+
 def _device_from_fields(xaddrs_raw: str, scopes_raw: str, types_raw: str, source_ip: str,
                         xml_data: str) -> Dict[str, Any]:
     """Monta o dicionário do dispositivo a partir dos campos de um ProbeMatch."""
-    # Extrair endpoints XAddrs (URLs dos serviços ONVIF)
-    endpoints = [x.strip() for x in xaddrs_raw.split() if x.strip().startswith("http")]
+    # Extrair e validar endpoints XAddrs (URLs dos serviços ONVIF) com proteção Anti-SSRF
+    raw_endpoints = [x.strip() for x in xaddrs_raw.split() if x.strip()]
+    valid_endpoints: List[Tuple[str, str, int]] = []
+    for ep in raw_endpoints:
+        parsed_ep = _parse_valid_xaddr(ep, source_ip)
+        if parsed_ep is not None:
+            valid_endpoints.append(parsed_ep)
 
-    # Determinar IP e Porta primários com validação Anti-SSRF
+    # Determinar IP e Porta primários
     ip = source_ip
     port = 80
     primary_endpoint = ""
 
-    if endpoints:
-        valid_endpoints = []
-        for ep in endpoints:
-            parsed_url = urllib.parse.urlparse(ep)
-            # Se source_ip foi fornecido pelo socket de rede, validar correspondência
-            if source_ip and parsed_url.hostname and parsed_url.hostname != source_ip:
-                logger.warning(
-                    f"Anti-SSRF: Endpoint XAddr divergente descartado no discovery "
-                    f"({parsed_url.hostname} != {source_ip})"
-                )
-                continue
-            valid_endpoints.append(ep)
-
-        if valid_endpoints:
-            primary_endpoint = valid_endpoints[0]
-            parsed_url = urllib.parse.urlparse(primary_endpoint)
-            if parsed_url.hostname:
-                ip = parsed_url.hostname
-            if parsed_url.port:
-                port = parsed_url.port
-            elif parsed_url.scheme == "https":
-                port = 443
-        elif source_ip:
-            primary_endpoint = f"http://{source_ip}:80/onvif/device_service"
-        else:
-            primary_endpoint = endpoints[0]
-            parsed_url = urllib.parse.urlparse(primary_endpoint)
-            if parsed_url.hostname:
-                ip = parsed_url.hostname
-            if parsed_url.port:
-                port = parsed_url.port
+    if valid_endpoints:
+        primary_endpoint, ip, port = valid_endpoints[0]
+    elif source_ip:
+        primary_endpoint = f"http://{source_ip}:80/onvif/device_service"
 
     # Parsear Scopes ONVIF (onvif://www.onvif.org/name/..., /hardware/..., /location/...)
     name = "Câmera IP ONVIF"
@@ -158,8 +157,8 @@ def _device_from_fields(xaddrs_raw: str, scopes_raw: str, types_raw: str, source
         "model": hardware,
         "manufacturer": manufacturer,
         "location": location,
-        "onvif_endpoint": primary_endpoint or f"http://{ip}:{port}/onvif/device_service",
-        "endpoints": endpoints,
+        "onvif_endpoint": primary_endpoint or (f"http://{ip}:{port}/onvif/device_service" if ip else ""),
+        "endpoints": [ep for ep, _, _ in valid_endpoints],
         "types": types_raw,
         "scopes": scopes_list,
         "raw_xml": xml_data,
@@ -174,35 +173,21 @@ def parse_ws_discovery_fallback(xml_data: str, source_ip: str = "") -> Optional[
     xaddrs = xaddrs_match.group(1).strip() if xaddrs_match else ""
     scopes = scopes_match.group(1).strip() if scopes_match else ""
 
-    endpoints = [x.strip() for x in xaddrs.split() if x.strip().startswith("http")]
+    raw_endpoints = [x.strip() for x in xaddrs.split() if x.strip()]
+    valid_endpoints: List[Tuple[str, str, int]] = []
+    for ep in raw_endpoints:
+        parsed_ep = _parse_valid_xaddr(ep, source_ip)
+        if parsed_ep is not None:
+            valid_endpoints.append(parsed_ep)
+
     ip = source_ip
     port = 80
     endpoint = ""
 
-    if endpoints:
-        valid_endpoints = []
-        for ep in endpoints:
-            parsed_url = urllib.parse.urlparse(ep)
-            if source_ip and parsed_url.hostname and parsed_url.hostname != source_ip:
-                continue
-            valid_endpoints.append(ep)
-
-        if valid_endpoints:
-            endpoint = valid_endpoints[0]
-            parsed = urllib.parse.urlparse(endpoint)
-            if parsed.hostname:
-                ip = parsed.hostname
-            if parsed.port:
-                port = parsed.port
-        elif source_ip:
-            endpoint = f"http://{source_ip}:80/onvif/device_service"
-        else:
-            endpoint = endpoints[0]
-            parsed = urllib.parse.urlparse(endpoint)
-            if parsed.hostname:
-                ip = parsed.hostname
-            if parsed.port:
-                port = parsed.port
+    if valid_endpoints:
+        endpoint, ip, port = valid_endpoints[0]
+    elif source_ip:
+        endpoint = f"http://{source_ip}:80/onvif/device_service"
 
     name = f"Câmera ONVIF ({ip})" if ip else "Dispositivo ONVIF"
     hardware = "ONVIF Camera"
@@ -221,8 +206,8 @@ def parse_ws_discovery_fallback(xml_data: str, source_ip: str = "") -> Optional[
         "model": hardware,
         "manufacturer": detect_manufacturer(hardware + " " + name + " " + scopes),
         "location": "",
-        "onvif_endpoint": endpoint or f"http://{ip}:{port}/onvif/device_service",
-        "endpoints": endpoints,
+        "onvif_endpoint": endpoint or (f"http://{ip}:{port}/onvif/device_service" if ip else ""),
+        "endpoints": [ep for ep, _, _ in valid_endpoints],
         "types": "",
         "scopes": scopes.split(),
         "raw_xml": xml_data,

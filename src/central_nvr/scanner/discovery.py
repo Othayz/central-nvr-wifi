@@ -89,38 +89,39 @@ class NetworkScanner:
         self._discovered_ips.clear()
         self.warnings = []
 
-        interfaces = list_ipv4_interfaces()
-        if not interfaces:
-            self.warnings.append("Nenhuma interface de rede IPv4 ativa: conecte-se à rede das câmeras e tente de novo.")
+        try:
+            interfaces = list_ipv4_interfaces()
+            if not interfaces:
+                self.warnings.append("Nenhuma interface de rede IPv4 ativa: conecte-se à rede das câmeras e tente de novo.")
+                if on_progress:
+                    on_progress(100, self.warnings[-1])
+                return []
+
             if on_progress:
-                on_progress(100, self.warnings[-1])
+                names = ", ".join(f"{i.name} ({i.network})" for i in interfaces)
+                on_progress(5, f"Iniciando descoberta WS-Discovery ONVIF em {names}...")
+
+            # 1. WS-Discovery por interface
+            self._run_ws_discovery(interfaces, timeout=timeout, on_device_found=on_device_found)
+
+            if on_progress:
+                on_progress(50, f"ONVIF concluído ({len(self._discovered_devices)} encontrados).")
+
+            # 2. Sondagem de portas TCP em cada sub-rede (se ativado)
+            if enable_port_scan and not self._stop_requested:
+                if on_progress:
+                    on_progress(55, "Sondando portas RTSP e HTTP nas sub-redes locais...")
+                self._run_port_scan(interfaces, on_device_found=on_device_found, on_progress=on_progress)
+
+            if on_progress:
+                summary = f"Varredura finalizada. Total: {len(self._discovered_devices)} dispositivos."
+                if self.warnings:
+                    summary += " " + " ".join(self.warnings)
+                on_progress(100, summary)
+
+            return list(self._discovered_devices.values())
+        finally:
             self._is_scanning = False
-            return []
-
-        if on_progress:
-            names = ", ".join(f"{i.name} ({i.network})" for i in interfaces)
-            on_progress(5, f"Iniciando descoberta WS-Discovery ONVIF em {names}...")
-
-        # 1. WS-Discovery por interface
-        self._run_ws_discovery(interfaces, timeout=timeout, on_device_found=on_device_found)
-
-        if on_progress:
-            on_progress(50, f"ONVIF concluído ({len(self._discovered_devices)} encontrados).")
-
-        # 2. Sondagem de portas TCP em cada sub-rede (se ativado)
-        if enable_port_scan and not self._stop_requested:
-            if on_progress:
-                on_progress(55, "Sondando portas RTSP e HTTP nas sub-redes locais...")
-            self._run_port_scan(interfaces, on_device_found=on_device_found, on_progress=on_progress)
-
-        if on_progress:
-            summary = f"Varredura finalizada. Total: {len(self._discovered_devices)} dispositivos."
-            if self.warnings:
-                summary += " " + " ".join(self.warnings)
-            on_progress(100, summary)
-
-        self._is_scanning = False
-        return list(self._discovered_devices.values())
 
     def _register(self, device_info: Dict[str, Any], on_device_found) -> None:
         key = device_info.get("onvif_endpoint") or f"{device_info['ip']}:{device_info.get('port', 80)}"
@@ -173,7 +174,12 @@ class NetworkScanner:
                     except OSError:
                         continue
                     xml_str = data.decode("utf-8", errors="ignore")
-                    for device_info in parse_ws_discovery_matches(xml_str, source_ip=addr[0]):
+                    try:
+                        devices = parse_ws_discovery_matches(xml_str, source_ip=addr[0])
+                    except Exception as e:
+                        logger.debug(f"Pacote WS-Discovery inválido de {addr[0]} ignorado: {e}")
+                        continue
+                    for device_info in devices:
                         device_info["source"] = "ONVIF (WS-Discovery)"
                         device_info["method"] = "ws-discovery"
                         device_info["status"] = "Online"
