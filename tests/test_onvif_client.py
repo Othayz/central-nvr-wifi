@@ -12,12 +12,14 @@ from unittest.mock import MagicMock
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
 
 import requests
+from urllib3.util import parse_url as urllib3_parse_url
 
 from central_nvr.core.onvif_client import (
     OnvifAuthError,
     OnvifClient,
     OnvifConnectionError,
     OnvifFaultError,
+    OnvifRedirectError,
     OnvifResponseError,
     OnvifTimeoutError,
 )
@@ -264,8 +266,32 @@ class _RecordingRedirectAdapter(requests.adapters.BaseAdapter):
         pass
 
 
+class _RecordingSoapAdapter(requests.adapters.BaseAdapter):
+    """Adapter HTTP real em memória que despacha respostas SOAP por corpo e registra URLs enviadas."""
+
+    def __init__(self, responder):
+        super().__init__()
+        self.responder = responder
+        self.sent_requests = []
+
+    def send(self, request, stream=False, timeout=None, verify=True, cert=None, proxies=None):
+        self.sent_requests.append(request)
+        body = request.body.decode("utf-8") if isinstance(request.body, bytes) else (request.body or "")
+        status, text = self.responder(request.url, body)
+        resp = requests.Response()
+        resp.url = request.url
+        resp.request = request
+        resp.encoding = "utf-8"
+        resp.status_code = status
+        resp._content = text.encode("utf-8")
+        return resp
+
+    def close(self):
+        pass
+
+
 class SecurityRedirectAndXAddrTest(unittest.TestCase):
-    """Regressão da Issue #79: bloqueio de redirecionamentos HTTP e esquemas/prefixos inválidos em XAddr."""
+    """Regressão da Issue #79: bloqueio de redirecionamentos HTTP e validação estrita Anti-SSRF em XAddr."""
 
     def _client_with_redirect(self, status_code: int, location: str):
         client = OnvifClient(ip="10.0.0.5", port=80, username="admin", password="segredo")
@@ -274,23 +300,26 @@ class SecurityRedirectAndXAddrTest(unittest.TestCase):
         client._session.mount("https://", adapter)
         return client, adapter
 
+    def test_redirect_error_is_subclass_of_response_error(self):
+        self.assertTrue(issubclass(OnvifRedirectError, OnvifResponseError))
+
     def test_redirect_307_does_not_resend_soap_body_to_other_host(self):
         client, adapter = self._client_with_redirect(307, "http://evil.example.com/steal")
-        with self.assertRaises(OnvifResponseError):
+        with self.assertRaises(OnvifRedirectError):
             client.get_device_information()
         self.assertEqual(len(adapter.sent_requests), 1)
         self.assertEqual(adapter.sent_requests[0].url, "http://10.0.0.5:80/onvif/device_service")
 
     def test_redirect_308_does_not_resend_soap_body_to_other_host(self):
         client, adapter = self._client_with_redirect(308, "http://evil.example.com/steal")
-        with self.assertRaises(OnvifResponseError):
+        with self.assertRaises(OnvifRedirectError):
             client.get_device_information()
         self.assertEqual(len(adapter.sent_requests), 1)
         self.assertEqual(adapter.sent_requests[0].url, "http://10.0.0.5:80/onvif/device_service")
 
     def test_redirect_302_is_rejected_without_following(self):
         client, adapter = self._client_with_redirect(302, "http://127.0.0.1:8080/admin")
-        with self.assertRaises(OnvifResponseError):
+        with self.assertRaises(OnvifRedirectError):
             client.get_capabilities()
         self.assertEqual(len(adapter.sent_requests), 1)
         self.assertEqual(adapter.sent_requests[0].url, "http://10.0.0.5:80/onvif/device_service")
@@ -299,7 +328,7 @@ class SecurityRedirectAndXAddrTest(unittest.TestCase):
         for status in (301, 303):
             with self.subTest(status=status):
                 client, adapter = self._client_with_redirect(status, "http://127.0.0.1/interno")
-                with self.assertRaises(OnvifResponseError):
+                with self.assertRaises(OnvifRedirectError):
                     client.get_capabilities()
                 self.assertEqual(len(adapter.sent_requests), 1)
 
@@ -316,7 +345,27 @@ class SecurityRedirectAndXAddrTest(unittest.TestCase):
             with self.subTest(xaddr=xaddr):
                 self.assertIsNone(client._validate_xaddr(xaddr))
 
-    def test_validate_xaddr_accepts_http_https_and_single_slash_relative(self):
+    def test_validate_xaddr_rejects_parser_differential_userinfo_and_control_chars(self):
+        client = OnvifClient(ip="10.0.0.5", port=80)
+        malicious_xaddrs = [
+            r"http://evil.com\@10.0.0.5/onvif/media",
+            r"http://127.0.0.1:8080\@10.0.0.5/admin",
+            "http://user:pass@10.0.0.5/onvif/media",
+            "http://@10.0.0.5/x",
+            r"http://10.0.0.5\evil/x",
+            "http://10.0.0.5/onvif/media service",
+            "http://10.0.0.5/onvif/media\n",
+            "http://10.0.0.5/onvif/media\r\nHost: evil.com",
+            "http://10.0.0.5/onvif/media\t",
+            "http://10.0.0.5/onvif/media\x00",
+        ]
+        for xaddr in malicious_xaddrs:
+            with self.subTest(xaddr=xaddr):
+                with self.assertLogs("central_nvr.core.onvif_client", level="WARNING") as cm:
+                    self.assertIsNone(client._validate_xaddr(xaddr))
+                self.assertTrue(any("Anti-SSRF:" in msg for msg in cm.output))
+
+    def test_validate_xaddr_accepts_and_normalizes_valid_urls(self):
         client = OnvifClient(ip="10.0.0.5", port=8080)
         self.assertEqual(
             client._validate_xaddr("http://10.0.0.5:8080/onvif/media_service"),
@@ -330,6 +379,44 @@ class SecurityRedirectAndXAddrTest(unittest.TestCase):
             client._validate_xaddr("/onvif/media_service"),
             "http://10.0.0.5:8080/onvif/media_service",
         )
+        self.assertEqual(
+            client._validate_xaddr("HTTP://10.0.0.5:8080/onvif/media_service?v=1#frag"),
+            "http://10.0.0.5:8080/onvif/media_service?v=1",
+        )
+        self.assertEqual(
+            client._validate_xaddr("http://10.0.0.5:/onvif/media_service"),
+            "http://10.0.0.5/onvif/media_service",
+        )
+
+    def test_end_to_end_malicious_media_xaddr_never_requests_other_host(self):
+        caps_malicious_media = ENV.format(
+            ns=NS,
+            body=r"""
+<tds:GetCapabilitiesResponse><tds:Capabilities>
+  <tt:Media><tt:XAddr>http://evil.com\@10.0.0.5/onvif/media</tt:XAddr></tt:Media>
+</tds:Capabilities></tds:GetCapabilitiesResponse>""",
+        )
+
+        def responder(url, body):
+            if "GetCapabilities" in body:
+                return 200, caps_malicious_media
+            if "GetProfiles" in body:
+                return 200, PROFILES_NO_PTZ
+            return 200, STREAM_URI_DAHUA
+
+        client = OnvifClient(ip="10.0.0.5", port=80, username="admin", password="segredo")
+        adapter = _RecordingSoapAdapter(responder)
+        client._session.mount("http://", adapter)
+        client._session.mount("https://", adapter)
+
+        caps = client.get_capabilities()
+        self.assertNotIn("media", caps)
+        self.assertEqual(client.media_service_url, "http://10.0.0.5:80/onvif/media_service")
+
+        client.get_profiles()
+        self.assertGreaterEqual(len(adapter.sent_requests), 2)
+        for req in adapter.sent_requests:
+            self.assertEqual(urllib3_parse_url(req.url).host, "10.0.0.5")
 
 
 class CleanupDecisionsTest(unittest.TestCase):
