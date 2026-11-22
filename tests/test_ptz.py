@@ -407,6 +407,189 @@ class PTZControllerTest(unittest.TestCase):
         self.assertIn(new_key, self.widget._client_cache)
         self.assertIn(new_key, self.widget._queues)
 
+    def test_slow_move_skips_overlapping_renewals_and_resumes_after_completion(self):
+        """#74: com cliente bloqueado, renovações não se acumulam; ao concluir, retoma e Stop segue ao soltar."""
+        cam = _camera("a", "10.0.0.1")
+        self.widget.set_camera(cam)
+        self.assertTrue(_wait_until(self.app, lambda: self.widget.client is not None))
+
+        started = [threading.Event(), threading.Event()]
+        gates = [threading.Event(), threading.Event()]
+        for g in gates:
+            self.addCleanup(g.set)
+
+        move_entries = 0
+        entries_lock = threading.Lock()
+
+        def blocking_move(pan_speed=0.0, tilt_speed=0.0, zoom_speed=0.0):
+            nonlocal move_entries
+            with entries_lock:
+                idx = move_entries
+                move_entries += 1
+            if idx < len(started):
+                started[idx].set()
+                gates[idx].wait(timeout=3.0)
+            with FakeOnvifClient.lock:
+                FakeOnvifClient.calls.append((cam.ip, "move"))
+            return True
+
+        self.widget.client.ptz_continuous_move = blocking_move
+        self.widget._move_renewal_timer.setInterval(30)
+
+        # Primeiro movimento inicia e fica bloqueado
+        self.widget._start_ptz_move(1.0, 0.0)
+        self.assertTrue(started[0].wait(2.0))
+
+        # Vários disparos do timer enquanto o 1º movimento ainda está em voo não podem enfileirar novos moves
+        _pump(self.app, 0.18)
+        self.widget._move_renewal_timer.stop()
+        gates[0].set()
+        self.assertTrue(_wait_until(self.app, lambda: len(FakeOnvifClient.calls) == 1))
+        _pump(self.app, 0.05)
+        self.assertEqual(move_entries, 1)
+        self.assertEqual([c[1] for c in FakeOnvifClient.calls], ["move"])
+
+        # Após concluir o 1º movimento, a próxima renovação do timer volta a ser enviada
+        self.widget._move_renewal_timer.start()
+        self.assertTrue(_wait_until(self.app, lambda: started[1].is_set()))
+        self.assertEqual(move_entries, 2)
+
+        # Novos disparos com a 2ª chamada bloqueada também são pulados; soltar o botão envia Stop
+        _pump(self.app, 0.15)
+        self.widget._stop_ptz()
+        gates[1].set()
+        self.assertTrue(_wait_until(self.app, lambda: len(FakeOnvifClient.calls) >= 3))
+        _pump(self.app, 0.05)
+        self.assertEqual([c[1] for c in FakeOnvifClient.calls], ["move", "move", "stop"])
+
+    def test_failed_move_releases_in_flight_flag_for_next_renewal(self):
+        """#74: falha ou exceção no ContinuousMove libera o controle para a próxima renovação."""
+        cam = _camera("a", "10.0.0.1")
+        self.widget.set_camera(cam)
+        self.assertTrue(_wait_until(self.app, lambda: self.widget.client is not None))
+
+        attempts = []
+
+        def flaky_move(pan_speed=0.0, tilt_speed=0.0, zoom_speed=0.0):
+            attempts.append(len(attempts) + 1)
+            if len(attempts) == 1:
+                return False
+            if len(attempts) == 2:
+                raise RuntimeError("timeout SOAP simulado")
+            return True
+
+        failures = []
+        self.widget.command_failed.connect(lambda name, msg: failures.append(msg))
+        self.widget.client.ptz_continuous_move = flaky_move
+        self.widget._move_renewal_timer.setInterval(60000)
+
+        # 1ª tentativa retorna False -> deve emitir falha e liberar renovação
+        self.widget._start_ptz_move(1.0, 0.0)
+        self.assertTrue(_wait_until(self.app, lambda: len(failures) == 1))
+
+        # 2ª tentativa (renovação) lança exceção -> deve emitir falha e liberar renovação
+        self.widget._renew_move()
+        self.assertTrue(_wait_until(self.app, lambda: len(failures) == 2))
+
+        # 3ª tentativa (renovação) volta a ser enviada e conclui com sucesso
+        self.widget._renew_move()
+        self.assertTrue(_wait_until(self.app, lambda: len(attempts) == 3))
+        self.assertEqual(len(failures), 2)
+
+    def test_begin_move_always_sends_even_when_previous_move_in_flight(self):
+        """#74: _begin_move sempre envia mesmo com ContinuousMove anterior em voo; renovações aguardam ambos."""
+        cam = _camera("a", "10.0.0.1")
+        self.widget.set_camera(cam)
+        self.assertTrue(_wait_until(self.app, lambda: self.widget.client is not None))
+
+        started = [threading.Event(), threading.Event(), threading.Event()]
+        gates = [threading.Event(), threading.Event()]
+        for g in gates:
+            self.addCleanup(g.set)
+
+        idx_counter = 0
+        counter_lock = threading.Lock()
+
+        def gated_move(pan_speed=0.0, tilt_speed=0.0, zoom_speed=0.0):
+            nonlocal idx_counter
+            with counter_lock:
+                idx = idx_counter
+                idx_counter += 1
+            if idx < len(started):
+                started[idx].set()
+            if idx < len(gates):
+                gates[idx].wait(timeout=3.0)
+            with FakeOnvifClient.lock:
+                FakeOnvifClient.calls.append((cam.ip, f"move:{pan_speed:.1f}"))
+            return True
+
+        self.widget.client.ptz_continuous_move = gated_move
+        self.widget._move_renewal_timer.setInterval(60000)
+
+        # Pressiona direita (move 1 bloqueado), solta (stop) e imediatamente pressiona esquerda (move 2)
+        self.widget._start_ptz_move(1.0, 0.0)
+        self.assertTrue(started[0].wait(2.0))
+        self.widget._stop_ptz()
+        self.widget._start_ptz_move(-1.0, 0.0)
+
+        # Libera o 1º movimento: Stop executa e o 2º movimento começa (e fica bloqueado em gates[1])
+        gates[0].set()
+        self.assertTrue(_wait_until(self.app, lambda: started[1].is_set()))
+        self.assertEqual([c[1] for c in FakeOnvifClient.calls], ["move:0.5", "stop"])
+
+        # Mesmo após o 1º movimento terminar, o 2º ainda está em voo -> renovação deve ser pulada
+        self.widget._renew_move()
+        gates[1].set()
+        self.assertTrue(_wait_until(self.app, lambda: len(FakeOnvifClient.calls) == 3))
+        _pump(self.app, 0.05)
+        self.assertEqual(idx_counter, 2)
+
+        # Agora todos os movimentos terminaram -> próxima renovação é enviada
+        self.widget._renew_move()
+        self.assertTrue(_wait_until(self.app, lambda: started[2].is_set()))
+        self.assertTrue(_wait_until(self.app, lambda: len(FakeOnvifClient.calls) == 4))
+        self.assertEqual(
+            [c[1] for c in FakeOnvifClient.calls],
+            ["move:0.5", "stop", "move:-0.5", "move:-0.5"],
+        )
+
+    def test_in_flight_tracking_is_per_camera(self):
+        """#74: movimento bloqueado em uma câmera não impede renovações de outra câmera."""
+        cam_a, cam_b = _camera("a", "10.0.0.1"), _camera("b", "10.0.0.2")
+        self.widget.set_camera(cam_a)
+        self.assertTrue(_wait_until(self.app, lambda: self.widget.client is not None))
+
+        started_a = threading.Event()
+        gate_a = threading.Event()
+        self.addCleanup(gate_a.set)
+
+        def blocking_move_a(pan_speed=0.0, tilt_speed=0.0, zoom_speed=0.0):
+            started_a.set()
+            gate_a.wait(timeout=3.0)
+            with FakeOnvifClient.lock:
+                FakeOnvifClient.calls.append((cam_a.ip, "move"))
+            return True
+
+        self.widget.client.ptz_continuous_move = blocking_move_a
+        self.widget._move_renewal_timer.setInterval(60000)
+        self.widget._start_ptz_move(1.0, 0.0)
+        self.assertTrue(started_a.wait(2.0))
+
+        # Troca para câmera B enquanto A continua bloqueada
+        self.widget.set_camera(cam_b)
+        self.assertTrue(_wait_until(self.app, lambda: self.widget.client is not None and self.widget.client.ip == cam_b.ip))
+        self.widget._move_renewal_timer.setInterval(60000)
+        self.widget._start_ptz_move(0.0, 1.0)
+        self.assertTrue(_wait_until(self.app, lambda: (cam_b.ip, "move") in FakeOnvifClient.calls))
+
+        # Renovação de B deve ser enviada normalmente mesmo com A em voo
+        self.widget._renew_move()
+        self.assertTrue(
+            _wait_until(self.app, lambda: sum(1 for c in FakeOnvifClient.calls if c == (cam_b.ip, "move")) == 2)
+        )
+        gate_a.set()
+        self.assertTrue(_wait_until(self.app, lambda: (cam_a.ip, "move") in FakeOnvifClient.calls))
+
 
 if __name__ == "__main__":
     unittest.main()

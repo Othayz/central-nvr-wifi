@@ -45,6 +45,7 @@ class PTZControllerWidget(QWidget):
     _client_ready = Signal(int, object, object)    # (geração, chave, cliente ou None)
     _presets_ready = Signal(int, list)             # (geração, presets)
     _preset_saved_gen = Signal(int, str, str)      # (geração, nome, token)
+    _move_finished = Signal(object)                # (chave da câmera cujo ContinuousMove concluiu)
 
     # Intervalo de renovação do ContinuousMove (o Timeout enviado é de 2 s)
     MOVE_RENEWAL_MS = 1000
@@ -62,6 +63,7 @@ class PTZControllerWidget(QWidget):
         self._client_cache: Dict[Tuple[str, str, int, str, str], OnvifClient] = {}
         self._failed_cache: Dict[Tuple[str, str, int, str, str], float] = {}
         self._queues: Dict[object, SerialCommandQueue] = {}
+        self._moves_in_flight: Dict[object, int] = {}
         self._renew_args: Optional[Tuple[float, float, float, str]] = None
         self._move_renewal_timer = QTimer(self)
         self._move_renewal_timer.setInterval(self.MOVE_RENEWAL_MS)
@@ -72,6 +74,7 @@ class PTZControllerWidget(QWidget):
         self._client_ready.connect(self._on_client_ready)
         self._presets_ready.connect(self._on_presets_ready)
         self._preset_saved_gen.connect(self._on_preset_saved_gen)
+        self._move_finished.connect(self._on_move_finished)
 
         self._setup_ui()
 
@@ -369,7 +372,12 @@ class PTZControllerWidget(QWidget):
         keep_key: Optional[Tuple[str, str, int, str, str]] = None,
     ) -> None:
         """Remove entradas antigas de cache e encerra filas seriais obsoletas de um Dispositivo Cadastrado."""
-        all_keys = set(self._client_cache.keys()) | set(self._failed_cache.keys()) | set(self._queues.keys())
+        all_keys = (
+            set(self._client_cache.keys())
+            | set(self._failed_cache.keys())
+            | set(self._queues.keys())
+            | set(self._moves_in_flight.keys())
+        )
         stale_keys = [
             k for k in all_keys
             if isinstance(k, tuple) and len(k) > 0 and k[0] == camera_id and k != keep_key
@@ -377,6 +385,7 @@ class PTZControllerWidget(QWidget):
         for k in stale_keys:
             self._client_cache.pop(k, None)
             self._failed_cache.pop(k, None)
+            self._moves_in_flight.pop(k, None)
             q = self._queues.pop(k, None)
             if q is not None:
                 q.shutdown()
@@ -398,6 +407,7 @@ class PTZControllerWidget(QWidget):
         for q in self._queues.values():
             q.shutdown()
         self._queues.clear()
+        self._moves_in_flight.clear()
         self._client_cache.clear()
         self._failed_cache.clear()
 
@@ -406,7 +416,7 @@ class PTZControllerWidget(QWidget):
     # ------------------------------------------------------------------
 
     def _submit(self, action: Callable[[OnvifClient], object], success_msg: Optional[str], failure_msg: str,
-                retries: int = 0) -> bool:
+                retries: int = 0, on_done: Optional[Callable[[], None]] = None) -> bool:
         """
         Enfileira um comando para a câmera selecionada. Os comandos de uma câmera rodam em série,
         na ordem de envio. `success_msg=None` não registra sucesso (renovações do movimento).
@@ -419,14 +429,18 @@ class PTZControllerWidget(QWidget):
 
         def _run():
             ok = False
-            for _ in range(retries + 1):
-                try:
-                    ok = bool(action(client))
-                except Exception as e:
-                    logger.error(f"Erro no comando PTZ ({camera_name}): {e}")
-                    ok = False
-                if ok:
-                    break
+            try:
+                for _ in range(retries + 1):
+                    try:
+                        ok = bool(action(client))
+                    except Exception as e:
+                        logger.error(f"Erro no comando PTZ ({camera_name}): {e}")
+                        ok = False
+                    if ok:
+                        break
+            finally:
+                if on_done is not None:
+                    on_done()
             if ok:
                 if success_msg:
                     self.command_executed.emit(camera_name, success_msg)
@@ -440,12 +454,27 @@ class PTZControllerWidget(QWidget):
         self.ptz_speed = value / 10.0
         self.lbl_speed_val.setText(f"{int(self.ptz_speed * 100)}%")
 
+    def _on_move_finished(self, key: object):
+        """Slot (thread da interface): libera o contador de ContinuousMove em voo da câmera."""
+        count = self._moves_in_flight.get(key, 0)
+        if count <= 1:
+            self._moves_in_flight.pop(key, None)
+        else:
+            self._moves_in_flight[key] = count - 1
+
     def _send_move(self, pan: float, tilt: float, zoom: float, success_msg: Optional[str], failure_msg: str):
-        self._submit(
+        if not self.camera or not self.client:
+            return
+        key = self._client_key(self.camera)
+        self._moves_in_flight[key] = self._moves_in_flight.get(key, 0) + 1
+        enqueued = self._submit(
             lambda c: c.ptz_continuous_move(pan_speed=pan, tilt_speed=tilt, zoom_speed=zoom),
             success_msg,
             failure_msg,
+            on_done=lambda k=key: self._move_finished.emit(k),
         )
+        if not enqueued:
+            self._on_move_finished(key)
 
     def _begin_move(self, pan: float, tilt: float, zoom: float, success_msg: str, failure_msg: str):
         if not self.camera or not self.client:
@@ -458,6 +487,11 @@ class PTZControllerWidget(QWidget):
     def _renew_move(self):
         if self._renew_args is None:
             self._move_renewal_timer.stop()
+            return
+        if not self.camera or not self.client:
+            return
+        # Evita acumular renovações na fila enquanto o ContinuousMove anterior ainda está em voo (Issue #74)
+        if self._moves_in_flight.get(self._client_key(self.camera), 0) > 0:
             return
         pan, tilt, zoom, failure_msg = self._renew_args
         self._send_move(pan, tilt, zoom, None, failure_msg)
