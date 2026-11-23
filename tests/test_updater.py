@@ -257,7 +257,7 @@ class TestUpdaterWorkers(unittest.TestCase):
             new_img.write_text("new app image v2")
 
             with patch.dict(os.environ, {"APPIMAGE": str(running_img), "APPDIR": str(appdir)}), \
-                 patch.object(sys, "executable", str(appdir / "usr" / "bin" / "python3")):
+                 patch("central_nvr.core.updater.__file__", str(appdir / "usr" / "src" / "central_nvr" / "core" / "updater.py")):
                 success, msg = install_downloaded_package(
                     str(new_img),
                     expected_sha256=compute_file_sha256(str(new_img)),
@@ -305,7 +305,7 @@ class TestUpdaterWorkers(unittest.TestCase):
             new.write_bytes(b"tampered")
 
             with patch.dict(os.environ, {"APPIMAGE": str(running), "APPDIR": str(appdir)}), \
-                 patch.object(sys, "executable", str(appdir / "usr" / "bin" / "python3")):
+                 patch("central_nvr.core.updater.__file__", str(appdir / "usr" / "src" / "central_nvr" / "core" / "updater.py")):
                 success, msg = install_downloaded_package(str(new), expected_sha256="a" * 64)
 
             self.assertFalse(success)
@@ -333,7 +333,7 @@ class TestUpdaterWorkers(unittest.TestCase):
             new = Path(tmpdir) / "new.AppImage"
             new.write_text("new")
             with patch.dict(os.environ, {"APPIMAGE": str(running), "APPDIR": str(appdir)}), \
-                 patch.object(sys, "executable", str(appdir / "usr" / "bin" / "python3")):
+                 patch("central_nvr.core.updater.__file__", str(appdir / "usr" / "src" / "central_nvr" / "core" / "updater.py")):
                 ok, _ = install_downloaded_package(str(new), expected_sha256=compute_file_sha256(str(new)))
             self.assertTrue(ok)
             self.assertEqual(running.read_text(), "new")
@@ -359,7 +359,7 @@ class TestUpdaterWorkers(unittest.TestCase):
                 return ok
 
             with patch.dict(os.environ, {"APPIMAGE": str(running), "APPDIR": str(appdir)}), \
-                 patch.object(sys, "executable", str(appdir / "usr" / "bin" / "python3")), \
+                 patch.object(updater, "__file__", str(appdir / "usr" / "src" / "central_nvr" / "core" / "updater.py")), \
                  patch.object(updater, "verify_file_sha256", side_effect=verify_then_swap):
                 updater.install_downloaded_package(
                     str(new), expected_sha256=hashlib.sha256(b"legit").hexdigest()

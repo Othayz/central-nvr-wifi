@@ -102,7 +102,7 @@ class UpdateFlowTest(unittest.TestCase):
         appdir.mkdir()
         patches = [
             patch.dict(os.environ, {"APPIMAGE": str(running), "APPDIR": str(appdir), "XDG_CACHE_HOME": tmp.name}),
-            patch.object(sys, "executable", str(appdir / "usr" / "bin" / "python3")),
+            patch("central_nvr.core.updater.__file__", str(appdir / "usr" / "src" / "central_nvr" / "core" / "updater.py")),
             patch.object(QMessageBox, "critical", return_value=None),
             patch.object(QMessageBox, "information", return_value=None),
             patch("central_nvr.ui.update_dialog.QDesktopServices.openUrl"),

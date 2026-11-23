@@ -23,6 +23,8 @@ print(json.dumps({
     "sys_path": sys.path,
     "LD_LIBRARY_PATH": os.environ.get("LD_LIBRARY_PATH"),
     "PYTHONPATH": os.environ.get("PYTHONPATH"),
+    "APPIMAGE": os.environ.get("APPIMAGE"),
+    "APPDIR": os.environ.get("APPDIR"),
 }))
 """
 
@@ -57,7 +59,7 @@ class AppRunSearchPathTest(unittest.TestCase):
 
     def _launch(self, **host_env):
         env = {k: v for k, v in os.environ.items()
-               if k not in ("LD_LIBRARY_PATH", "PYTHONPATH", "PYTHONHOME", "PYTHONSAFEPATH")}
+               if k not in ("LD_LIBRARY_PATH", "PYTHONPATH", "PYTHONHOME", "PYTHONSAFEPATH", "APPIMAGE", "APPDIR")}
         env.update(host_env)
         proc = subprocess.run(
             [str(self.appdir / "AppRun")],
@@ -114,6 +116,34 @@ class AppRunSearchPathTest(unittest.TestCase):
         self.assertNotIn(str(self.downloads), report["sys_path"])
         self.assertIn(f"{self.appdir}/usr/src", report["sys_path"])
         self.assertFalse(report["argparse"].startswith(str(self.downloads)))
+
+    def test_inherited_appimage_is_unset_when_apprun_is_invoked_directly(self):
+        """Issue #72: ao executar AppRun direto com APPDIR ausente ou diferente, APPIMAGE herdado é descartado."""
+        foreign_appdir = self.appdir.parent / "mount_outro_appimage"
+        foreign_appdir.mkdir()
+        for host_env in (
+            {"APPIMAGE": "/algum/Outro.AppImage", "APPDIR": str(foreign_appdir)},
+            {"APPIMAGE": "/algum/Outro.AppImage", "APPDIR": "/caminho/inexistente/outro.AppDir"},
+            {"APPIMAGE": "/algum/Outro.AppImage", "APPDIR": ""},
+            {"APPIMAGE": "/algum/Outro.AppImage"},
+        ):
+            with self.subTest(host_env=host_env):
+                report = self._launch(**host_env)
+                self.assertIsNone(report["APPIMAGE"])
+                self.assertEqual(report["APPDIR"], str(self.appdir))
+
+    def test_appimage_is_preserved_when_appdir_matches_apprun(self):
+        """Issue #72: quando o runtime do AppImage define APPDIR igual ao AppDir, APPIMAGE é preservado."""
+        symlink_appdir = self.appdir.parent / "link_appdir"
+        os.symlink(self.appdir, symlink_appdir)
+        for appdir_val in (str(self.appdir), str(symlink_appdir)):
+            with self.subTest(APPDIR=appdir_val):
+                report = self._launch(
+                    APPIMAGE="/algum/Central_NVR_WiFi.AppImage",
+                    APPDIR=appdir_val,
+                )
+                self.assertEqual(report["APPIMAGE"], "/algum/Central_NVR_WiFi.AppImage")
+                self.assertEqual(report["APPDIR"], str(self.appdir))
 
 
 if __name__ == "__main__":

@@ -14,7 +14,6 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
-import sys
 import tempfile
 import threading
 import time
@@ -698,13 +697,13 @@ def _user_bin_target() -> Path:
 
 def _running_appimage_path() -> Optional[Path]:
     """
-    Retorna o caminho resolvido do AppImage em execução somente quando o processo
-    realmente roda a partir desse AppDir (Issue #72).
+    Retorna o caminho resolvido do AppImage em execução somente quando o pacote
+    central_nvr realmente roda a partir desse AppDir (Issue #72).
 
     A variável APPIMAGE é herdada por processos filhos (ex.: terminal aberto dentro
-    de outro AppImage). Para evitar sobrescrever um executável de terceiros, exige-se
-    APPDIR absoluto definido e que sys.executable ou __file__ do pacote central_nvr
-    esteja dentro de Path(APPDIR).resolve().
+    de outro AppImage). Para evitar sobrescrever um executável de terceiros — mesmo
+    quando esse outro AppImage embute Python no PATH —, exige-se APPDIR absoluto
+    definido e que __file__ do pacote central_nvr esteja dentro de Path(APPDIR).resolve().
     """
     running_appimage = os.environ.get("APPIMAGE")
     if not running_appimage:
@@ -751,20 +750,21 @@ def _running_appimage_path() -> Optional[Path]:
         )
         return None
 
-    candidates = [Path(__file__)]
-    if sys.executable:
-        candidates.insert(0, Path(sys.executable))
+    try:
+        module_path = Path(__file__).resolve()
+    except OSError as e:
+        logger.warning(
+            f"Variável APPIMAGE herdada ({appimage_path}) ignorada: "
+            f"caminho do pacote inválido ({e}); instalando em ~/.local/bin."
+        )
+        return None
 
-    for candidate in candidates:
-        try:
-            if candidate.resolve().is_relative_to(appdir_path):
-                return appimage_path
-        except OSError:
-            continue
+    if module_path.is_relative_to(appdir_path):
+        return appimage_path
 
     logger.warning(
         f"Variável APPIMAGE herdada ({appimage_path}) ignorada: "
-        f"executável ({sys.executable}) e pacote não pertencem ao AppDir ({appdir_path}); "
+        f"pacote ({module_path}) não pertence ao AppDir ({appdir_path}); "
         "instalando em ~/.local/bin."
     )
     return None
