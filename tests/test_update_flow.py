@@ -19,7 +19,13 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 from central_nvr.core.threads import drain_retired_threads
-from central_nvr.core.updater import ReleaseAsset, ReleaseInfo
+from central_nvr.core.updater import (
+    AssetDownloadWorker,
+    ChecksumFetchWorker,
+    ReleaseAsset,
+    ReleaseInfo,
+    UpdateCheckWorker,
+)
 from central_nvr.ui.settings_dialog import SettingsDialog
 from central_nvr.ui.update_dialog import StartupUpdateDialog, UpdateDialog
 
@@ -436,6 +442,147 @@ class UpdateFlowTest(unittest.TestCase):
         self.assertEqual(len(opened), 1)
         self.assertTrue(opened[0].testAttribute(Qt.WidgetAttribute.WA_DeleteOnClose))
         self._dialogs.append(opened[0])
+
+    def _emit_from_worker_thread(self, signal, *args):
+        """Emite sinal a partir de outra thread para enfileirar QMetaCallEvent na thread principal."""
+        emitter = threading.Thread(target=signal.emit, args=args)
+        emitter.start()
+        emitter.join(timeout=5)
+        self.assertFalse(emitter.is_alive())
+
+    def test_queued_checksum_ready_before_close_does_not_start_download(self):
+        """Evento checksum_ready já enfileirado antes de close() não inicia AssetDownloadWorker (Issue #83)."""
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+
+        dlg = UpdateDialog(release_info=self._make_release())
+        self._dialogs.append(dlg)
+
+        with patch.dict(os.environ, {"XDG_CACHE_HOME": tmp.name}), \
+             patch.object(ChecksumFetchWorker, "start", return_value=None), \
+             patch("central_nvr.ui.update_dialog.AssetDownloadWorker") as mock_dl_cls:
+            mock_dl_cls.return_value.isRunning.return_value = False
+            dlg._on_action_clicked()
+            worker = dlg.checksum_worker
+            self.assertIsNotNone(worker)
+
+            # Enfileira o evento na thread principal sem processEvents() antes de fechar
+            self._emit_from_worker_thread(worker.checksum_ready, "a" * 64)
+            dlg.close()
+            self.app.processEvents()
+
+            mock_dl_cls.assert_not_called()
+            self.assertIsNone(dlg.download_worker)
+            self.assertIsNone(dlg.expected_sha256)
+
+    def test_queued_checksum_missing_before_reject_does_not_alert_or_open_browser(self):
+        """Evento checksum_missing já enfileirado antes de reject() não abre alerta nem navegador (Issue #83)."""
+        dlg = UpdateDialog(release_info=self._make_release())
+        self._dialogs.append(dlg)
+
+        with patch.object(ChecksumFetchWorker, "start", return_value=None), \
+             patch.object(QMessageBox, "critical") as mock_critical, \
+             patch("central_nvr.ui.update_dialog.QDesktopServices.openUrl") as mock_open:
+            dlg._on_action_clicked()
+            worker = dlg.checksum_worker
+            self.assertIsNotNone(worker)
+
+            # Enfileira o evento na thread principal sem processEvents() antes de rejeitar
+            self._emit_from_worker_thread(worker.checksum_missing)
+            dlg.reject()
+            self.app.processEvents()
+
+            mock_critical.assert_not_called()
+            mock_open.assert_not_called()
+
+    def test_queued_download_finished_before_close_in_startup_dialog_does_not_prompt(self):
+        """Evento download_finished já enfileirado antes de close() no StartupUpdateDialog não abre diálogo (Issue #83)."""
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        rel = self._make_release()
+
+        with patch.dict(os.environ, {"XDG_CACHE_HOME": tmp.name}), \
+             patch.object(StartupUpdateDialog, "_start_check", return_value=None), \
+             patch.object(AssetDownloadWorker, "start", return_value=None), \
+             patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.No) as mock_question, \
+             patch.object(QMessageBox, "critical") as mock_critical, \
+             patch("central_nvr.ui.update_dialog.QDesktopServices.openUrl") as mock_open:
+            dlg = StartupUpdateDialog(repo="test/test")
+            self._dialogs.append(dlg)
+            dlg.release_info = rel
+            dlg.best_asset = rel.assets[0]
+            dlg.expected_sha256 = "a" * 64
+            dlg._begin_download()
+            worker = dlg.download_worker
+            self.assertIsNotNone(worker)
+
+            # Enfileira o evento na thread principal sem processEvents() antes de fechar
+            self._emit_from_worker_thread(worker.download_finished, "/caminho/falso.AppImage")
+            dlg.close()
+            self.app.processEvents()
+
+            mock_question.assert_not_called()
+            mock_critical.assert_not_called()
+            mock_open.assert_not_called()
+            self.assertIsNone(dlg.downloaded_file_path)
+
+    def test_queued_worker_signals_after_close_are_ignored_across_dialogs(self):
+        """Demais sinais de worker já enfileirados antes do fechamento são ignorados (Issue #83)."""
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        rel = self._make_release()
+
+        with patch.dict(os.environ, {"XDG_CACHE_HOME": tmp.name}), \
+             patch.object(UpdateCheckWorker, "start", return_value=None), \
+             patch.object(AssetDownloadWorker, "start", return_value=None):
+            update_dlg = UpdateDialog(repo="o/r")
+            self._dialogs.append(update_dlg)
+            check_worker = update_dlg.check_worker
+            self.assertIsNotNone(check_worker)
+            status_before = update_dlg.lbl_status.text()
+
+            self._emit_from_worker_thread(check_worker.update_available, rel)
+            self._emit_from_worker_thread(check_worker.no_update_available, rel)
+            self._emit_from_worker_thread(check_worker.check_failed, "erro enfileirado")
+            update_dlg.close()
+            self.app.processEvents()
+
+            self.assertIsNone(update_dlg.release_info)
+            self.assertEqual(update_dlg.lbl_status.text(), status_before)
+
+            startup_dlg = StartupUpdateDialog(repo="o/r")
+            self._dialogs.append(startup_dlg)
+            startup_check = startup_dlg.check_worker
+            self.assertIsNotNone(startup_check)
+            startup_status_before = startup_dlg.lbl_status.text()
+
+            with patch("central_nvr.ui.update_dialog.QTimer.singleShot") as mock_timer:
+                self._emit_from_worker_thread(startup_check.update_available, rel)
+                self._emit_from_worker_thread(startup_check.no_update_available, rel)
+                self._emit_from_worker_thread(startup_check.check_failed, "erro enfileirado")
+                startup_dlg.reject()
+                self.app.processEvents()
+
+                mock_timer.assert_not_called()
+                self.assertIsNone(startup_dlg.release_info)
+                self.assertEqual(startup_dlg.lbl_status.text(), startup_status_before)
+
+            dl_dlg = UpdateDialog(release_info=rel)
+            self._dialogs.append(dl_dlg)
+            dl_dlg.expected_sha256 = "a" * 64
+            dl_dlg._begin_download()
+            dl_worker = dl_dlg.download_worker
+            self.assertIsNotNone(dl_worker)
+            dl_status_before = dl_dlg.lbl_status.text()
+
+            self._emit_from_worker_thread(dl_worker.progress, 50, 100, 10.0)
+            self._emit_from_worker_thread(dl_worker.download_finished, "/caminho/falso.AppImage")
+            self._emit_from_worker_thread(dl_worker.download_failed, "erro enfileirado")
+            dl_dlg.close()
+            self.app.processEvents()
+
+            self.assertIsNone(dl_dlg.downloaded_file_path)
+            self.assertEqual(dl_dlg.lbl_status.text(), dl_status_before)
 
 
 if __name__ == "__main__":

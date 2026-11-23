@@ -3,6 +3,7 @@
 Interface Gráfica para Verificação e Instalação de Atualizações via GitHub Releases.
 Inclui StartupUpdateDialog (Modo Splash de Inicialização) e UpdateDialog (Modo Periódico/Manual).
 """
+from functools import wraps
 import html
 import logging
 import os
@@ -92,6 +93,17 @@ def _disconnect_worker_signals(worker, *signal_names: str) -> None:
                 pass
 
 
+def _ignore_if_closing(slot):
+    """Ignora slots disparados por eventos já enfileirados após o início do fechamento do diálogo."""
+    @wraps(slot)
+    def wrapper(self, *args, **kwargs):
+        if self._closing:
+            return None
+        return slot(self, *args, **kwargs)
+
+    return wrapper
+
+
 class BaseUpdateDialog(QDialog):
     """
     Classe base para diálogos de atualização (StartupUpdateDialog e UpdateDialog).
@@ -100,6 +112,7 @@ class BaseUpdateDialog(QDialog):
 
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent)
+        self._closing: bool = False
         self.repo: str = DEFAULT_GITHUB_REPO
         self.token: Optional[str] = None
         self.release_info: Optional[ReleaseInfo] = None
@@ -163,6 +176,7 @@ class BaseUpdateDialog(QDialog):
         """
         return os.path.join(str(get_updates_dir()), os.path.basename(self.best_asset.name))
 
+    @_ignore_if_closing
     def _on_checksum_ready(self, sha: str):
         """Trata o recebimento bem-sucedido do hash SHA-256 da release."""
         self.expected_sha256 = sha
@@ -178,9 +192,11 @@ class BaseUpdateDialog(QDialog):
         Os workers são filhos do diálogo: destruí-lo com uma thread ainda em execução aborta o
         processo ("QThread: Destroyed while thread is still running"). Quem não terminar dentro
         da espera curta é aposentado (retire_thread), que o desvincula do diálogo e o mantém vivo
-        até o run() retornar. Os sinais são desconectados antes da espera/aposentadoria para evitar
-        que eventos tardios disparem slots num diálogo já fechado.
+        até o run() retornar. Marca _closing antes de desconectar sinais para que eventos já
+        enfileirados na fila principal (QMetaCallEvent) também sejam ignorados pelos slots.
         """
+        self._closing = True
+
         checksum_worker = getattr(self, "checksum_worker", None)
         self.checksum_worker = None
         if checksum_worker is not None:
@@ -359,6 +375,7 @@ class StartupUpdateDialog(BaseUpdateDialog):
         self.check_worker.check_failed.connect(self._on_check_failed)
         self.check_worker.start()
 
+    @_ignore_if_closing
     def _on_no_update(self, release_info: Optional[ReleaseInfo]):
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(100)
@@ -366,6 +383,7 @@ class StartupUpdateDialog(BaseUpdateDialog):
         self.lbl_status.setStyleSheet("font-size: 13px; font-weight: 700; color: #16A34A;")
         QTimer.singleShot(700, self._proceed_to_app)
 
+    @_ignore_if_closing
     def _on_check_failed(self, error_msg: str):
         logger.debug(f"Checagem inicial de versão: {error_msg}")
         self.progress_bar.setRange(0, 100)
@@ -373,6 +391,7 @@ class StartupUpdateDialog(BaseUpdateDialog):
         self.lbl_status.setText("Iniciando Central NVR WiFi...")
         QTimer.singleShot(400, self._proceed_to_app)
 
+    @_ignore_if_closing
     def _on_update_found(self, release: ReleaseInfo):
         self.release_info = release
         self.best_asset = find_best_asset_for_system(release.assets)
@@ -393,6 +412,7 @@ class StartupUpdateDialog(BaseUpdateDialog):
         self.btn_skip.show()
         self.btn_update.show()
 
+    @_ignore_if_closing
     def _proceed_to_app(self):
         self.should_open_main_window = True
         self.accept()
@@ -422,6 +442,7 @@ class StartupUpdateDialog(BaseUpdateDialog):
 
         self._start_checksum_fetch(self._on_checksum_ready, self._on_checksum_missing)
 
+    @_ignore_if_closing
     def _on_checksum_missing(self):
         self.progress_bar.setRange(0, 100)
         self.btn_skip.setEnabled(True)
@@ -453,6 +474,7 @@ class StartupUpdateDialog(BaseUpdateDialog):
         self.download_worker.download_failed.connect(self._on_download_failed)
         self.download_worker.start()
 
+    @_ignore_if_closing
     def _on_download_progress(self, downloaded: int, total: int, speed_kbps: float):
         if total > 0:
             pct = int((downloaded / total) * 100)
@@ -461,6 +483,7 @@ class StartupUpdateDialog(BaseUpdateDialog):
             tot_mb = total / (1024 * 1024)
             self.lbl_status.setText(f"Baixando: {dl_mb:.1f} MB / {tot_mb:.1f} MB ({pct}%) • {speed_kbps:.0f} KB/s")
 
+    @_ignore_if_closing
     def _on_download_finished(self, file_path: str):
         self.downloaded_file_path = file_path
         self.progress_bar.setValue(100)
@@ -487,6 +510,7 @@ class StartupUpdateDialog(BaseUpdateDialog):
         if reply == QMessageBox.StandardButton.Yes:
             self._execute_installation()
 
+    @_ignore_if_closing
     def _on_download_failed(self, error_msg: str):
         self.lbl_status.setText(f"❌ Erro no download: {html.escape(error_msg)}")
         self.lbl_status.setStyleSheet("font-size: 12px; font-weight: 700; color: #EF4444;")
@@ -641,6 +665,7 @@ class UpdateDialog(BaseUpdateDialog):
         self.check_worker.check_failed.connect(self._on_check_error)
         self.check_worker.start()
 
+    @_ignore_if_closing
     def _display_release(self, release: ReleaseInfo):
         self.release_info = release
         self.best_asset = find_best_asset_for_system(release.assets)
@@ -659,6 +684,7 @@ class UpdateDialog(BaseUpdateDialog):
         self.btn_action.setEnabled(True)
         self.btn_action.setText("⬇️ Baixar e Instalar")
 
+    @_ignore_if_closing
     def _on_up_to_date(self, release: Optional[ReleaseInfo]):
         self.status_box.show()
         self.progress_bar.setRange(0, 100)
@@ -669,6 +695,7 @@ class UpdateDialog(BaseUpdateDialog):
         self.btn_action.setEnabled(False)
         self.btn_action.hide()
 
+    @_ignore_if_closing
     def _on_check_error(self, err: str):
         self.status_box.show()
         self.progress_bar.setRange(0, 100)
@@ -708,6 +735,7 @@ class UpdateDialog(BaseUpdateDialog):
 
         self._start_checksum_fetch(self._on_checksum_ready, self._on_checksum_missing)
 
+    @_ignore_if_closing
     def _on_checksum_missing(self):
         self.progress_bar.setRange(0, 100)
         self.lbl_status.setText("Release sem checksum SHA-256: download bloqueado.")
@@ -735,6 +763,7 @@ class UpdateDialog(BaseUpdateDialog):
         self.download_worker.download_failed.connect(self._on_download_failed)
         self.download_worker.start()
 
+    @_ignore_if_closing
     def _on_download_progress(self, downloaded_bytes: int, total_bytes: int, speed_kbps: float):
         if total_bytes > 0:
             percentage = int((downloaded_bytes / total_bytes) * 100)
@@ -745,6 +774,7 @@ class UpdateDialog(BaseUpdateDialog):
                 f"Baixando: {downloaded_mb:.1f} MB / {total_mb:.1f} MB ({percentage}%) • {speed_kbps:.0f} KB/s"
             )
 
+    @_ignore_if_closing
     def _on_download_finished(self, file_path: str):
         self.downloaded_file_path = file_path
         self.progress_bar.setValue(100)
@@ -759,6 +789,7 @@ class UpdateDialog(BaseUpdateDialog):
             pass
         self.btn_action.clicked.connect(self._install_package)
 
+    @_ignore_if_closing
     def _on_download_failed(self, err: str):
         self.lbl_status.setText(f"Falha no download: {html.escape(err)}")
         self.lbl_status.setStyleSheet("font-size: 12px; font-weight: 700; color: #EF4444;")
