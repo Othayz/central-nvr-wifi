@@ -4,8 +4,12 @@ Testes dos workflows do GitHub Actions e da cadeia de build.
 - #39: a suíte inteira roda em PR/push e na release; tarball de fonte via `git archive`.
 - #20: actions fixadas por SHA, build sem permissão de escrita, downloads conferidos por SHA-256
   e dependências instaladas de um lockfile com hashes.
+- #73: tags de pré-release (com `-`) são marcadas como `prerelease` e não viram `latest`.
+- #76: create_release.sh aborta com stage/arquivos de versão sujos e commita só os dois arquivos.
 """
 import re
+import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -29,6 +33,125 @@ class WorkflowsTest(unittest.TestCase):
         release = (WORKFLOWS / "release.yml").read_text(encoding="utf-8")
         self.assertIn("git archive", release)
         self.assertNotIn("tar --exclude", release)
+
+    def test_release_marks_prerelease_tags_and_protects_latest(self):
+        """Issue #73: tags com '-' viram pré-release e não substituem /releases/latest."""
+        release = (WORKFLOWS / "release.yml").read_text(encoding="utf-8")
+        _, gh_release_step = release.split("softprops/action-gh-release@", 1)
+        self.assertIn("prerelease: ${{ contains(github.ref_name, '-') }}", gh_release_step)
+        self.assertIn("make_latest: ${{ !contains(github.ref_name, '-') }}", gh_release_step)
+
+
+class CreateReleaseScriptTest(unittest.TestCase):
+    """Issue #76: create_release.sh não inclui arquivos estranhos do stage nem sobrescreve arquivos sujos."""
+
+    SCRIPT = ROOT / "scripts" / "create_release.sh"
+
+    @staticmethod
+    def _git(repo: Path, *args: str) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            ["git", *args],
+            cwd=repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+    def _init_temp_repo(self, repo: Path) -> None:
+        (repo / "src" / "central_nvr").mkdir(parents=True)
+        (repo / "src" / "central_nvr" / "__init__.py").write_text(
+            '__version__ = "1.3.2"\n',
+            encoding="utf-8",
+        )
+        (repo / "pyproject.toml").write_text(
+            '[project]\nname = "central-nvr"\nversion = "1.3.2"\n',
+            encoding="utf-8",
+        )
+        (repo / "README.md").write_text("# Central NVR\n", encoding="utf-8")
+
+        self._git(repo, "init")
+        self._git(repo, "config", "user.name", "Teste")
+        self._git(repo, "config", "user.email", "teste@example.com")
+        self._git(repo, "config", "commit.gpgsign", "false")
+        self._git(repo, "config", "tag.gpgSign", "false")
+        self._git(repo, "add", "src/central_nvr/__init__.py", "pyproject.toml", "README.md")
+        self._git(repo, "commit", "-m", "commit inicial")
+
+    def test_aborts_when_another_file_is_staged(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            self._init_temp_repo(repo)
+            (repo / "extra.txt").write_text("trabalho em andamento\n", encoding="utf-8")
+            self._git(repo, "add", "extra.txt")
+
+            proc = subprocess.run(
+                ["bash", str(self.SCRIPT), "1.4.0", "teste"],
+                cwd=repo,
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn("stage", (proc.stdout + proc.stderr).lower())
+            commits = self._git(repo, "rev-list", "--count", "HEAD").stdout.strip()
+            self.assertEqual(commits, "1")
+            tags = self._git(repo, "tag", "--list").stdout.strip()
+            self.assertEqual(tags, "")
+            self.assertIn('version = "1.3.2"', (repo / "pyproject.toml").read_text(encoding="utf-8"))
+            self.assertIn('__version__ = "1.3.2"', (repo / "src" / "central_nvr" / "__init__.py").read_text(encoding="utf-8"))
+
+    def test_aborts_when_version_file_has_unstaged_changes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            self._init_temp_repo(repo)
+            (repo / "pyproject.toml").write_text(
+                '[project]\nname = "central-nvr"\nversion = "1.3.2"\n# alteração local\n',
+                encoding="utf-8",
+            )
+
+            proc = subprocess.run(
+                ["bash", str(self.SCRIPT), "1.4.0", "teste"],
+                cwd=repo,
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertNotEqual(proc.returncode, 0)
+            commits = self._git(repo, "rev-list", "--count", "HEAD").stdout.strip()
+            self.assertEqual(commits, "1")
+            tags = self._git(repo, "tag", "--list").stdout.strip()
+            self.assertEqual(tags, "")
+
+    def test_clean_tree_commits_only_version_files_and_creates_tag(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            self._init_temp_repo(repo)
+            # Alteração fora do stage em outro arquivo não deve entrar no commit de release
+            (repo / "README.md").write_text("# Central NVR alterado\n", encoding="utf-8")
+
+            proc = subprocess.run(
+                ["bash", str(self.SCRIPT), "1.4.0-rc1", "Pré-release de teste"],
+                cwd=repo,
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            commits = self._git(repo, "rev-list", "--count", "HEAD").stdout.strip()
+            self.assertEqual(commits, "2")
+            changed = {
+                line
+                for line in self._git(repo, "show", "--pretty=format:", "--name-only", "HEAD").stdout.splitlines()
+                if line.strip()
+            }
+            self.assertEqual(changed, {"pyproject.toml", "src/central_nvr/__init__.py"})
+            tags = self._git(repo, "tag", "--list").stdout.splitlines()
+            self.assertEqual(tags, ["v1.4.0-rc1"])
+            self.assertIn('version = "1.4.0-rc1"', (repo / "pyproject.toml").read_text(encoding="utf-8"))
+            self.assertIn(
+                '__version__ = "1.4.0-rc1"',
+                (repo / "src" / "central_nvr" / "__init__.py").read_text(encoding="utf-8"),
+            )
 
 
 class SupplyChainTest(unittest.TestCase):
