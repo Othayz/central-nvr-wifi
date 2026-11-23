@@ -496,7 +496,7 @@ class CameraGridWidget(QWidget):
 
     def _on_camera_double_clicked(self, camera_id: str):
         """Alterna suavemente entre 1x1 (maximizado) e o modo de grade dinâmico."""
-        self.selected_camera_id = camera_id
+        self._on_camera_selected(camera_id)
         if self.grid_layout_mode == "1x1":
             target_mode = self.previous_grid_mode or "auto"
             self.set_layout_mode(target_mode)
