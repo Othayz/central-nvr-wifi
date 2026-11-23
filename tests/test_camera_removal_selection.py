@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Testes de regressão das Issues #52 e #80:
-Sincronização dos painéis PTZ e de Gravações na seleção inicial, no cadastro/atualização
-e ao remover um Dispositivo Cadastrado.
+Testes de regressão das Issues #52, #70 e #80:
+Sincronização dos painéis PTZ e de Gravações na seleção inicial, no cadastro/atualização,
+ao maximizar a grade (botão Max / menu de contexto) e ao remover um Dispositivo Cadastrado.
 """
 import os
 import sys
@@ -17,7 +17,8 @@ SRC_DIR = Path(__file__).resolve().parent.parent / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from PySide6.QtCore import QCoreApplication, QEvent
+from PySide6.QtCore import QCoreApplication, QEvent, Qt
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 import central_nvr.core.config as cfg_mod
@@ -212,6 +213,80 @@ class CameraRemovalSelectionSyncTest(unittest.TestCase):
             self.app.processEvents()
             time.sleep(0.01)
         self.assertFalse(old_queue._thread.is_alive())
+
+    def test_max_button_on_other_camera_syncs_selection_and_panels(self):
+        """#70: clicar em 'Max' na câmera B seleciona B, destaca só B e sincroniza PTZ e Gravações."""
+        self.window.show()
+        self.window._select_camera_by_id("A")
+        self.app.processEvents()
+
+        grid = self.window.camera_grid
+        view_a = grid.camera_views["A"]
+        view_b = grid.camera_views["B"]
+        selected_events = []
+        grid.camera_selected.connect(selected_events.append)
+
+        self.assertEqual(grid.selected_camera_id, "A")
+        self.assertTrue(view_a.is_selected)
+        self.assertFalse(view_b.is_selected)
+        self.assertEqual(self.window.ptz_panel.camera.id, "A")
+        self.assertEqual(self.window.recordings_panel.camera.id, "A")
+
+        QTest.mouseClick(view_b.btn_fullscreen, Qt.MouseButton.LeftButton)
+        self.app.processEvents()
+
+        self.assertEqual(grid.grid_layout_mode, "1x1")
+        self.assertFalse(view_b.isHidden())
+        self.assertTrue(view_a.isHidden())
+        self.assertEqual(grid.selected_camera_id, "B")
+        self.assertEqual(selected_events, ["B"])
+        self.assertTrue(view_b.is_selected)
+        self.assertFalse(view_a.is_selected)
+        self.assertIsNotNone(self.window.ptz_panel.camera)
+        self.assertEqual(self.window.ptz_panel.camera.id, "B")
+        self.assertIsNotNone(self.window.recordings_panel.camera)
+        self.assertEqual(self.window.recordings_panel.camera.id, "B")
+
+        # Voltar para a grade com 'Max' mantém B selecionada e sincronizada
+        QTest.mouseClick(view_b.btn_fullscreen, Qt.MouseButton.LeftButton)
+        self.app.processEvents()
+
+        self.assertEqual(grid.grid_layout_mode, "auto")
+        self.assertFalse(view_a.isHidden())
+        self.assertFalse(view_b.isHidden())
+        self.assertEqual(grid.selected_camera_id, "B")
+        self.assertTrue(view_b.is_selected)
+        self.assertFalse(view_a.is_selected)
+        self.assertEqual(self.window.ptz_panel.camera.id, "B")
+        self.assertEqual(self.window.recordings_panel.camera.id, "B")
+
+    def test_context_menu_maximize_on_other_camera_syncs_selection_and_panels(self):
+        """#70: sinal double_clicked (usado por 'Maximizar Grade (1x1)') na câmera B sincroniza seleção e painéis."""
+        self.window.show()
+        self.window._select_camera_by_id("A")
+        self.app.processEvents()
+
+        grid = self.window.camera_grid
+        view_a = grid.camera_views["A"]
+        view_b = grid.camera_views["B"]
+        selected_events = []
+        grid.camera_selected.connect(selected_events.append)
+
+        # No menu de contexto, a ação 'Maximizar Grade (1x1)' apenas emite double_clicked(camera.id)
+        view_b.double_clicked.emit("B")
+        self.app.processEvents()
+
+        self.assertEqual(grid.grid_layout_mode, "1x1")
+        self.assertFalse(view_b.isHidden())
+        self.assertTrue(view_a.isHidden())
+        self.assertEqual(grid.selected_camera_id, "B")
+        self.assertEqual(selected_events, ["B"])
+        self.assertTrue(view_b.is_selected)
+        self.assertFalse(view_a.is_selected)
+        self.assertIsNotNone(self.window.ptz_panel.camera)
+        self.assertEqual(self.window.ptz_panel.camera.id, "B")
+        self.assertIsNotNone(self.window.recordings_panel.camera)
+        self.assertEqual(self.window.recordings_panel.camera.id, "B")
 
 
 class InitialAndDiscoverySelectionSyncTest(unittest.TestCase):
