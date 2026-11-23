@@ -98,8 +98,11 @@ class UpdateFlowTest(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         running = Path(tmp.name) / "running.AppImage"
         running.write_text("old")
+        appdir = Path(tmp.name) / "appdir"
+        appdir.mkdir()
         patches = [
-            patch.dict(os.environ, {"APPIMAGE": str(running), "XDG_CACHE_HOME": tmp.name}),
+            patch.dict(os.environ, {"APPIMAGE": str(running), "APPDIR": str(appdir), "XDG_CACHE_HOME": tmp.name}),
+            patch("central_nvr.core.updater.__file__", str(appdir / "usr" / "src" / "central_nvr" / "core" / "updater.py")),
             patch.object(QMessageBox, "critical", return_value=None),
             patch.object(QMessageBox, "information", return_value=None),
             patch("central_nvr.ui.update_dialog.QDesktopServices.openUrl"),

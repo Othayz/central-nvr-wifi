@@ -695,6 +695,81 @@ def _user_bin_target() -> Path:
     return user_bin_dir / "central-nvr.AppImage"
 
 
+def _running_appimage_path() -> Optional[Path]:
+    """
+    Retorna o caminho resolvido do AppImage em execução somente quando o pacote
+    central_nvr realmente roda a partir desse AppDir (Issue #72).
+
+    A variável APPIMAGE é herdada por processos filhos (ex.: terminal aberto dentro
+    de outro AppImage). Para evitar sobrescrever um executável de terceiros — mesmo
+    quando esse outro AppImage embute Python no PATH —, exige-se APPDIR absoluto
+    definido e que __file__ do pacote central_nvr esteja dentro de Path(APPDIR).resolve().
+    """
+    running_appimage = os.environ.get("APPIMAGE")
+    if not running_appimage:
+        return None
+
+    try:
+        appimage_path = Path(running_appimage).resolve()
+    except OSError as e:
+        logger.warning(f"Variável APPIMAGE ({running_appimage!r}) ignorada: caminho inválido ({e}).")
+        return None
+
+    if not appimage_path.is_file():
+        logger.warning(f"Variável APPIMAGE ({running_appimage}) ignorada: arquivo não encontrado no disco.")
+        return None
+
+    appdir_env = os.environ.get("APPDIR")
+    if not appdir_env:
+        logger.warning(
+            f"Variável APPIMAGE herdada ({appimage_path}) ignorada: APPDIR não definido; "
+            "instalando em ~/.local/bin."
+        )
+        return None
+
+    try:
+        raw_appdir = Path(appdir_env)
+        if not raw_appdir.is_absolute():
+            logger.warning(
+                f"Variável APPIMAGE herdada ({appimage_path}) ignorada: "
+                f"APPDIR ({appdir_env!r}) não é absoluto; instalando em ~/.local/bin."
+            )
+            return None
+        appdir_path = raw_appdir.resolve()
+    except OSError as e:
+        logger.warning(
+            f"Variável APPIMAGE herdada ({appimage_path}) ignorada: "
+            f"APPDIR inválido ({e}); instalando em ~/.local/bin."
+        )
+        return None
+
+    if appdir_path == appdir_path.parent:
+        logger.warning(
+            f"Variável APPIMAGE herdada ({appimage_path}) ignorada: "
+            f"APPDIR ({appdir_path}) aponta para a raiz do sistema; instalando em ~/.local/bin."
+        )
+        return None
+
+    try:
+        module_path = Path(__file__).resolve()
+    except OSError as e:
+        logger.warning(
+            f"Variável APPIMAGE herdada ({appimage_path}) ignorada: "
+            f"caminho do pacote inválido ({e}); instalando em ~/.local/bin."
+        )
+        return None
+
+    if module_path.is_relative_to(appdir_path):
+        return appimage_path
+
+    logger.warning(
+        f"Variável APPIMAGE herdada ({appimage_path}) ignorada: "
+        f"pacote ({module_path}) não pertence ao AppDir ({appdir_path}); "
+        "instalando em ~/.local/bin."
+    )
+    return None
+
+
 def _rollback_hint(target_path: Path) -> str:
     backup = target_path.with_name(f"{target_path.name}.bak")
     if backup.exists():
@@ -730,11 +805,10 @@ def install_downloaded_package(
     expected_hash = expected_sha256.strip()
 
     try:
-        running_appimage = os.environ.get("APPIMAGE")
+        target_path = _running_appimage_path()
 
         # Rodando a partir de um AppImage existente: Atomic Replacement no próprio arquivo
-        if running_appimage and os.path.exists(running_appimage):
-            target_path = Path(running_appimage).resolve()
+        if target_path is not None:
             if os.access(target_path.parent, os.W_OK):
                 try:
                     _replace_appimage_atomically(file_obj, target_path, expected_hash)

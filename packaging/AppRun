@@ -5,8 +5,22 @@ set -e
 # AppRun: Launcher universal para Central NVR WiFi AppImage
 # =============================================================================
 
-# Determinar o diretório base montado do AppDir
-APPDIR="$(dirname "$(readlink -f "$0")")"
+# Determinar o diretório base do AppDir a partir do próprio AppRun
+SCRIPT_APPDIR="$(dirname "$(readlink -f "$0")")"
+
+# Só o runtime do AppImage define APPDIR para o ponto de montagem e APPIMAGE para o executável.
+# Se o AppRun for executado diretamente (ex.: AppDir extraído ou diretório de build a partir do
+# terminal de outro AppImage), o APPDIR herdado estará vazio ou apontará para outro local;
+# nesses casos limpamos APPIMAGE para evitar que o updater sobrescreva outro programa (Issue #72).
+INHERITED_APPDIR=""
+if [ -n "${APPDIR:-}" ]; then
+    INHERITED_APPDIR="$(readlink -f -- "$APPDIR" 2>/dev/null || true)"
+fi
+if [ -z "$INHERITED_APPDIR" ] || [ "$INHERITED_APPDIR" != "$SCRIPT_APPDIR" ]; then
+    unset APPIMAGE
+fi
+
+APPDIR="$SCRIPT_APPDIR"
 export APPDIR
 
 # Configurar diretório base do Python embutido
