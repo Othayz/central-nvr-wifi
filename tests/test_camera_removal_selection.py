@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-Testes de regressão das Issues #52, #70 e #80:
+Testes de regressão das Issues #52, #70, #80 e #81:
 Sincronização dos painéis PTZ e de Gravações na seleção inicial, no cadastro/atualização,
-ao maximizar a grade (botão Max / menu de contexto) e ao remover um Dispositivo Cadastrado.
+ao maximizar a grade (botão Max / menu de contexto), ao selecionar câmera em outra página
+da grade paginada e ao remover um Dispositivo Cadastrado.
 """
 import os
 import sys
@@ -428,6 +429,263 @@ class InitialAndDiscoverySelectionSyncTest(unittest.TestCase):
         self.assertEqual(window.ptz_panel.lbl_cam_target.text(), "Portaria Atualizada (PTZ Desativado)")
         self.assertIs(window.recordings_panel.camera, new_instance)
         self.assertEqual(window.recordings_panel.lbl_cam_name.text(), "Portaria Atualizada (192.0.2.10)")
+
+
+class PaginatedSelectionSyncTest(unittest.TestCase):
+    """Regressão da Issue #81: selecionar câmera de outra página muda a página da grade e sincroniza PTZ."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        base = Path(self._tmpdir.name)
+        config_dir = base / "config"
+        data_dir = base / "data"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        data_dir.mkdir(parents=True, exist_ok=True)
+
+        self._patchers = [
+            patch.object(cfg_mod, "get_config_dir", return_value=config_dir),
+            patch.object(cfg_mod, "get_data_dir", return_value=data_dir),
+            patch("central_nvr.ui.playback_view.get_data_dir", return_value=data_dir),
+            patch.object(cfg_mod, "is_keyring_available", return_value=False),
+            patch.object(cfg_mod, "HAS_KEYRING", False),
+            patch.object(sw, "HAS_CV2", False),
+            patch("central_nvr.ui.ptz_controller.OnvifClient", _FakeOnvifClient),
+        ]
+        for patcher in self._patchers:
+            patcher.start()
+
+        self.config_mgr = ConfigManager()
+        self.config_mgr.set("periodic_update_check", False)
+        self.config_mgr.set("grid_layout", "2x2")
+        for idx in range(1, 6):
+            cam = _registered_camera(f"c{idx}", f"Cam {idx}", f"192.0.2.{10 + idx}", has_ptz=True)
+            self.config_mgr.add_or_update_device(cam.to_dict())
+
+        self.window = MainWindow(config_mgr=self.config_mgr)
+        self.window.show()
+        self.app.processEvents()
+
+    def tearDown(self):
+        try:
+            self.window.close()
+            self.app.processEvents()
+            drained = drain_retired_threads(5000)
+            self.window.deleteLater()
+            QCoreApplication.sendPostedEvents(self.window, QEvent.Type.DeferredDelete)
+            QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+            self.app.processEvents()
+            self.assertTrue(drained, "Todas as threads de streaming aposentadas devem encerrar")
+        finally:
+            for patcher in reversed(self._patchers):
+                patcher.stop()
+            self._tmpdir.cleanup()
+
+    def test_selecting_camera_on_other_page_switches_page_and_syncs_ptz(self):
+        """#81: em grade 2x2 com 5 Dispositivos Cadastrados, selecionar câmera da página 1 muda de página."""
+        grid = self.window.camera_grid
+        emitted = []
+        grid.camera_selected.connect(emitted.append)
+
+        self.assertEqual(grid.grid_layout_mode, "2x2")
+        self.assertEqual(grid.current_page, 0)
+        self.assertTrue(grid.camera_views["c5"].isHidden())
+        self.assertTrue(grid.camera_views["c5"].worker.is_paused)
+
+        # Selecionar câmera da página atual não troca a página
+        self.window._select_camera_by_id("c2")
+        self.app.processEvents()
+        self.assertEqual(grid.current_page, 0)
+        self.assertFalse(grid.camera_views["c2"].isHidden())
+        self.assertTrue(grid.camera_views["c2"].is_selected)
+        self.assertEqual(self.window.ptz_panel.camera.id, "c2")
+        self.assertEqual(self.window.recordings_panel.camera.id, "c2")
+        self.assertEqual(emitted, [])
+
+        # Selecionar câmera da página 1 via _select_camera_by_id (árvore / Focar / Abrir Controle PTZ)
+        self.window._select_camera_by_id("c5")
+        self.app.processEvents()
+        self.assertEqual(grid.current_page, 1)
+        self.assertEqual(grid.selected_camera_id, "c5")
+        self.assertFalse(grid.camera_views["c5"].isHidden())
+        self.assertTrue(grid.camera_views["c5"].is_selected)
+        self.assertTrue(grid.camera_views["c1"].isHidden())
+        self.assertFalse(grid.camera_views["c2"].is_selected)
+        self.assertTrue(grid.camera_views["c1"].worker.is_paused)
+        self.assertFalse(grid.camera_views["c5"].worker.is_paused)
+        self.assertEqual(grid.lbl_page.text(), "Página 2/2")
+        self.assertTrue(grid.btn_prev_page.isEnabled())
+        self.assertFalse(grid.btn_next_page.isEnabled())
+        self.assertIsNotNone(self.window.ptz_panel.camera)
+        self.assertEqual(self.window.ptz_panel.camera.id, "c5")
+        self.assertIsNotNone(self.window.recordings_panel.camera)
+        self.assertEqual(self.window.recordings_panel.camera.id, "c5")
+        self.assertEqual(emitted, [])
+
+        # Clicar na árvore em câmera da página 0 retorna para a página 0
+        self.window._on_tree_item_clicked(self.window._tree_items["c1"], 0)
+        self.app.processEvents()
+        self.assertEqual(grid.current_page, 0)
+        self.assertFalse(grid.camera_views["c1"].isHidden())
+        self.assertTrue(grid.camera_views["c1"].is_selected)
+        self.assertTrue(grid.camera_views["c5"].isHidden())
+        self.assertTrue(grid.camera_views["c5"].worker.is_paused)
+        self.assertFalse(grid.camera_views["c1"].worker.is_paused)
+        self.assertEqual(grid.lbl_page.text(), "Página 1/2")
+        self.assertEqual(self.window.ptz_panel.camera.id, "c1")
+        self.assertEqual(emitted, [])
+
+    def test_selecting_camera_in_1x1_keeps_existing_behavior(self):
+        """#81: em modo 1x1, selecionar outra câmera pela MainWindow mantém o comportamento atual."""
+        grid = self.window.camera_grid
+        self.window._change_grid_layout("1x1")
+        self.app.processEvents()
+
+        self.window._select_camera_by_id("c5")
+        self.app.processEvents()
+
+        self.assertEqual(grid.grid_layout_mode, "1x1")
+        self.assertEqual(grid.selected_camera_id, "c5")
+        self.assertFalse(grid.camera_views["c5"].isHidden())
+        self.assertTrue(grid.camera_views["c5"].is_selected)
+        self.assertTrue(grid.camera_views["c1"].isHidden())
+        self.assertEqual(grid.lbl_page.text(), "Página 5/5")
+        self.assertIsNotNone(self.window.ptz_panel.camera)
+        self.assertEqual(self.window.ptz_panel.camera.id, "c5")
+        self.assertIsNotNone(self.window.recordings_panel.camera)
+        self.assertEqual(self.window.recordings_panel.camera.id, "c5")
+
+    def test_internal_syncs_keep_operator_current_page(self):
+        """#81: sincronizações internas (set_cameras, Configurações, cadastro, remoção) não mudam a página."""
+        grid = self.window.camera_grid
+        self.assertEqual(grid.grid_layout_mode, "2x2")
+        self.assertEqual(grid.selected_camera_id, "c1")
+
+        # Operador navega para a página 1 mantendo c1 selecionada na página 0
+        grid.next_page()
+        self.app.processEvents()
+        self.assertEqual(grid.current_page, 1)
+        self.assertEqual(grid.selected_camera_id, "c1")
+        self.assertFalse(grid.camera_views["c5"].isHidden())
+        self.assertFalse(grid.camera_views["c5"].worker.is_paused)
+
+        # (a) set_cameras com a mesma lista preserva a página 1 e roda apply_layout uma única vez
+        with patch.object(grid, "apply_layout", wraps=grid.apply_layout) as mock_apply:
+            grid.set_cameras(list(self.window.cameras))
+        self.app.processEvents()
+        self.assertEqual(grid.current_page, 1)
+        self.assertEqual(mock_apply.call_count, 1)
+        self.assertFalse(grid.camera_views["c5"].isHidden())
+        self.assertFalse(grid.camera_views["c5"].worker.is_paused)
+
+        # (b) Salvar Configurações pela MainWindow preserva a página 1 (diálogo mockado)
+        with patch("central_nvr.ui.main_window.SettingsDialog") as mock_settings_dlg:
+            mock_settings_dlg.return_value.exec.return_value = True
+            self.window._open_settings_dialog()
+        self.app.processEvents()
+        self.assertEqual(grid.current_page, 1)
+        self.assertEqual(grid.selected_camera_id, "c1")
+        self.assertFalse(grid.camera_views["c5"].isHidden())
+        self.assertFalse(grid.camera_views["c5"].worker.is_paused)
+
+        # (c) Cadastrar novo Dispositivo Cadastrado via _add_discovered_camera preserva a página 1
+        cam6 = _registered_camera("c6", "Cam 6", "192.0.2.16", has_ptz=True)
+        self.assertTrue(self.window._add_discovered_camera(cam6))
+        self.app.processEvents()
+        self.assertEqual(grid.current_page, 1)
+        self.assertEqual(grid.selected_camera_id, "c1")
+        self.assertFalse(grid.camera_views["c5"].isHidden())
+        self.assertFalse(grid.camera_views["c6"].isHidden())
+
+        # (d) Remover Dispositivo Cadastrado não selecionado preserva a página 1
+        with patch(
+            "central_nvr.ui.main_window.QMessageBox.question",
+            return_value=QMessageBox.StandardButton.Yes,
+        ):
+            self.window._remove_camera_by_id("c2")
+        self.app.processEvents()
+        self.assertEqual(grid.current_page, 1)
+        self.assertEqual(grid.selected_camera_id, "c1")
+        self.assertIsNotNone(self.window.ptz_panel.camera)
+        self.assertEqual(self.window.ptz_panel.camera.id, "c1")
+        self.assertFalse(grid.camera_views["c6"].isHidden())
+
+    def test_exiting_1x1_and_switching_layout_shows_selected_camera_page(self):
+        """#81: sair de 1x1 ou trocar de layout alinha a página à câmera selecionada."""
+        grid = self.window.camera_grid
+        self.assertEqual(grid.grid_layout_mode, "2x2")
+        self.assertEqual(grid.current_page, 0)
+
+        # 2x2 → 1x1 → selecionar c5 pela MainWindow → voltar para 2x2 abre na página 1 com c5 visível
+        self.window._change_grid_layout("1x1")
+        self.window._on_tree_item_clicked(self.window._tree_items["c5"], 0)
+        self.window._change_grid_layout("2x2")
+        self.app.processEvents()
+
+        self.assertEqual(grid.grid_layout_mode, "2x2")
+        self.assertEqual(grid.current_page, 1)
+        self.assertEqual(grid.selected_camera_id, "c5")
+        self.assertFalse(grid.camera_views["c5"].isHidden())
+        self.assertFalse(grid.camera_views["c5"].worker.is_paused)
+        self.assertTrue(grid.camera_views["c1"].isHidden())
+        self.assertTrue(grid.camera_views["c1"].worker.is_paused)
+        self.assertEqual(self.window.ptz_panel.camera.id, "c5")
+
+        # auto com c5 selecionada → trocar para 2x2 abre na página 1 com c5 visível
+        self.window._change_grid_layout("auto")
+        self.app.processEvents()
+        self.assertEqual(grid.current_page, 0)
+        self.window._select_camera_by_id("c5")
+        self.window._change_grid_layout("2x2")
+        self.app.processEvents()
+
+        self.assertEqual(grid.grid_layout_mode, "2x2")
+        self.assertEqual(grid.current_page, 1)
+        self.assertFalse(grid.camera_views["c5"].isHidden())
+        self.assertFalse(grid.camera_views["c5"].worker.is_paused)
+
+    def test_selecting_tenth_camera_in_3x3_and_auto_switches_to_page_1(self):
+        """#81: em 3x3 e auto com 10 Dispositivos Cadastrados, selecionar c10 pela árvore leva à página 1."""
+        for idx in range(6, 11):
+            cam = _registered_camera(f"c{idx}", f"Cam {idx}", f"192.0.2.{10 + idx}", has_ptz=True)
+            self.assertTrue(self.window._add_discovered_camera(cam))
+        self.app.processEvents()
+
+        grid = self.window.camera_grid
+
+        # Modo 3x3
+        self.window._change_grid_layout("3x3")
+        self.app.processEvents()
+        self.assertEqual(grid.current_page, 0)
+        self.assertTrue(grid.camera_views["c10"].isHidden())
+
+        self.window._on_tree_item_clicked(self.window._tree_items["c10"], 0)
+        self.app.processEvents()
+        self.assertEqual(grid.current_page, 1)
+        self.assertFalse(grid.camera_views["c10"].isHidden())
+        self.assertFalse(grid.camera_views["c10"].worker.is_paused)
+        self.assertTrue(grid.camera_views["c1"].isHidden())
+        self.assertTrue(grid.camera_views["c1"].worker.is_paused)
+        self.assertEqual(grid.lbl_page.text(), "Página 2/2")
+        self.assertEqual(self.window.ptz_panel.camera.id, "c10")
+
+        # Modo auto
+        self.window._on_tree_item_clicked(self.window._tree_items["c1"], 0)
+        self.window._change_grid_layout("auto")
+        self.app.processEvents()
+        self.assertEqual(grid.current_page, 0)
+        self.assertTrue(grid.camera_views["c10"].isHidden())
+
+        self.window._on_tree_item_clicked(self.window._tree_items["c10"], 0)
+        self.app.processEvents()
+        self.assertEqual(grid.current_page, 1)
+        self.assertFalse(grid.camera_views["c10"].isHidden())
+        self.assertFalse(grid.camera_views["c10"].worker.is_paused)
+        self.assertEqual(grid.lbl_page.text(), "Página 2/2")
+        self.assertEqual(self.window.ptz_panel.camera.id, "c10")
 
 
 if __name__ == "__main__":
