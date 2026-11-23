@@ -222,8 +222,61 @@ def preferred_download_url(asset: "ReleaseAsset", token: Optional[str]) -> str:
     return asset.download_url
 
 
-# ETag e corpo da última resposta de /releases/latest, por URL (Issue #37)
-_ETAG_CACHE: Dict[str, Tuple[str, Dict[str, Any]]] = {}
+# ETag e corpo JSON da última resposta da API do GitHub, por URL (Issues #37, #73)
+_ETAG_CACHE: Dict[str, Tuple[str, Any]] = {}
+_GITHUB_NOT_FOUND = object()
+
+
+def _raise_for_github_status(response: Any, repo: str) -> None:
+    """Levanta RuntimeError descritivo para status HTTP de erro da API do GitHub."""
+    if response.status_code == 401:
+        raise RuntimeError("Token de autenticação do GitHub inválido ou expirado. Verifique as configurações.")
+    if response.status_code == 403:
+        resp_body = str(getattr(response, "text", "") or "").lower()
+        if "rate limit" in resp_body:
+            raise RuntimeError(
+                "Limite de requisições da API pública do GitHub atingido para seu endereço IP.\n"
+                "Configure um GitHub Personal Access Token em Configurações para continuar sem restrições."
+            )
+        raise RuntimeError(f"Acesso não autorizado ao repositório '{repo}' (HTTP 403).")
+    raise RuntimeError(f"Consulta ao GitHub retornou status HTTP {response.status_code}.")
+
+
+def _fetch_github_json_cached(
+    url: str,
+    headers: Dict[str, str],
+    timeout: int,
+    repo: str,
+    *,
+    allow_404: bool = False,
+) -> Any:
+    """
+    Faz GET condicional (If-None-Match) em `url` usando `_ETAG_CACHE` (Issue #37).
+    Em 304 reaproveita o corpo em cache; em 200 guarda ETag e JSON no cache.
+    Com `allow_404=True`, retorna `_GITHUB_NOT_FOUND` em 404; nos demais status
+    de erro levanta `RuntimeError` via `_raise_for_github_status`.
+    """
+    cached = _ETAG_CACHE.get(url)
+    conditional_headers = dict(headers)
+    if cached:
+        conditional_headers["If-None-Match"] = cached[0]
+    response = requests.get(url, headers=conditional_headers, timeout=timeout)
+
+    if response.status_code == 304 and cached:
+        return cached[1]
+    if allow_404 and response.status_code == 404:
+        return _GITHUB_NOT_FOUND
+    if response.status_code != 200:
+        _raise_for_github_status(response, repo)
+
+    data = response.json()
+    try:
+        etag = response.headers.get("ETag")
+    except AttributeError:
+        etag = None
+    if isinstance(etag, str) and etag:
+        _ETAG_CACHE[url] = (etag, data)
+    return data
 
 
 def fetch_latest_release(
@@ -257,25 +310,8 @@ def fetch_latest_release(
                     return _parse_github_release_dict(best)
 
         # Requisição condicional (Issue #37): 304 não conta na cota da API e evita baixar de novo
-        cached = _ETAG_CACHE.get(url)
-        conditional_headers = dict(headers)
-        if cached:
-            conditional_headers["If-None-Match"] = cached[0]
-        response = requests.get(url, headers=conditional_headers, timeout=timeout)
-
-        if response.status_code == 304 and cached:
-            data = cached[1]
-        elif response.status_code == 401:
-            raise RuntimeError("Token de autenticação do GitHub inválido ou expirado. Verifique as configurações.")
-        elif response.status_code == 403:
-            resp_body = response.text.lower()
-            if "rate limit" in resp_body:
-                raise RuntimeError(
-                    "Limite de requisições da API pública do GitHub atingido para seu endereço IP.\n"
-                    "Configure um GitHub Personal Access Token em Configurações para continuar sem restrições."
-                )
-            raise RuntimeError(f"Acesso não autorizado ao repositório '{repo}' (HTTP 403).")
-        elif response.status_code == 404:
+        data = _fetch_github_json_cached(url, headers, timeout, repo, allow_404=True)
+        if data is _GITHUB_NOT_FOUND:
             # 1. Tentar listar todas as releases
             list_url = f"https://api.github.com/repos/{repo}/releases"
             list_resp = requests.get(list_url, headers=headers, timeout=timeout)
@@ -323,29 +359,15 @@ def fetch_latest_release(
 
             # Se o repositório existe e foi acessado (200), mas está sem nenhuma release ou tag cadastrada
             return _up_to_date_release_info(repo)
-        elif response.status_code != 200:
-            raise RuntimeError(f"Consulta ao GitHub retornou status HTTP {response.status_code}.")
-        else:
-            data = response.json()
-            try:
-                etag = response.headers.get("ETag")
-            except AttributeError:
-                etag = None
-            if isinstance(etag, str) and etag:
-                _ETAG_CACHE[url] = (etag, data)
 
         # Defesa extra (Issue #73): mesmo que uma pré-release tenha sido publicada sem a flag
         # `prerelease=true` e apareça em /releases/latest, ignorá-la quando include_prereleases=False.
         if not include_prereleases and _is_release_prerelease(data):
-            list_resp = requests.get(
-                f"https://api.github.com/repos/{repo}/releases",
-                headers=headers,
-                timeout=timeout,
-            )
-            if list_resp.status_code == 200:
-                best = _pick_highest_release(list_resp.json(), include_prereleases=False)
-                if best is not None:
-                    return _parse_github_release_dict(best)
+            list_url = f"https://api.github.com/repos/{repo}/releases"
+            releases = _fetch_github_json_cached(list_url, headers, timeout, repo)
+            best = _pick_highest_release(releases, include_prereleases=False)
+            if best is not None:
+                return _parse_github_release_dict(best)
             return _up_to_date_release_info(repo)
 
         return _parse_github_release_dict(data)

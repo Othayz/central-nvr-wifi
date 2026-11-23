@@ -21,11 +21,13 @@ from central_nvr.core.updater import (
 )
 
 
-def _resp(status, payload=None):
+def _resp(status, payload=None, text="", headers=None):
     r = MagicMock()
     r.status_code = status
     r.json.return_value = payload
-    r.text = ""
+    r.text = text
+    if headers is not None:
+        r.headers = headers
     return r
 
 
@@ -194,6 +196,100 @@ class FetchSelectionTest(unittest.TestCase):
         ]
         self.assertEqual(_pick_highest_release(releases, include_prereleases=False)["tag_name"], "v1.3.2")
         self.assertEqual(_pick_highest_release(releases, include_prereleases=True)["tag_name"], "v1.4.0-rc1")
+
+    def test_tag_fallback_includes_prerelease_when_enabled_and_marks_flag(self):
+        """Issue #73: fallback por /tags devolve RC com prerelease=True quando include_prereleases=True e a ignora quando False."""
+        tags = [{"name": "v1.2.10"}, {"name": "v1.3.0-rc1"}, {"name": "v1.2.9"}]
+
+        def get(url, headers=None, timeout=None):
+            if url.endswith("/releases/latest"):
+                return _resp(404)
+            if url.endswith("/releases"):
+                return _resp(200, [])
+            if url.endswith("/tags"):
+                return _resp(200, tags)
+            return _resp(404)
+
+        with patch("requests.get", side_effect=get), patch("central_nvr.core.updater.__version__", "1.2.2"):
+            info_pre = fetch_latest_release(repo="o/r", include_prereleases=True, token="t")
+            updater._ETAG_CACHE.clear()
+            info_stable = fetch_latest_release(repo="o/r", include_prereleases=False, token="t")
+
+        self.assertEqual(info_pre.tag_name, "v1.3.0-rc1")
+        self.assertEqual(info_pre.version, "1.3.0-rc1")
+        self.assertTrue(info_pre.prerelease)
+        self.assertTrue(info_pre.is_newer)
+
+        self.assertEqual(info_stable.tag_name, "v1.2.10")
+        self.assertEqual(info_stable.version, "1.2.10")
+        self.assertFalse(info_stable.prerelease)
+        self.assertTrue(info_stable.is_newer)
+
+    def test_latest_prerelease_fallback_raises_on_github_http_errors(self):
+        """PR #100: falha HTTP no fallback /releases levanta RuntimeError em vez de retornar atualizado."""
+        rc = {"tag_name": "v1.4.0-rc1", "prerelease": False, "assets": []}
+        cases = [
+            (403, "API rate limit exceeded", "Limite de requisições"),
+            (403, "Forbidden", "Acesso não autorizado ao repositório 'o/r' (HTTP 403)"),
+            (401, "Bad credentials", "Token de autenticação do GitHub inválido ou expirado"),
+            (500, "Internal Server Error", "HTTP 500"),
+        ]
+
+        for status, body, expected_msg in cases:
+            with self.subTest(status=status, body=body):
+                updater._ETAG_CACHE.clear()
+
+                def get(url, headers=None, timeout=None):
+                    if url.endswith("/releases/latest"):
+                        return _resp(200, rc)
+                    if url.endswith("/releases"):
+                        return _resp(status, text=body)
+                    return _resp(404)
+
+                with patch("requests.get", side_effect=get), patch("central_nvr.core.updater.__version__", "1.3.1"):
+                    with self.assertRaises(RuntimeError) as ctx:
+                        fetch_latest_release(repo="o/r", include_prereleases=False, token="t")
+                self.assertIn(expected_msg, str(ctx.exception))
+
+    def test_latest_prerelease_fallback_uses_etag_cache_and_handles_304(self):
+        """PR #100: fallback /releases guarda ETag, envia If-None-Match e reutiliza a lista em 304."""
+        rc = {"tag_name": "v1.4.0-rc1", "prerelease": False, "assets": []}
+        stable = {"tag_name": "v1.3.2", "prerelease": False, "assets": []}
+        latest_url = "https://api.github.com/repos/o/r/releases/latest"
+        list_url = "https://api.github.com/repos/o/r/releases"
+
+        seen_headers = []
+        call_counts = {latest_url: 0, list_url: 0}
+
+        def get(url, headers=None, timeout=None):
+            seen_headers.append((url, dict(headers or {})))
+            call_counts[url] = call_counts.get(url, 0) + 1
+            if url == latest_url:
+                if call_counts[url] == 1:
+                    return _resp(200, rc, headers={"ETag": '"etag-latest"'})
+                return _resp(304, headers={})
+            if url == list_url:
+                if call_counts[url] == 1:
+                    return _resp(200, [rc, stable], headers={"ETag": '"etag-releases"'})
+                return _resp(304, headers={})
+            return _resp(404)
+
+        with patch("requests.get", side_effect=get), patch("central_nvr.core.updater.__version__", "1.3.1"):
+            first = fetch_latest_release(repo="o/r", include_prereleases=False, token="t")
+            self.assertIn(list_url, updater._ETAG_CACHE)
+            self.assertEqual(updater._ETAG_CACHE[list_url][0], '"etag-releases"')
+            second = fetch_latest_release(repo="o/r", include_prereleases=False, token="t")
+
+        self.assertEqual(first.tag_name, "v1.3.2")
+        self.assertEqual(second.tag_name, "v1.3.2")
+        self.assertEqual(second.version, "1.3.2")
+        self.assertTrue(second.is_newer)
+        self.assertFalse(second.prerelease)
+
+        list_calls = [hdrs for url, hdrs in seen_headers if url == list_url]
+        self.assertEqual(len(list_calls), 2)
+        self.assertNotIn("If-None-Match", list_calls[0])
+        self.assertEqual(list_calls[1].get("If-None-Match"), '"etag-releases"')
 
 
 if __name__ == "__main__":
