@@ -23,6 +23,7 @@ from central_nvr.core.config import ConfigManager
 from central_nvr.core.onvif_client import (
     OnvifClient,
     OnvifFaultError,
+    OnvifRedirectError,
     OnvifTimeoutError,
 )
 
@@ -199,7 +200,8 @@ class ProfileGSearchFlowTest(unittest.TestCase):
         self.calls = []
 
     def _mock_post(self, handler):
-        def post(url, data, headers, timeout):
+        def post(url, data, headers, timeout, allow_redirects=True):
+            self.assertFalse(allow_redirects)
             xml = data.decode("utf-8")
             self.calls.append((url, xml))
             return handler(url, xml)
@@ -506,6 +508,38 @@ class ProfileGSearchFlowTest(unittest.TestCase):
         recs = self.client.find_recordings(max_matches=10, should_abort=lambda: abort_flag["stop"])
         self.assertEqual(recs, [])
         self.assertEqual(len(self.calls), 2)
+
+    def test_get_recording_summary_does_not_fallback_on_redirect(self):
+        for status in (301, 302, 307, 308):
+            with self.subTest(status=status):
+                self.calls.clear()
+
+                def handler(url, xml, status_code=status):
+                    if url == "http://10.0.0.5:80/onvif/search_service":
+                        return _http_response(status_code, "")
+                    raise AssertionError(f"Não deveria fazer fallback em 3xx: {url}")
+
+                self._mock_post(handler)
+                with self.assertRaises(OnvifRedirectError):
+                    self.client.get_recording_summary()
+                self.assertEqual(len(self.calls), 1)
+                self.assertEqual(self.calls[0][0], "http://10.0.0.5:80/onvif/search_service")
+
+    def test_find_recordings_does_not_fallback_on_redirect(self):
+        for status in (301, 302, 307, 308):
+            with self.subTest(status=status):
+                self.calls.clear()
+
+                def handler(url, xml, status_code=status):
+                    if url == "http://10.0.0.5:80/onvif/search_service":
+                        return _http_response(status_code, "")
+                    raise AssertionError(f"Não deveria fazer fallback em 3xx: {url}")
+
+                self._mock_post(handler)
+                with self.assertRaises(OnvifRedirectError):
+                    self.client.find_recordings(max_matches=10)
+                self.assertEqual(len(self.calls), 1)
+                self.assertEqual(self.calls[0][0], "http://10.0.0.5:80/onvif/search_service")
 
 
 def _camera(cam_id: str = "cam_10_0_0_5", name: str = "Câmera Garagem", ip: str = "10.0.0.5") -> CameraDevice:

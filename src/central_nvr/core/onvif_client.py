@@ -20,6 +20,7 @@ from xml.etree.ElementTree import Element, ParseError
 import defusedxml.ElementTree as SafeET
 import requests
 from defusedxml.common import DefusedXmlException
+from urllib3.util import parse_url as urllib3_parse_url
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +51,10 @@ class OnvifFaultError(OnvifError):
 
 class OnvifResponseError(OnvifError):
     """Resposta inesperada: status HTTP de erro sem Fault, ou XML inválido."""
+
+
+class OnvifRedirectError(OnvifResponseError):
+    """Redirecionamento HTTP (3xx) recusado por segurança ao comunicar com o dispositivo ONVIF."""
 
 
 # =========================================================================
@@ -151,22 +156,59 @@ class OnvifClient:
 
     def _validate_xaddr(self, xaddr: str) -> Optional[str]:
         """
-        Valida que o endpoint XAddr recebido possui host estritamente correspondente ao IP
-        configurado da câmera, bloqueando requisições SOAP para terceiros (Anti-SSRF).
+        Valida que o endpoint XAddr recebido usa esquema HTTP(S), não contém caracteres
+        inválidos nem userinfo e possui host estritamente correspondente ao IP configurado
+        da câmera em ambos os parsers (urllib.parse e urllib3), bloqueando requisições
+        SOAP para terceiros (Anti-SSRF). Devolve a URL reconstruída/normalizada.
         """
         if not xaddr:
             return None
         try:
-            if xaddr.startswith("/"):
-                return f"http://{self.ip}:{self.port}{xaddr}"
-            parsed = urllib.parse.urlparse(xaddr)
-            if parsed.hostname and parsed.hostname == self.ip:
-                return xaddr
-            logger.warning(
-                f"Anti-SSRF: Endpoint XAddr rejeitado por divergir do IP da câmera "
-                f"({parsed.hostname} != {self.ip}): {xaddr}"
-            )
-            return None
+            if any(
+                ch == "\\" or ord(ch) <= 0x20 or 0x7F <= ord(ch) <= 0x9F or ch.isspace()
+                for ch in xaddr
+            ):
+                logger.warning(f"Anti-SSRF: XAddr rejeitado por conter caracteres inválidos: {xaddr!r}")
+                return None
+
+            candidate = xaddr
+            if xaddr.startswith("/") and not xaddr.startswith("//"):
+                candidate = f"http://{self.ip}:{self.port}{xaddr}"
+
+            parsed = urllib.parse.urlparse(candidate)
+            scheme = parsed.scheme.lower()
+            if scheme not in ("http", "https"):
+                logger.warning(f"Anti-SSRF: Esquema XAddr rejeitado: {parsed.scheme}")
+                return None
+
+            if (
+                parsed.username is not None
+                or parsed.password is not None
+                or "@" in parsed.netloc
+            ):
+                logger.warning(f"Anti-SSRF: XAddr com userinfo rejeitado: {xaddr}")
+                return None
+
+            port = parsed.port
+            u3 = urllib3_parse_url(candidate)
+            if u3.auth is not None:
+                logger.warning(f"Anti-SSRF: XAddr com userinfo rejeitado pelo urllib3: {xaddr}")
+                return None
+            if (u3.scheme or "").lower() != scheme or u3.port != port:
+                logger.warning(
+                    f"Anti-SSRF: Divergência de esquema/porta ao validar XAddr: {xaddr}"
+                )
+                return None
+
+            if parsed.hostname != self.ip or u3.host != self.ip:
+                logger.warning(
+                    f"Anti-SSRF: Endpoint XAddr rejeitado por divergir do IP da câmera "
+                    f"({parsed.hostname} / {u3.host} != {self.ip}): {xaddr}"
+                )
+                return None
+
+            netloc = f"{self.ip}:{port}" if port is not None else self.ip
+            return urllib.parse.urlunparse((scheme, netloc, parsed.path, parsed.params, parsed.query, ""))
         except Exception as e:
             logger.warning(f"Anti-SSRF: Erro ao validar XAddr '{xaddr}': {e}")
             return None
@@ -263,6 +305,7 @@ class OnvifClient:
                 data=envelope.encode("utf-8"),
                 headers=headers,
                 timeout=self.timeout,
+                allow_redirects=False,
             )
         except requests.exceptions.Timeout as e:
             raise OnvifTimeoutError(f"Sem resposta de {service_url} em {self.timeout}s") from e
@@ -273,6 +316,10 @@ class OnvifClient:
 
         if resp.status_code == 200:
             return resp.text
+        if 300 <= resp.status_code < 400:
+            raise OnvifRedirectError(
+                f"Redirecionamento HTTP {resp.status_code} recusado por segurança em {service_url}"
+            )
         if resp.status_code == 401:
             raise OnvifAuthError(f"HTTP 401 em {service_url}: credenciais recusadas")
 
@@ -482,6 +529,8 @@ class OnvifClient:
         """Obtém resumo das gravações salvas no armazenamento local da câmera (cartão SD)."""
         try:
             root = self._call(self.search_service_url, "<tse:GetRecordingSummary/>")
+        except OnvifRedirectError:
+            raise
         except (OnvifFaultError, OnvifResponseError):
             root = self._call(self.recording_service_url, "<trc:GetRecordingSummary/>")
 
@@ -522,6 +571,8 @@ class OnvifClient:
         active_search_url = self.search_service_url
         try:
             root = self._call(active_search_url, body)
+        except OnvifRedirectError:
+            raise
         except (OnvifFaultError, OnvifResponseError):
             if aborted():
                 return []
