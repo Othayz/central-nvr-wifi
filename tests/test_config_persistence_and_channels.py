@@ -668,5 +668,255 @@ class ResolveGithubTokenReadOnlyTest(unittest.TestCase):
             self.assertEqual(data["github_token"], "ghp_from_file")
 
 
+if cfg_mod.HAS_KEYRING:
+    import keyring
+    import keyring.backend
+    import keyring.errors
+
+    class _LockedKeyringBackend(keyring.backend.KeyringBackend):
+        """Backend de teste com prioridade > 0 cujo cofre está bloqueado."""
+
+        priority = 10
+
+        def get_password(self, service, username):
+            raise keyring.errors.KeyringLocked("coleção bloqueada")
+
+        def set_password(self, service, username, password):
+            raise keyring.errors.KeyringLocked("coleção bloqueada")
+
+        def delete_password(self, service, username):
+            raise keyring.errors.KeyringLocked("coleção bloqueada")
+
+    class _MemoryKeyringBackend(keyring.backend.KeyringBackend):
+        """Backend de teste em memória com prioridade > 0."""
+
+        priority = 10
+
+        def __init__(self):
+            self.store = {}
+
+        def get_password(self, service, username):
+            return self.store.get((service, username))
+
+        def set_password(self, service, username, password):
+            self.store[(service, username)] = password
+
+        def delete_password(self, service, username):
+            if (service, username) not in self.store:
+                raise keyring.errors.PasswordDeleteError("não encontrado")
+            del self.store[(service, username)]
+
+
+@unittest.skipUnless(cfg_mod.HAS_KEYRING, "keyring não disponível neste ambiente")
+class GithubTokenKeyringFallbackTest(unittest.TestCase):
+    """Regressão da Issue #75: fallback em settings.json (0600) e aviso quando o keyring recusa o PAT."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        base = Path(self._tmpdir.name)
+        self.config_dir = base / "config"
+        self.data_dir = base / "data"
+        self.config_dir.mkdir(parents=True, exist_ok=True)
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        self._prev_keyring = keyring.get_keyring()
+
+        self._patchers = [
+            patch.object(cfg_mod, "get_config_dir", return_value=self.config_dir),
+            patch.object(cfg_mod, "get_data_dir", return_value=self.data_dir),
+        ]
+        for p in self._patchers:
+            p.start()
+
+    def tearDown(self):
+        keyring.set_keyring(self._prev_keyring)
+        for p in reversed(self._patchers):
+            p.stop()
+        self._tmpdir.cleanup()
+
+    def test_locked_keyring_keeps_token_in_settings_json_with_0600_and_exposes_warning(self):
+        """Keyring bloqueado mantém o PAT em settings.json (0600), expõe aviso e preserva ao recarregar."""
+        keyring.set_keyring(_LockedKeyringBackend())
+        self.assertTrue(cfg_mod.is_keyring_available())
+
+        cfg = ConfigManager()
+        self.assertTrue(cfg.update({"github_token": "ghp_locked_token"}))
+        self.assertEqual(cfg.get("github_token"), "ghp_locked_token")
+
+        settings_path = self.config_dir / "settings.json"
+        saved = json.loads(settings_path.read_text(encoding="utf-8"))
+        self.assertEqual(saved["github_token"], "ghp_locked_token")
+        self.assertEqual(settings_path.stat().st_mode & 0o777, 0o600)
+
+        warnings = getattr(cfg, "last_write_warnings", [])
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("cofre de senhas", warnings[0].lower())
+
+        # Gravar outra configuração depois preserva o token de fallback e limpa avisos antigos
+        self.assertTrue(cfg.set("theme", "light"))
+        self.assertEqual(cfg.last_write_warnings, [])
+        self.assertEqual(cfg.get("github_token"), "ghp_locked_token")
+        saved_after = json.loads(settings_path.read_text(encoding="utf-8"))
+        self.assertEqual(saved_after["github_token"], "ghp_locked_token")
+
+        # Recarregar ConfigManager com o keyring ainda bloqueado preserva o token
+        reloaded = ConfigManager()
+        self.assertEqual(reloaded.get("github_token"), "ghp_locked_token")
+        saved_reloaded = json.loads(settings_path.read_text(encoding="utf-8"))
+        self.assertEqual(saved_reloaded["github_token"], "ghp_locked_token")
+
+        # Limpar o token com string vazia limpa o arquivo e não gera aviso
+        self.assertTrue(reloaded.update({"github_token": ""}))
+        self.assertEqual(reloaded.get("github_token"), "")
+        self.assertEqual(reloaded.last_write_warnings, [])
+        saved_cleared = json.loads(settings_path.read_text(encoding="utf-8"))
+        self.assertEqual(saved_cleared["github_token"], "")
+
+    def test_working_keyring_keeps_token_out_of_json_and_empty_clears_both(self):
+        """Keyring operacional grava o PAT fora de settings.json e token vazio limpa ambos."""
+        backend = _MemoryKeyringBackend()
+        keyring.set_keyring(backend)
+        self.assertTrue(cfg_mod.is_keyring_available())
+
+        cfg = ConfigManager()
+        self.assertTrue(cfg.update({"github_token": "ghp_keyring_ok"}))
+        self.assertEqual(cfg.get("github_token"), "ghp_keyring_ok")
+        self.assertEqual(cfg.last_write_warnings, [])
+        self.assertEqual(backend.store.get((cfg_mod.KEYRING_SERVICE_NAME, "github_token")), "ghp_keyring_ok")
+
+        settings_path = self.config_dir / "settings.json"
+        saved = json.loads(settings_path.read_text(encoding="utf-8"))
+        self.assertEqual(saved["github_token"], "")
+
+        reloaded = ConfigManager()
+        self.assertEqual(reloaded.get("github_token"), "ghp_keyring_ok")
+
+        self.assertTrue(reloaded.update({"github_token": ""}))
+        self.assertEqual(reloaded.get("github_token"), "")
+        self.assertNotIn((cfg_mod.KEYRING_SERVICE_NAME, "github_token"), backend.store)
+        saved_cleared = json.loads(settings_path.read_text(encoding="utf-8"))
+        self.assertEqual(saved_cleared["github_token"], "")
+
+    def test_reload_migrates_fallback_token_when_keyring_unlocks(self):
+        """Após salvar em fallback com keyring bloqueado, recarregar com keyring livre migra o PAT."""
+        keyring.set_keyring(_LockedKeyringBackend())
+        cfg = ConfigManager()
+        self.assertTrue(cfg.update({"github_token": "ghp_migrate_me"}))
+
+        backend = _MemoryKeyringBackend()
+        keyring.set_keyring(backend)
+        reloaded = ConfigManager()
+        self.assertEqual(reloaded.get("github_token"), "ghp_migrate_me")
+        self.assertEqual(backend.store.get((cfg_mod.KEYRING_SERVICE_NAME, "github_token")), "ghp_migrate_me")
+        saved = json.loads((self.config_dir / "settings.json").read_text(encoding="utf-8"))
+        self.assertEqual(saved["github_token"], "")
+
+    def test_save_settings_omits_token_only_when_actually_in_keyring(self):
+        """save_settings() só omite github_token do JSON quando ele está efetivamente no keyring."""
+        keyring.set_keyring(_LockedKeyringBackend())
+        cfg = ConfigManager()
+        cfg.settings["github_token"] = "ghp_direct"
+        self.assertTrue(cfg.save_settings())
+        saved = json.loads((self.config_dir / "settings.json").read_text(encoding="utf-8"))
+        self.assertEqual(saved["github_token"], "ghp_direct")
+
+        backend = _MemoryKeyringBackend()
+        backend.set_password(cfg_mod.KEYRING_SERVICE_NAME, "github_token", "ghp_direct")
+        keyring.set_keyring(backend)
+        cfg2 = ConfigManager()
+        cfg2.settings["github_token"] = "ghp_direct"
+        self.assertTrue(cfg2.save_settings())
+        saved2 = json.loads((self.config_dir / "settings.json").read_text(encoding="utf-8"))
+        self.assertEqual(saved2["github_token"], "")
+
+
+@unittest.skipUnless(HAS_PYSIDE6 and cfg_mod.HAS_KEYRING, "PySide6 ou keyring não disponível neste ambiente")
+class SettingsDialogKeyringWarningTest(unittest.TestCase):
+    """SettingsDialog exibe QMessageBox.warning quando o keyring recusa o PAT."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        base = Path(self._tmpdir.name)
+        self.config_dir = base / "config"
+        self.data_dir = base / "data"
+        self.config_dir.mkdir(parents=True, exist_ok=True)
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        self._prev_keyring = keyring.get_keyring()
+
+        self._patchers = [
+            patch.object(cfg_mod, "get_config_dir", return_value=self.config_dir),
+            patch.object(cfg_mod, "get_data_dir", return_value=self.data_dir),
+        ]
+        for p in self._patchers:
+            p.start()
+
+    def tearDown(self):
+        keyring.set_keyring(self._prev_keyring)
+        for p in reversed(self._patchers):
+            p.stop()
+        self._tmpdir.cleanup()
+
+    def test_settings_dialog_warns_when_keyring_locked_and_preserves_token(self):
+        """Com keyring bloqueado e PAT preenchido, SettingsDialog mostra warning em vez de sucesso puro."""
+        keyring.set_keyring(_LockedKeyringBackend())
+        cfg = ConfigManager()
+        sdlg = SettingsDialog(config_mgr=cfg)
+        self.addCleanup(sdlg.deleteLater)
+        self.addCleanup(sdlg.close)
+
+        sdlg.txt_github_token.setText("ghp_ui_token")
+        with patch("central_nvr.ui.settings_dialog.QMessageBox.warning") as warn_mock, \
+                patch("central_nvr.ui.settings_dialog.QMessageBox.information") as info_mock, \
+                patch.object(sdlg, "accept") as accept_mock:
+            sdlg._save_values()
+
+        warn_mock.assert_called_once()
+        warn_text = warn_mock.call_args[0][2]
+        self.assertEqual(
+            warn_text,
+            "O cofre de senhas do sistema recusou o token; "
+            "ele foi salvo no arquivo de configuração com permissão restrita.",
+        )
+        info_mock.assert_not_called()
+        accept_mock.assert_called_once()
+        self.assertEqual(cfg.get("github_token"), "ghp_ui_token")
+
+    def test_settings_dialog_no_warning_when_token_empty_or_keyring_accepts(self):
+        """Sem PAT ou com keyring funcional, SettingsDialog exibe mensagem normal de sucesso."""
+        keyring.set_keyring(_LockedKeyringBackend())
+        cfg = ConfigManager()
+        sdlg = SettingsDialog(config_mgr=cfg)
+        self.addCleanup(sdlg.deleteLater)
+        self.addCleanup(sdlg.close)
+
+        sdlg.txt_github_token.setText("")
+        with patch("central_nvr.ui.settings_dialog.QMessageBox.warning") as warn_mock, \
+                patch("central_nvr.ui.settings_dialog.QMessageBox.information") as info_mock, \
+                patch.object(sdlg, "accept") as accept_mock:
+            sdlg._save_values()
+
+        warn_mock.assert_not_called()
+        info_mock.assert_called_once()
+        accept_mock.assert_called_once()
+
+        backend = _MemoryKeyringBackend()
+        keyring.set_keyring(backend)
+        sdlg.txt_github_token.setText("ghp_accepted")
+        with patch("central_nvr.ui.settings_dialog.QMessageBox.warning") as warn_mock, \
+                patch("central_nvr.ui.settings_dialog.QMessageBox.information") as info_mock, \
+                patch.object(sdlg, "accept") as accept_mock:
+            sdlg._save_values()
+
+        warn_mock.assert_not_called()
+        info_mock.assert_called_once()
+        accept_mock.assert_called_once()
+        self.assertEqual(cfg.get("github_token"), "ghp_accepted")
+        saved = json.loads((self.config_dir / "settings.json").read_text(encoding="utf-8"))
+        self.assertEqual(saved["github_token"], "")
+
+
 if __name__ == "__main__":
     unittest.main()
