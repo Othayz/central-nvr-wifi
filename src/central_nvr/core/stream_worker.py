@@ -68,29 +68,9 @@ except ImportError:
             return self
 
 from central_nvr.core.camera import DEFAULT_RTSP_TRANSPORT, CameraDevice, ConnectionState, StreamStats
+from central_nvr.core.log_sanitize import sanitize_rtsp_url
 
 logger = logging.getLogger(__name__)
-
-def sanitize_rtsp_url(url: str) -> str:
-    """
-    Ofusca a senha em URLs RTSP para gravação segura em logs.
-
-    Usa o último `@` do trecho após o esquema como fim das credenciais: assim a senha é mascarada
-    mesmo se contiver `/`, `:` ou `@` sem codificação. Na dúvida, mascara a mais (nunca a menos).
-    """
-    if not url:
-        return ""
-    scheme, sep, rest = url.partition("://")
-    if not sep:
-        return url
-    at = rest.rfind("@")
-    if at == -1:
-        return url
-    userinfo, hostpart = rest[:at], rest[at + 1:]
-    if ":" not in userinfo:
-        return url  # Só usuário, sem senha
-    user = userinfo.split(":", 1)[0]
-    return f"{scheme}://{user}:****@{hostpart}"
 
 # Tentar importar bibliotecas de decodificação de vídeo
 HAS_AV = False

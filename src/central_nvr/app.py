@@ -9,6 +9,10 @@ import sys
 
 from central_nvr import __version__
 from central_nvr.core.config import ConfigManager
+from central_nvr.core.log_sanitize import (
+    CredentialSanitizingFilter,
+    CredentialSanitizingFormatter,
+)
 
 
 def parse_arguments() -> argparse.Namespace:
@@ -67,10 +71,17 @@ def apply_cli_overrides(config_mgr: ConfigManager, args: argparse.Namespace) -> 
 
 
 def setup_logging(debug: bool = False):
-    """Configura o sistema de logs da aplicação."""
+    """Configura o sistema de logs da aplicação com mascaramento global de credenciais em URLs."""
     log_level = logging.DEBUG if debug else logging.INFO
     log_format = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
-    logging.basicConfig(level=log_level, format=log_format, datefmt="%H:%M:%S")
+    date_format = "%H:%M:%S"
+    handler = logging.StreamHandler()
+    handler.setFormatter(CredentialSanitizingFormatter(log_format, datefmt=date_format))
+    handler.addFilter(CredentialSanitizingFilter())
+    logging.basicConfig(level=log_level, handlers=[handler])
+    for existing in logging.getLogger().handlers:
+        if not any(isinstance(f, CredentialSanitizingFilter) for f in existing.filters):
+            existing.addFilter(CredentialSanitizingFilter())
 
 
 # Tempo máximo de espera, no encerramento, por threads de rede ainda bloqueadas

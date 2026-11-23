@@ -12,9 +12,37 @@ PyAV, então a URL com credenciais também não aparece na linha de comando de o
 """
 import getpass
 import os
+from pathlib import Path
+import re
 import socket
 import sys
 import urllib.parse
+
+_SRC_DIR = str(Path(__file__).resolve().parent.parent / "src")
+if os.path.isdir(_SRC_DIR) and _SRC_DIR not in sys.path:
+    sys.path.insert(0, _SRC_DIR)
+
+try:
+    from central_nvr.core.log_sanitize import sanitize_url_credentials
+except ImportError:
+    # Fallback autocontido quando o script é executado fora do repositório (sem `src/`).
+    _FALLBACK_URL_RE = re.compile(
+        r"([A-Za-z][A-Za-z0-9+.-]*://[^:\s<>/@]+):[^\s<>]*@"
+    )
+
+    def sanitize_url_credentials(text: str) -> str:
+        """Ofusca `esquema://usuario:senha@` até o último `@` antes de um espaço em branco."""
+        if not text:
+            return ""
+        return _FALLBACK_URL_RE.sub(r"\1:****@", text)
+
+
+def format_rtsp_error(exc: Exception, max_len: int = 120) -> str:
+    """Formata a mensagem de erro do PyAV sem expor credenciais da URL RTSP."""
+    err = sanitize_url_credentials(str(exc)).replace("\n", " ").strip()
+    if not err:
+        return "Sem dados recebidos no tempo limite"
+    return err[:max_len]
 
 def test_port(ip, port, timeout=1.0):
     try:
@@ -116,8 +144,7 @@ def diagnose(ip, password=""):
                 print("     ❌ Credenciais recusadas pela câmera (RTSP 401).")
                 return
             except Exception as e:
-                err = str(e).replace("\n", " ")
-                print(f"     ⚠️  Resposta: {err[:120] if err else 'Sem dados recebidos no tempo limite'}")
+                print(f"     ⚠️  Resposta: {format_rtsp_error(e)}")
 
     print("\n" + "=" * 60)
 
