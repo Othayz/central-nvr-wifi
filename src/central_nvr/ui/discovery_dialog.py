@@ -3,6 +3,7 @@ Diálogo de Descoberta de Rede (WS-Discovery ONVIF e Sondagem de Portas) e Adiç
 """
 import hashlib
 import ipaddress
+import logging
 from typing import Any, Callable, Dict, List, Optional
 
 from PySide6.QtCore import QObject, QThread, Qt, Signal
@@ -33,6 +34,8 @@ from central_nvr.core.onvif_enrich import FALLBACK_WARNING, enrich_from_onvif
 from central_nvr.core.threads import retire_thread
 from central_nvr.scanner.discovery import NetworkScanner
 
+logger = logging.getLogger(__name__)
+
 
 class ScannerWorker(QThread):
     """Worker thread para execução não-bloqueante do escaneamento de rede."""
@@ -58,13 +61,19 @@ class ScannerWorker(QThread):
         self.scanner.stop_scan()
 
     def run(self):
-        devices = self.scanner.scan_network(
-            timeout=self.timeout,
-            enable_port_scan=self.enable_port_scan,
-            on_device_found=lambda dev: self.device_found.emit(dev),
-            on_progress=lambda pct, msg: self.progress_updated.emit(pct, msg),
-        )
-        self.scan_finished.emit(devices)
+        devices: List[Dict[str, Any]] = []
+        try:
+            devices = self.scanner.scan_network(
+                timeout=self.timeout,
+                enable_port_scan=self.enable_port_scan,
+                on_device_found=lambda dev: self.device_found.emit(dev),
+                on_progress=lambda pct, msg: self.progress_updated.emit(pct, msg),
+            )
+        except Exception as e:
+            logger.exception("Erro inesperado durante a varredura de rede")
+            self.scanner.warnings.append(f"Erro durante a varredura de rede: {e}")
+        finally:
+            self.scan_finished.emit(devices)
 
 
 class OnvifEnrichWorker(QThread):

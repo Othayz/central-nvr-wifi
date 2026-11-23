@@ -18,7 +18,7 @@ from PySide6.QtWidgets import QApplication
 from central_nvr.scanner import discovery
 from central_nvr.scanner.discovery import NetworkScanner
 from central_nvr.scanner.interfaces import Ipv4Interface, list_ipv4_interfaces, scan_targets
-from central_nvr.scanner.parser import parse_ws_discovery_matches
+from central_nvr.scanner.parser import parse_ws_discovery_fallback, parse_ws_discovery_matches
 
 TWO_MATCHES = """<?xml version="1.0"?>
 <s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:d="http://schemas.xmlsoap.org/ws/2005/04/discovery">
@@ -49,6 +49,64 @@ class ParserTest(unittest.TestCase):
         for d in parse_ws_discovery_matches(TWO_MATCHES, source_ip="192.168.1.60"):
             scanner._register(d, found.append)
         self.assertEqual(len(found), 2)
+
+    def test_malformed_xaddrs_discarded_without_error(self):
+        """Issue #82: XAddrs malformados ou sem hostname são descartados sem ValueError."""
+        bad_xaddrs = [
+            "http://[::1/onvif/device_service",
+            "http://192.168.1.50:99999/onvif/device_service",
+            "http://192.168.1.50:abc/onvif/device_service",
+            "http:///evil/path",
+        ]
+        for bad in bad_xaddrs:
+            xml_ok = (
+                '<?xml version="1.0"?>'
+                '<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" '
+                'xmlns:d="http://schemas.xmlsoap.org/ws/2005/04/discovery">'
+                f"<s:Body><d:ProbeMatches><d:ProbeMatch><d:XAddrs>{bad}</d:XAddrs>"
+                "</d:ProbeMatch></d:ProbeMatches></s:Body></s:Envelope>"
+            )
+            xml_truncated = f"<d:ProbeMatch><d:XAddrs>{bad}</d:XAddrs>"
+
+            for label, parse_fn, payload in (
+                ("xml", lambda p, ip: parse_ws_discovery_matches(p, source_ip=ip)[0], xml_ok),
+                ("fallback", lambda p, ip: parse_ws_discovery_fallback(p, source_ip=ip), xml_truncated),
+            ):
+                with self.subTest(mode=label, xaddr=bad, with_source_ip=True):
+                    dev = parse_fn(payload, "192.168.1.50")
+                    self.assertIsNotNone(dev)
+                    self.assertEqual(dev["ip"], "192.168.1.50")
+                    self.assertEqual(dev["port"], 80)
+                    self.assertEqual(dev["endpoints"], [])
+                    self.assertEqual(dev["onvif_endpoint"], "http://192.168.1.50:80/onvif/device_service")
+
+                with self.subTest(mode=label, xaddr=bad, with_source_ip=False):
+                    dev = parse_fn(payload, "")
+                    self.assertIsNotNone(dev)
+                    self.assertEqual(dev["ip"], "")
+                    self.assertEqual(dev["endpoints"], [])
+                    self.assertEqual(dev["onvif_endpoint"], "")
+
+    def test_malformed_xaddr_skipped_when_valid_xaddr_follows(self):
+        """Issue #82: XAddr inválido na lista não impede uso do XAddr válido seguinte."""
+        xaddrs = "http://[::1/onvif/device_service http:///evil/path http://192.168.1.50:8080/onvif/device_service"
+        xml_ok = (
+            '<?xml version="1.0"?>'
+            '<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" '
+            'xmlns:d="http://schemas.xmlsoap.org/ws/2005/04/discovery">'
+            f"<s:Body><d:ProbeMatches><d:ProbeMatch><d:XAddrs>{xaddrs}</d:XAddrs>"
+            "</d:ProbeMatch></d:ProbeMatches></s:Body></s:Envelope>"
+        )
+        xml_truncated = f"<d:ProbeMatch><d:XAddrs>{xaddrs}</d:XAddrs>"
+
+        for dev in (
+            parse_ws_discovery_matches(xml_ok, source_ip="192.168.1.50")[0],
+            parse_ws_discovery_fallback(xml_truncated, source_ip="192.168.1.50"),
+        ):
+            self.assertEqual(dev["ip"], "192.168.1.50")
+            self.assertEqual(dev["port"], 8080)
+            self.assertEqual(dev["onvif_endpoint"], "http://192.168.1.50:8080/onvif/device_service")
+            self.assertEqual(dev["endpoints"], ["http://192.168.1.50:8080/onvif/device_service"])
 
 
 class InterfacesTest(unittest.TestCase):
@@ -140,6 +198,93 @@ class ScannerTest(unittest.TestCase):
         self.assertFalse(t.is_alive())
         self.assertLess(time.monotonic() - started, 2.0)
 
+    def test_bad_ws_discovery_packet_does_not_block_next_valid_packet(self):
+        """Issue #82: pacote WS-Discovery ruim é ignorado e o pacote válido seguinte é processado."""
+        interfaces = [_iface("eth0", "192.168.1.5", "255.255.255.0")]
+        bad_packet = (
+            b'<?xml version="1.0"?>'
+            b'<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" '
+            b'xmlns:d="http://schemas.xmlsoap.org/ws/2005/04/discovery">'
+            b"<s:Body><d:ProbeMatches><d:ProbeMatch>"
+            b"<d:XAddrs>http://[::1/onvif/device_service</d:XAddrs>"
+            b"</d:ProbeMatch></d:ProbeMatches></s:Body></s:Envelope>"
+        )
+        valid_packet = TWO_MATCHES.encode("utf-8")
+
+        fake_sock = MagicMock()
+        packets = [
+            (bad_packet, ("192.168.1.99", 3702)),
+            (valid_packet, ("192.168.1.60", 3702)),
+        ]
+        fake_sock.recvfrom.side_effect = packets
+
+        select_calls = {"n": 0}
+
+        def fake_select(rlist, wlist, xlist, timeout):
+            select_calls["n"] += 1
+            if select_calls["n"] <= len(packets):
+                return (rlist, [], [])
+            scanner.stop_scan()
+            return ([], [], [])
+
+        scanner = NetworkScanner()
+        with patch.object(discovery, "list_ipv4_interfaces", return_value=interfaces), \
+                patch.object(NetworkScanner, "_open_probe_socket", return_value=fake_sock), \
+                patch.object(discovery.select, "select", side_effect=fake_select):
+            devices = scanner.scan_network(timeout=1.0, enable_port_scan=False)
+
+        self.assertFalse(scanner.is_scanning)
+        ips = {d["ip"] for d in devices}
+        self.assertIn("192.168.1.60", ips)
+        self.assertEqual([d["name"] for d in devices if d["ip"] == "192.168.1.60"], ["Canal 1", "Canal 2"])
+
+    def test_parser_exception_in_ws_discovery_loop_is_isolated(self):
+        """Issue #82: exceção inesperada no parser de um pacote não interrompe a varredura."""
+        interfaces = [_iface("eth0", "192.168.1.5", "255.255.255.0")]
+        fake_sock = MagicMock()
+        packets = [
+            (b"<bad/>", ("192.168.1.99", 3702)),
+            (TWO_MATCHES.encode("utf-8"), ("192.168.1.60", 3702)),
+        ]
+        fake_sock.recvfrom.side_effect = packets
+
+        real_parse = parse_ws_discovery_matches
+        parse_calls = {"n": 0}
+
+        def flaky_parse(xml_str, source_ip=""):
+            parse_calls["n"] += 1
+            if parse_calls["n"] == 1:
+                raise ValueError("pacote corrompido simulado")
+            return real_parse(xml_str, source_ip=source_ip)
+
+        select_calls = {"n": 0}
+
+        def fake_select(rlist, wlist, xlist, timeout):
+            select_calls["n"] += 1
+            if select_calls["n"] <= len(packets):
+                return (rlist, [], [])
+            scanner.stop_scan()
+            return ([], [], [])
+
+        scanner = NetworkScanner()
+        with patch.object(discovery, "list_ipv4_interfaces", return_value=interfaces), \
+                patch.object(NetworkScanner, "_open_probe_socket", return_value=fake_sock), \
+                patch.object(discovery.select, "select", side_effect=fake_select), \
+                patch.object(discovery, "parse_ws_discovery_matches", side_effect=flaky_parse):
+            devices = scanner.scan_network(timeout=1.0, enable_port_scan=False)
+
+        self.assertFalse(scanner.is_scanning)
+        self.assertEqual(len(devices), 2)
+        self.assertEqual([d["name"] for d in devices], ["Canal 1", "Canal 2"])
+
+    def test_is_scanning_resets_to_false_on_unexpected_error(self):
+        """Issue #82: _is_scanning volta para False mesmo se ocorrer erro inesperado."""
+        scanner = NetworkScanner()
+        with patch.object(discovery, "list_ipv4_interfaces", side_effect=RuntimeError("falha de rede")):
+            with self.assertRaises(RuntimeError):
+                scanner.scan_network(timeout=0.1)
+        self.assertFalse(scanner.is_scanning)
+
 
 class DialogLifecycleTest(unittest.TestCase):
     @classmethod
@@ -168,6 +313,32 @@ class DialogLifecycleTest(unittest.TestCase):
                 dialog.deleteLater()
             release.set()
             self.assertTrue(drain_retired_threads(5000))
+
+    def test_scanner_worker_emits_scan_finished_and_unlocks_ui_on_error(self):
+        """Issue #82: exceção em scan_network() ainda emite scan_finished e destrava o diálogo."""
+        from central_nvr.ui.discovery_dialog import DiscoveryDialog
+
+        dialog = DiscoveryDialog()
+        self.addCleanup(dialog.deleteLater)
+        self.addCleanup(dialog.close)
+
+        finished_payloads = []
+        orig_on_finished = dialog._on_scan_finished
+
+        def track_finished(devices):
+            finished_payloads.append(devices)
+            orig_on_finished(devices)
+
+        dialog._on_scan_finished = track_finished
+        with patch.object(NetworkScanner, "scan_network", side_effect=ValueError("URL inválida")):
+            dialog._toggle_scan()
+            worker = dialog.worker
+            self.assertTrue(worker.wait(5000))
+            self.app.processEvents()
+
+        self.assertEqual(finished_payloads, [[]])
+        self.assertEqual(dialog.btn_scan.text(), "🔍 Iniciar Varredura de Rede")
+        self.assertIn("URL inválida", dialog.lbl_scan_status.text())
 
 
 if __name__ == "__main__":
