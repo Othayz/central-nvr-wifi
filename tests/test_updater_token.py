@@ -3,7 +3,9 @@
 Testes do token do GitHub no download de assets (Issue #19): URL de API do asset com token,
 token restrito aos hosts do GitHub (comparando hostname) e a mesma regra na busca do checksum.
 """
+import json
 import os
+from pathlib import Path
 import sys
 import tempfile
 import unittest
@@ -11,6 +13,7 @@ from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
 
+import central_nvr.core.config as cfg_mod
 from central_nvr.core.updater import (
     ReleaseAsset,
     ReleaseInfo,
@@ -19,6 +22,7 @@ from central_nvr.core.updater import (
     get_expected_sha256_for_asset,
     github_auth_headers,
     preferred_download_url,
+    resolve_github_token,
 )
 
 TOKEN = "ghp_test_token"
@@ -112,6 +116,46 @@ class ChecksumTokenTest(unittest.TestCase):
         with patch("requests.get", return_value=resp) as get:
             get_expected_sha256_for_asset(self._release(sha_asset), _asset().name, token=TOKEN)
         self.assertNotIn("Authorization", get.call_args[1]["headers"])
+
+
+class ResolveGithubTokenPrecedenceTest(unittest.TestCase):
+    """Precedência de resolve_github_token: explícito -> GITHUB_TOKEN -> settings.json -> keyring."""
+
+    def test_settings_json_token_takes_precedence_over_readable_keyring(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_dir = Path(tmp)
+            (cfg_dir / "settings.json").write_text(
+                json.dumps({"github_token": "ghp_novo_arquivo"}),
+                encoding="utf-8",
+            )
+            with patch.dict(os.environ, {"GITHUB_TOKEN": ""}, clear=False), \
+                    patch.object(cfg_mod, "get_config_dir", return_value=cfg_dir), \
+                    patch.object(cfg_mod, "is_keyring_available", return_value=True), \
+                    patch.object(cfg_mod, "get_keyring_pat", return_value="ghp_antigo_keyring"):
+                self.assertEqual(resolve_github_token(), "ghp_novo_arquivo")
+
+    def test_env_token_takes_precedence_over_settings_json_and_keyring(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_dir = Path(tmp)
+            (cfg_dir / "settings.json").write_text(
+                json.dumps({"github_token": "ghp_novo_arquivo"}),
+                encoding="utf-8",
+            )
+            with patch.dict(os.environ, {"GITHUB_TOKEN": "ghp_env"}, clear=False), \
+                    patch.object(cfg_mod, "get_config_dir", return_value=cfg_dir), \
+                    patch.object(cfg_mod, "is_keyring_available", return_value=True), \
+                    patch.object(cfg_mod, "get_keyring_pat", return_value="ghp_antigo_keyring"):
+                self.assertEqual(resolve_github_token(), "ghp_env")
+
+    def test_falls_back_to_keyring_when_settings_json_has_no_token(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_dir = Path(tmp)
+            (cfg_dir / "settings.json").write_text(json.dumps({"github_token": ""}), encoding="utf-8")
+            with patch.dict(os.environ, {"GITHUB_TOKEN": ""}, clear=False), \
+                    patch.object(cfg_mod, "get_config_dir", return_value=cfg_dir), \
+                    patch.object(cfg_mod, "is_keyring_available", return_value=True), \
+                    patch.object(cfg_mod, "get_keyring_pat", return_value="ghp_do_keyring"):
+                self.assertEqual(resolve_github_token(), "ghp_do_keyring")
 
 
 if __name__ == "__main__":

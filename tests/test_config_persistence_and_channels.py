@@ -706,6 +706,23 @@ if cfg_mod.HAS_KEYRING:
                 raise keyring.errors.PasswordDeleteError("não encontrado")
             del self.store[(service, username)]
 
+    class _ReadOnlyKeyringBackend(keyring.backend.KeyringBackend):
+        """Backend com leitura funcional, mas gravação e remoção recusadas (KeyringLocked)."""
+
+        priority = 10
+
+        def __init__(self, initial=None):
+            self.store = dict(initial or {})
+
+        def get_password(self, service, username):
+            return self.store.get((service, username))
+
+        def set_password(self, service, username, password):
+            raise keyring.errors.KeyringLocked("coleção bloqueada para escrita")
+
+        def delete_password(self, service, username):
+            raise keyring.errors.KeyringLocked("coleção bloqueada para remoção")
+
 
 @unittest.skipUnless(cfg_mod.HAS_KEYRING, "keyring não disponível neste ambiente")
 class GithubTokenKeyringFallbackTest(unittest.TestCase):
@@ -764,12 +781,22 @@ class GithubTokenKeyringFallbackTest(unittest.TestCase):
         saved_reloaded = json.loads(settings_path.read_text(encoding="utf-8"))
         self.assertEqual(saved_reloaded["github_token"], "ghp_locked_token")
 
-        # Limpar o token com string vazia limpa o arquivo e não gera aviso
+        # Limpar o token existente com o keyring bloqueado limpa o arquivo e expõe aviso da remoção recusada
         self.assertTrue(reloaded.update({"github_token": ""}))
         self.assertEqual(reloaded.get("github_token"), "")
-        self.assertEqual(reloaded.last_write_warnings, [])
+        self.assertEqual(
+            reloaded.last_write_warnings,
+            [
+                "O cofre de senhas do sistema recusou a remoção do token do GitHub; "
+                "ele pode voltar a ser usado quando o cofre for desbloqueado."
+            ],
+        )
         saved_cleared = json.loads(settings_path.read_text(encoding="utf-8"))
         self.assertEqual(saved_cleared["github_token"], "")
+
+        # Sem token anterior, enviar github_token="" não gera aviso mesmo com keyring bloqueado
+        self.assertTrue(reloaded.update({"github_token": ""}))
+        self.assertEqual(reloaded.last_write_warnings, [])
 
     def test_working_keyring_keeps_token_out_of_json_and_empty_clears_both(self):
         """Keyring operacional grava o PAT fora de settings.json e token vazio limpa ambos."""
@@ -827,6 +854,117 @@ class GithubTokenKeyringFallbackTest(unittest.TestCase):
         self.assertTrue(cfg2.save_settings())
         saved2 = json.loads((self.config_dir / "settings.json").read_text(encoding="utf-8"))
         self.assertEqual(saved2["github_token"], "")
+
+    def test_file_token_takes_precedence_over_readable_keyring_token(self):
+        """Token novo em settings.json prevalece sobre PAT antigo legível no keyring em get_persisted e resolve_github_token."""
+        backend = _ReadOnlyKeyringBackend({(cfg_mod.KEYRING_SERVICE_NAME, "github_token"): "ghp_old"})
+        keyring.set_keyring(backend)
+
+        cfg = ConfigManager()
+        self.assertEqual(cfg.get_persisted("github_token"), "ghp_old")
+        self.assertTrue(cfg.update({"github_token": "ghp_new"}))
+        self.assertEqual(cfg.get_persisted("github_token"), "ghp_new")
+
+        if HAS_PYSIDE6:
+            with patch.dict(os.environ, {"GITHUB_TOKEN": ""}, clear=False):
+                self.assertEqual(resolve_github_token(), "ghp_new")
+
+        # Após recarregar do disco, ambos continuam devolvendo o PAT novo do arquivo
+        reloaded = ConfigManager()
+        self.assertEqual(reloaded.get_persisted("github_token"), "ghp_new")
+        if HAS_PYSIDE6:
+            with patch.dict(os.environ, {"GITHUB_TOKEN": ""}, clear=False):
+                self.assertEqual(resolve_github_token(), "ghp_new")
+
+    def test_save_settings_keeps_new_direct_token_when_different_from_pat_synced(self):
+        """Após sincronizar 'ghp_a' no keyring, gravar 'ghp_b' em settings + save_settings() preserva 'ghp_b' no JSON."""
+        backend = _MemoryKeyringBackend()
+        keyring.set_keyring(backend)
+
+        cfg = ConfigManager()
+        self.assertTrue(cfg.update({"github_token": "ghp_a"}))
+        self.assertEqual(cfg._pat_synced, "ghp_a")
+        saved_a = json.loads((self.config_dir / "settings.json").read_text(encoding="utf-8"))
+        self.assertEqual(saved_a["github_token"], "")
+
+        cfg.settings["github_token"] = "ghp_b"
+        self.assertTrue(cfg.save_settings())
+        saved_b = json.loads((self.config_dir / "settings.json").read_text(encoding="utf-8"))
+        self.assertEqual(saved_b["github_token"], "ghp_b")
+
+        # Já se settings["github_token"] for igual ao _pat_synced, continua sendo omitido
+        cfg.settings["github_token"] = "ghp_a"
+        self.assertTrue(cfg.save_settings())
+        saved_same = json.loads((self.config_dir / "settings.json").read_text(encoding="utf-8"))
+        self.assertEqual(saved_same["github_token"], "")
+
+    def test_token_removal_warnings_for_locked_vs_missing_keyring_entries(self):
+        """Remoção com KeyringLocked avisa só se havia token; PasswordDeleteError é tratado como sucesso sem aviso."""
+        expected_msg = (
+            "O cofre de senhas do sistema recusou a remoção do token do GitHub; "
+            "ele pode voltar a ser usado quando o cofre for desbloqueado."
+        )
+
+        # 1. Havia token legível no keyring e delete_password lança KeyringLocked -> aviso exposto
+        ro_backend = _ReadOnlyKeyringBackend({(cfg_mod.KEYRING_SERVICE_NAME, "github_token"): "ghp_antigo"})
+        keyring.set_keyring(ro_backend)
+        cfg = ConfigManager()
+        self.assertEqual(cfg.get_persisted("github_token"), "ghp_antigo")
+        self.assertFalse(cfg_mod.set_keyring_pat(""))
+        self.assertTrue(cfg.update({"github_token": ""}))
+        self.assertEqual(cfg.last_write_warnings, [expected_msg])
+
+        # 2. Sem token anterior e delete_password lança KeyringLocked -> nenhum aviso
+        keyring.set_keyring(_LockedKeyringBackend())
+        cfg_empty = ConfigManager()
+        self.assertEqual(cfg_empty.get_persisted("github_token"), "")
+        self.assertTrue(cfg_empty.update({"github_token": ""}))
+        self.assertEqual(cfg_empty.last_write_warnings, [])
+
+        # 3. delete_password lança PasswordDeleteError ("não existia") -> sucesso, sem aviso
+        mem_backend = _MemoryKeyringBackend()
+        keyring.set_keyring(mem_backend)
+        self.assertTrue(cfg_mod.set_keyring_pat(""))
+        cfg_missing = ConfigManager()
+        cfg_missing.settings["github_token"] = "ghp_so_no_arquivo"
+        self.assertTrue(cfg_missing.update({"github_token": ""}))
+        self.assertEqual(cfg_missing.last_write_warnings, [])
+        self.assertIsNone(cfg_missing._pat_synced)
+
+    def test_rollback_restores_pat_synced_and_clears_warnings_on_oserror(self):
+        """Falha de save_settings() com OSError em update() e set() restaura _pat_synced e limpa last_write_warnings."""
+        backend = _MemoryKeyringBackend()
+        keyring.set_keyring(backend)
+        cfg = ConfigManager()
+        self.assertTrue(cfg.update({"github_token": "ghp_inicial"}))
+        self.assertEqual(cfg._pat_synced, "ghp_inicial")
+
+        # Falha com keyring livre alterando _pat_synced: rollback restaura "ghp_inicial"
+        with patch.object(cfg_mod, "_secure_write_json", side_effect=OSError("disco cheio")):
+            self.assertFalse(cfg.update({"github_token": "ghp_novo_upd"}))
+        self.assertEqual(cfg._pat_synced, "ghp_inicial")
+        self.assertEqual(cfg.last_write_warnings, [])
+        self.assertEqual(cfg.settings["github_token"], "")
+
+        with patch.object(cfg_mod, "_secure_write_json", side_effect=OSError("disco cheio")):
+            self.assertFalse(cfg.set("github_token", "ghp_novo_set"))
+        self.assertEqual(cfg._pat_synced, "ghp_inicial")
+        self.assertEqual(cfg.last_write_warnings, [])
+        self.assertEqual(cfg.settings["github_token"], "")
+
+        # Falha com keyring bloqueado (gera aviso em _store) em update() e set(): limpa avisos e restaura estado
+        keyring.set_keyring(_LockedKeyringBackend())
+        with patch.object(cfg_mod, "_secure_write_json", side_effect=OSError("disco cheio")):
+            self.assertFalse(cfg.update({"github_token": "ghp_inicial"}))
+        self.assertEqual(cfg._pat_synced, "ghp_inicial")
+        self.assertEqual(cfg.last_write_warnings, [])
+        self.assertEqual(cfg.settings["github_token"], "")
+
+        with patch.object(cfg_mod, "_secure_write_json", side_effect=OSError("disco cheio")):
+            self.assertFalse(cfg.set("github_token", "ghp_inicial"))
+        self.assertEqual(cfg._pat_synced, "ghp_inicial")
+        self.assertEqual(cfg.last_write_warnings, [])
+        self.assertEqual(cfg.settings["github_token"], "")
 
 
 @unittest.skipUnless(HAS_PYSIDE6 and cfg_mod.HAS_KEYRING, "PySide6 ou keyring não disponível neste ambiente")
