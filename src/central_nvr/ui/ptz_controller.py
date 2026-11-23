@@ -45,7 +45,7 @@ class PTZControllerWidget(QWidget):
     _client_ready = Signal(int, object, object)    # (geração, chave, cliente ou None)
     _presets_ready = Signal(int, list)             # (geração, presets)
     _preset_saved_gen = Signal(int, str, str)      # (geração, nome, token)
-    _move_finished = Signal(object)                # (chave da câmera cujo ContinuousMove concluiu)
+    _move_finished = Signal(object, object)        # (chave da câmera, fila serial cujo ContinuousMove concluiu)
 
     # Intervalo de renovação do ContinuousMove (o Timeout enviado é de 2 s)
     MOVE_RENEWAL_MS = 1000
@@ -454,8 +454,10 @@ class PTZControllerWidget(QWidget):
         self.ptz_speed = value / 10.0
         self.lbl_speed_val.setText(f"{int(self.ptz_speed * 100)}%")
 
-    def _on_move_finished(self, key: object):
+    def _on_move_finished(self, key: object, queue_obj: object):
         """Slot (thread da interface): libera o contador de ContinuousMove em voo da câmera."""
+        if self._queues.get(key) is not queue_obj:
+            return
         count = self._moves_in_flight.get(key, 0)
         if count <= 1:
             self._moves_in_flight.pop(key, None)
@@ -466,15 +468,16 @@ class PTZControllerWidget(QWidget):
         if not self.camera or not self.client:
             return
         key = self._client_key(self.camera)
+        queue_obj = self._queue_for(key)
         self._moves_in_flight[key] = self._moves_in_flight.get(key, 0) + 1
         enqueued = self._submit(
             lambda c: c.ptz_continuous_move(pan_speed=pan, tilt_speed=tilt, zoom_speed=zoom),
             success_msg,
             failure_msg,
-            on_done=lambda k=key: self._move_finished.emit(k),
+            on_done=lambda k=key, q=queue_obj: self._move_finished.emit(k, q),
         )
         if not enqueued:
-            self._on_move_finished(key)
+            self._on_move_finished(key, queue_obj)
 
     def _begin_move(self, pan: float, tilt: float, zoom: float, success_msg: str, failure_msg: str):
         if not self.camera or not self.client:
