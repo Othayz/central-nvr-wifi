@@ -271,6 +271,7 @@ class StreamWorker(QThread):
         """Anuncia transições de pausa a partir da thread do worker."""
         if self._is_paused and not self._paused_announced:
             self._paused_announced = True
+            self._clear_motion_state()
             self.state_changed.emit(ConnectionState.PAUSED, "Pausada (fora da tela)")
         elif not self._is_paused and self._paused_announced:
             self._paused_announced = False

@@ -5,6 +5,7 @@ Testes da Issue #33: a imagem parada depois de uma queda não pode passar por "a
 import os
 import sys
 import time
+import types
 import unittest
 from unittest.mock import patch
 
@@ -147,6 +148,80 @@ class SignalLossTest(unittest.TestCase):
         self.assertTrue(self.view.lbl_motion.isHidden())
         self.assertNotIn("#EF4444", self.view.styleSheet())
 
+    def test_motion_alert_reappears_when_frames_resume_after_stall(self):
+        """PR #99: ao voltar do travamento na mesma conexão, o alerta reflete o estado do worker sem novo sinal."""
+        self._go_live()
+        self.view._on_motion_detected("c1", True)
+        self.assertFalse(self.view.lbl_motion.isHidden())
+        self.assertIn("#EF4444", self.view.styleSheet())
+
+        last = self.view._last_frame_monotonic
+        self.view._check_stall(now=last + self.view.STALL_TIMEOUT_SEC + 0.1)
+        self.assertFalse(self.view.is_live())
+        self.assertTrue(self.view.lbl_motion.isHidden())
+        self.assertNotIn("#EF4444", self.view.styleSheet())
+
+        # Frames retornam na mesma conexão sem novo sinal motion_detected do worker
+        self.view._on_frame_received(_frame())
+        self.assertTrue(self.view.is_live())
+        self.assertFalse(self.view.lbl_motion.isHidden())
+        self.assertIn("#EF4444", self.view.styleSheet())
+
+    def test_motion_alert_cleared_on_stop(self):
+        """PR #99: stop() limpa _worker_motion e esconde o alerta mesmo com sinais desconectados."""
+        self._go_live()
+        self.view._on_motion_detected("c1", True)
+        self.assertFalse(self.view.lbl_motion.isHidden())
+        self.assertIn("#EF4444", self.view.styleSheet())
+
+        self.view.stop()
+        self.assertFalse(self.view._worker_motion)
+        self.assertTrue(self.view.lbl_motion.isHidden())
+        self.assertNotIn("#EF4444", self.view.styleSheet())
+
+        # Reconectar sem novo movimento não reexibe o alerta antigo
+        self._go_live()
+        self.assertTrue(self.view.lbl_motion.isHidden())
+        self.assertNotIn("#EF4444", self.view.styleSheet())
+
+    def test_hiding_motion_alert_preserves_selection_border(self):
+        """PR #99: com a câmera selecionada, exibir ou esconder o alerta mantém a borda de seleção (#38BDF8)."""
+        self._go_live()
+        self.view.set_selected(True)
+        self.assertIn("#38BDF8", self.view.styleSheet())
+
+        self.view._on_motion_detected("c1", True)
+        self.assertFalse(self.view.lbl_motion.isHidden())
+        self.assertIn("#38BDF8", self.view.styleSheet())
+        self.assertNotIn("#EF4444", self.view.styleSheet())
+
+        # Esconder via travamento, saída de STREAMING, sinal False e stop preserva #38BDF8
+        last = self.view._last_frame_monotonic
+        self.view._check_stall(now=last + self.view.STALL_TIMEOUT_SEC + 0.1)
+        self.assertTrue(self.view.lbl_motion.isHidden())
+        self.assertIn("#38BDF8", self.view.styleSheet())
+
+        self.view._on_frame_received(_frame())
+        self.assertFalse(self.view.lbl_motion.isHidden())
+        self.assertIn("#38BDF8", self.view.styleSheet())
+
+        self.view._on_state_changed(ConnectionState.ERROR, "Offline")
+        self.assertTrue(self.view.lbl_motion.isHidden())
+        self.assertIn("#38BDF8", self.view.styleSheet())
+
+        self._go_live()
+        self.view._on_motion_detected("c1", True)
+        self.view.stop()
+        self.assertTrue(self.view.lbl_motion.isHidden())
+        self.assertIn("#38BDF8", self.view.styleSheet())
+
+        # Ao desmarcar com movimento ativo, a borda vermelha assume
+        self._go_live()
+        self.view._on_motion_detected("c1", True)
+        self.view.set_selected(False)
+        self.assertFalse(self.view.lbl_motion.isHidden())
+        self.assertIn("#EF4444", self.view.styleSheet())
+
 
 class LastFrameTimeTest(unittest.TestCase):
     def test_worker_updates_last_frame_time(self):
@@ -268,6 +343,99 @@ class MotionCleanupAndMemoryTest(unittest.TestCase):
 
         worker._reset_stats()
         self.assertIsNone(worker._prev_sample_matrix)
+
+    @unittest.skipUnless(sw.HAS_AV, "PyAV não disponível neste ambiente")
+    def test_pyav_pause_clears_motion_state_and_resume_detects_new_motion(self):
+        """PR #99: pausa no PyAV zera movimento/cooldown/amostra e retomada volta a detectar movimento."""
+        worker = self._worker(hw_accel="cpu")
+        worker._is_running = True
+        events = []
+        states = []
+        worker.motion_detected.connect(lambda cid, active: events.append((cid, active)))
+        worker.state_changed.connect(lambda st, msg: states.append(st))
+
+        dark = np.zeros((36, 64, 3), dtype=np.uint8)
+        bright = np.full((36, 64, 3), 255, dtype=np.uint8)
+
+        class FakeFrame:
+            def __init__(self, rgb):
+                self._rgb = rgb
+
+            def to_ndarray(self, format="rgb24"):
+                return self._rgb
+
+        class FakePacket:
+            def __init__(self, rgb, is_keyframe=True):
+                self.size = 512
+                self.is_keyframe = is_keyframe
+                self._rgb = rgb
+
+            def decode(self):
+                return [FakeFrame(self._rgb)]
+
+        paused_snapshot = {}
+        post_resume_before_motion = {}
+
+        class FakeContainer:
+            def __init__(self):
+                stream = types.SimpleNamespace(
+                    type="video",
+                    thread_type="SLICE",
+                    codec_context=types.SimpleNamespace(name="h264", is_hwaccel=False),
+                )
+                self.streams = [stream]
+                self.closed = False
+
+            def demux(self, stream):
+                # 1) Gera movimento ativo antes da pausa (dark -> bright)
+                for _ in range(3):
+                    yield FakePacket(dark)
+                for _ in range(3):
+                    yield FakePacket(bright)
+
+                # 2) Entra em pausa na mesma sessão PyAV
+                worker.pause()
+                yield FakePacket(bright, is_keyframe=False)
+
+                # Captura estado já em pausa (após _update_pause_state rodar no pacote anterior)
+                paused_snapshot["events"] = list(events)
+                paused_snapshot["motion_active"] = worker._motion_active
+                paused_snapshot["cooldown"] = worker._motion_cooldown
+                paused_snapshot["prev_sample"] = worker._prev_sample_matrix
+                paused_snapshot["stats_motion"] = worker.stats.motion_detected
+
+                # 3) Retoma: 3 frames dark não devem comparar com bright de antes da pausa
+                worker.resume()
+                for _ in range(3):
+                    yield FakePacket(dark, is_keyframe=True)
+                post_resume_before_motion["events"] = list(events)
+
+                # 4) Movimento real após a retomada volta a emitir motion_detected(True)
+                for _ in range(3):
+                    yield FakePacket(bright, is_keyframe=True)
+                worker.request_stop()
+
+            def close(self):
+                self.closed = True
+
+        container = FakeContainer()
+        with patch.object(sw.av, "open", return_value=container):
+            outcome = worker._run_pyav_stream("rtsp://192.0.2.1:554/onvif1", transport="tcp")
+
+        self.assertEqual(outcome, StreamOutcome.STOPPED)
+        self.assertTrue(container.closed)
+        self.assertIn(ConnectionState.PAUSED, states)
+        self.assertEqual(paused_snapshot["events"], [("c1", True), ("c1", False)])
+        self.assertFalse(paused_snapshot["motion_active"])
+        self.assertEqual(paused_snapshot["cooldown"], 0)
+        self.assertIsNone(paused_snapshot["prev_sample"])
+        self.assertFalse(paused_snapshot["stats_motion"])
+        self.assertEqual(
+            post_resume_before_motion["events"],
+            [("c1", True), ("c1", False)],
+            "o primeiro frame pós-retomada não deve ser comparado com a amostra pré-pausa",
+        )
+        self.assertEqual(events, [("c1", True), ("c1", False), ("c1", True)])
 
 
 if __name__ == "__main__":

@@ -116,6 +116,7 @@ class CameraViewWidget(QFrame):
         
         self.is_selected = False
         self.is_maximized_view = False
+        self._worker_motion = False
         self.current_frame: Optional[QImage] = None
         self.stats = StreamStats()
         self.connection_state = ConnectionState.DISCONNECTED
@@ -473,8 +474,7 @@ class CameraViewWidget(QFrame):
             self.worker.motion_detection = options.motion_detection
             self.worker.reconnect_interval_sec = max(0.5, float(options.reconnect_interval_sec))
             self.worker.auto_reconnect = options.auto_reconnect
-        if not options.motion_detection and hasattr(self, "lbl_motion"):
-            self.lbl_motion.hide()
+        self._refresh_motion_alert()
         fullscreen = getattr(self, "_fullscreen_win", None)
         if fullscreen is not None:
             fullscreen.snapshot_dir = options.resolved_snapshot_dir()
@@ -553,13 +553,7 @@ class CameraViewWidget(QFrame):
                 }
             """)
         else:
-            self.setStyleSheet("""
-                QFrame#cameraContainer {
-                    background-color: #050B14;
-                    border: 1px solid #1E293B;
-                    border-radius: 6px;
-                }
-            """)
+            self._refresh_motion_alert()
         self.update()
 
     def _on_frame_received(self, q_img: QImage):
@@ -620,28 +614,36 @@ class CameraViewWidget(QFrame):
         self.lbl_metrics.setText(" | ".join(parts))
 
     def _on_motion_detected(self, camera_id: str, is_detected: bool):
-        """Atualiza o alerta visual de detecção de movimento em tempo real."""
+        """Registra o último estado de movimento informado pelo worker e atualiza o alerta visual."""
+        self._worker_motion = bool(is_detected)
+        self._refresh_motion_alert()
+
+    def _refresh_motion_alert(self):
+        """Exibe o alerta de movimento apenas quando ativo no worker, habilitado nas opções e ao vivo."""
+        show_alert = self._worker_motion and self.options.motion_detection and self.is_live()
         if hasattr(self, "lbl_motion"):
-            if is_detected and self.options.motion_detection and self.is_live():
+            if show_alert:
                 self.lbl_motion.show()
-                if not self.is_selected:
-                    self.setStyleSheet("""
-                        QFrame#cameraContainer {
-                            background-color: #050B14;
-                            border: 2px solid #EF4444;
-                            border-radius: 6px;
-                        }
-                    """)
             else:
                 self.lbl_motion.hide()
-                if not self.is_selected:
-                    self.setStyleSheet("""
-                        QFrame#cameraContainer {
-                            background-color: #050B14;
-                            border: 1px solid #1E293B;
-                            border-radius: 6px;
-                        }
-                    """)
+        if self.is_selected:
+            return
+        if show_alert:
+            self.setStyleSheet("""
+                QFrame#cameraContainer {
+                    background-color: #050B14;
+                    border: 2px solid #EF4444;
+                    border-radius: 6px;
+                }
+            """)
+        else:
+            self.setStyleSheet("""
+                QFrame#cameraContainer {
+                    background-color: #050B14;
+                    border: 1px solid #1E293B;
+                    border-radius: 6px;
+                }
+            """)
 
     def _toggle_stream_profile(self):
         """Alterna entre MainStream (HD) e SubStream (SD) para controle de banda."""
@@ -693,6 +695,7 @@ class CameraViewWidget(QFrame):
         fullscreen = getattr(self, "_fullscreen_win", None)
         if fullscreen is not None:
             fullscreen.set_live(live, self.signal_warning())
+        self._refresh_motion_alert()
         self.update()
 
     def _publish_display_state(self, label: str):
@@ -725,7 +728,6 @@ class CameraViewWidget(QFrame):
             self.lbl_status.setText("SEM SINAL")
             self.lbl_status.setStyleSheet("color: #F87171; background-color: rgba(153, 27, 27, 0.9); padding: 3px 6px; border-radius: 4px; font-size: 10px; font-weight: bold;")
             self._set_live(False)
-            self._on_motion_detected(self.camera.id, False)
             self._update_hw_accel_badge()
 
     def _on_state_changed(self, state: ConnectionState, message: str):
@@ -743,8 +745,7 @@ class CameraViewWidget(QFrame):
         else:
             self._set_live(False)
 
-        if state != ConnectionState.STREAMING:
-            self._on_motion_detected(self.camera.id, False)
+        self._refresh_motion_alert()
 
         self._update_hw_accel_badge()
 
@@ -858,6 +859,8 @@ class CameraViewWidget(QFrame):
             # interface) nem deixá-la ser destruída junto com este widget (abortaria o processo).
             w.request_stop()
             retire_thread(w)
+        self._worker_motion = False
+        self._refresh_motion_alert()
 
     def dispose(self):
         """Para timers e stream e desconecta sinais internos para quebrar ciclos de referência."""
