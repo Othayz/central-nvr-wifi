@@ -191,6 +191,47 @@ class OsdAndSnapshotTest(QtCase):
                     panel.refresh_recordings()
                 self.assertEqual(panel.list_recordings.count(), 1)
 
+    def test_playback_open_media_folder_respects_custom_and_default_snapshot_dir(self):
+        from central_nvr.ui.playback_view import PlaybackWidget
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            data_dir = base / "data"
+            custom_dir = base / "custom_snaps" / "aninhada"
+
+            with patch("central_nvr.ui.playback_view.get_data_dir", return_value=data_dir), \
+                    patch("central_nvr.ui.playback_view.subprocess.Popen") as popen_mock:
+                # Caso padrão: sem pasta personalizada, abre get_data_dir()
+                panel = PlaybackWidget()
+                self.addCleanup(panel.deleteLater)
+                panel._open_media_folder()
+                popen_mock.assert_called_once_with(["xdg-open", str(data_dir)])
+                self.assertTrue(data_dir.is_dir())
+
+                # Com pasta personalizada inexistente: cria e abre a pasta configurada
+                popen_mock.reset_mock()
+                panel.set_snapshot_dir(custom_dir)
+                self.assertTrue(custom_dir.is_dir())
+                custom_dir.rmdir()
+                self.assertFalse(custom_dir.exists())
+
+                panel._open_media_folder()
+                popen_mock.assert_called_once_with(["xdg-open", str(custom_dir)])
+                self.assertTrue(custom_dir.is_dir())
+
+                # Voltando ao padrão: abre novamente get_data_dir()
+                popen_mock.reset_mock()
+                panel.set_snapshot_dir(None)
+                panel._open_media_folder()
+                popen_mock.assert_called_once_with(["xdg-open", str(data_dir)])
+
+                # Falha ao criar a pasta: registra aviso no log sem quebrar
+                popen_mock.reset_mock()
+                with patch.object(Path, "mkdir", side_effect=PermissionError("sem permissão")), \
+                        self.assertLogs("central_nvr.ui.playback_view", level="WARNING"):
+                    panel._open_media_folder()
+                popen_mock.assert_called_once_with(["xdg-open", str(data_dir)])
+
     def test_main_window_propagates_snapshot_dir_to_recordings_panel(self):
         from central_nvr.ui.main_window import MainWindow
 

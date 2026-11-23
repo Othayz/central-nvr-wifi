@@ -25,7 +25,7 @@ from PySide6.QtWidgets import (
 
 from central_nvr.core.camera import CameraDevice
 from central_nvr.core.config import get_data_dir
-from central_nvr.core.onvif_client import OnvifClient
+from central_nvr.core.onvif_client import OnvifClient, OnvifError, OnvifRedirectError
 from central_nvr.core.threads import retire_thread
 from central_nvr.ui.timeline_bar import TimelineBarWidget
 
@@ -75,10 +75,25 @@ class EdgeStorageWorker(QThread):
             except (TypeError, ValueError):
                 pass
 
-            recs = client.find_recordings(**find_kwargs)
+            listing_error = ""
+            try:
+                recs = client.find_recordings(**find_kwargs)
+            except OnvifRedirectError:
+                raise
+            except OnvifError as e:
+                if self.isInterruptionRequested():
+                    return
+                logger.warning(
+                    "Falha na listagem detalhada do cartão SD (%s): %s",
+                    self.camera_name,
+                    e,
+                )
+                recs = []
+                listing_error = str(e) or type(e).__name__
+
             if self.isInterruptionRequested():
                 return
-            self.query_finished.emit(summary, recs, "")
+            self.query_finished.emit(summary, recs, listing_error)
         except Exception as e:
             if not self.isInterruptionRequested():
                 self.query_finished.emit(None, None, str(e))
@@ -271,9 +286,13 @@ class PlaybackWidget(QWidget):
                 QMessageBox.warning(self, "Aviso", f"Não foi possível abrir o arquivo: {e}")
 
     def _open_media_folder(self):
-        base_dir = get_data_dir()
+        target_dir = self.resolved_snapshot_dir() if self._snapshot_dir is not None else get_data_dir()
         try:
-            subprocess.Popen(["xdg-open", str(base_dir)])
+            target_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            logger.warning(f"Não foi possível criar a pasta de mídia '{target_dir}': {e}")
+        try:
+            subprocess.Popen(["xdg-open", str(target_dir)])
         except Exception as e:
             QMessageBox.warning(self, "Aviso", f"Não foi possível abrir a pasta de mídia: {e}")
 
@@ -325,7 +344,9 @@ class PlaybackWidget(QWidget):
         self._restore_sync_sd_button()
         cam_suffix = f" ({camera_name})" if camera_name else ""
 
-        if error_msg:
+        has_summary = bool(summary and summary.get("num_recordings", 0) > 0)
+
+        if error_msg and not has_summary:
             QMessageBox.warning(
                 self,
                 "ONVIF Profile G",
@@ -339,11 +360,15 @@ class PlaybackWidget(QWidget):
                 lines.append(f"{i}. Token: {r.get('token')}")
                 lines.append(f"   Replay RTSP: {r.get('replay_uri') or 'Nativo'}")
             QMessageBox.information(self, "ONVIF Profile G - Cartão SD", "\n".join(lines))
-        elif summary and summary.get("num_recordings", 0) > 0:
+        elif has_summary:
             msg = (
                 f"A câmera{cam_suffix} reportou {summary['num_recordings']} gravações no cartão SD.\n"
                 f"Histórico de: {summary.get('earliest_time') or 'N/A'} até {summary.get('latest_time') or 'N/A'}."
             )
+            if error_msg:
+                msg += (
+                    f"\n\nAviso: não foi possível obter a listagem detalhada das gravações ({error_msg})."
+                )
             QMessageBox.information(self, "ONVIF Profile G - Cartão SD", msg)
         else:
             QMessageBox.information(
