@@ -622,7 +622,7 @@ class CameraViewWidget(QFrame):
     def _on_motion_detected(self, camera_id: str, is_detected: bool):
         """Atualiza o alerta visual de detecção de movimento em tempo real."""
         if hasattr(self, "lbl_motion"):
-            if is_detected and self.options.motion_detection:
+            if is_detected and self.options.motion_detection and self.is_live():
                 self.lbl_motion.show()
                 if not self.is_selected:
                     self.setStyleSheet("""
@@ -725,6 +725,7 @@ class CameraViewWidget(QFrame):
             self.lbl_status.setText("SEM SINAL")
             self.lbl_status.setStyleSheet("color: #F87171; background-color: rgba(153, 27, 27, 0.9); padding: 3px 6px; border-radius: 4px; font-size: 10px; font-weight: bold;")
             self._set_live(False)
+            self._on_motion_detected(self.camera.id, False)
             self._update_hw_accel_badge()
 
     def _on_state_changed(self, state: ConnectionState, message: str):
@@ -741,6 +742,9 @@ class CameraViewWidget(QFrame):
             self._publish_display_state("Conectando")
         else:
             self._set_live(False)
+
+        if state != ConnectionState.STREAMING:
+            self._on_motion_detected(self.camera.id, False)
 
         self._update_hw_accel_badge()
 
