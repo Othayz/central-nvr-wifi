@@ -59,15 +59,26 @@ class InstallTest(unittest.TestCase):
 
     def _running_appimage(self):
         opt = self.root / "opt"
-        opt.mkdir()
+        opt.mkdir(exist_ok=True)
         current = opt / "central-nvr.AppImage"
         current.write_bytes(b"versao antiga")
         return current
 
+    def _appimage_env(self, appimage_path: Path):
+        """Prepara ambiente de execução a partir do AppDir correspondente ao AppImage."""
+        appdir = self.root / "mount_central_nvr"
+        appdir.mkdir(exist_ok=True)
+        bundled_python = appdir / "usr" / "bin" / "python3"
+        return (
+            patch.dict(os.environ, {"APPIMAGE": str(appimage_path), "APPDIR": str(appdir)}),
+            patch.object(sys, "executable", str(bundled_python)),
+        )
+
     def test_read_only_destination_falls_back_to_user_bin(self):
         current = self._running_appimage()
         real_access = os.access
-        with patch.dict(os.environ, {"APPIMAGE": str(current)}), \
+        env_patch, exe_patch = self._appimage_env(current)
+        with env_patch, exe_patch, \
                 patch.object(updater.os, "access",
                              side_effect=lambda p, m: False if Path(p) == current.parent else real_access(p, m)):
             ok, msg = install_downloaded_package(str(self.new), expected_sha256=self.sha)
@@ -88,7 +99,8 @@ class InstallTest(unittest.TestCase):
                 raise PermissionError("Read-only file system")
             return real(source, target, sha)
 
-        with patch.dict(os.environ, {"APPIMAGE": str(current)}), \
+        env_patch, exe_patch = self._appimage_env(current)
+        with env_patch, exe_patch, \
                 patch.object(updater, "_replace_appimage_atomically", side_effect=replace):
             ok, msg = install_downloaded_package(str(self.new), expected_sha256=self.sha)
         self.assertTrue(ok, msg)
@@ -96,11 +108,84 @@ class InstallTest(unittest.TestCase):
 
     def test_success_message_explains_rollback(self):
         current = self._running_appimage()
-        with patch.dict(os.environ, {"APPIMAGE": str(current)}):
+        env_patch, exe_patch = self._appimage_env(current)
+        with env_patch, exe_patch:
             ok, msg = install_downloaded_package(str(self.new), expected_sha256=self.sha)
         self.assertTrue(ok, msg)
         self.assertIn(".bak", msg)
         self.assertEqual(current.with_name(current.name + ".bak").read_bytes(), b"versao antiga")
+
+    def test_inherited_appimage_without_appdir_installs_to_user_bin(self):
+        """Issue #72: APPIMAGE herdado sem APPDIR não sobrescreve o AppImage de outro programa."""
+        foreign = self.root / "Outro.AppImage"
+        foreign.write_bytes(b"outro programa")
+        env = dict(os.environ)
+        env["APPIMAGE"] = str(foreign)
+        env.pop("APPDIR", None)
+        with patch.dict(os.environ, env, clear=True), \
+                self.assertLogs(updater.logger, level="WARNING") as logs:
+            ok, msg = install_downloaded_package(str(self.new), expected_sha256=self.sha)
+        self.assertTrue(ok, msg)
+        self.assertEqual(foreign.read_bytes(), b"outro programa")
+        self.assertFalse(foreign.with_name(foreign.name + ".bak").exists())
+        installed = self.home / ".local" / "bin" / "central-nvr.AppImage"
+        self.assertEqual(installed.read_bytes(), b"nova versao")
+        self.assertTrue(any("APPDIR" in line for line in logs.output), logs.output)
+
+    def test_inherited_appimage_with_executable_outside_appdir_installs_to_user_bin(self):
+        """Issue #72: APPIMAGE + APPDIR de outro programa (sys.executable fora do AppDir) instala em ~/.local/bin."""
+        foreign = self.root / "Cursor.AppImage"
+        foreign.write_bytes(b"ide terceiro")
+        foreign_appdir = self.root / "mount_cursor"
+        foreign_appdir.mkdir()
+        external_python = self.root / "venv" / "bin" / "python3"
+        with patch.dict(os.environ, {"APPIMAGE": str(foreign), "APPDIR": str(foreign_appdir)}), \
+                patch.object(sys, "executable", str(external_python)), \
+                self.assertLogs(updater.logger, level="WARNING") as logs:
+            ok, msg = install_downloaded_package(str(self.new), expected_sha256=self.sha)
+        self.assertTrue(ok, msg)
+        self.assertEqual(foreign.read_bytes(), b"ide terceiro")
+        self.assertFalse(foreign.with_name(foreign.name + ".bak").exists())
+        installed = self.home / ".local" / "bin" / "central-nvr.AppImage"
+        self.assertEqual(installed.read_bytes(), b"nova versao")
+        self.assertTrue(any("AppDir" in line for line in logs.output), logs.output)
+
+    def test_appimage_with_executable_inside_appdir_replaces_atomically(self):
+        """Issue #72: APPIMAGE + APPDIR com sys.executable dentro do AppDir mantém o Atomic Replacement."""
+        current = self._running_appimage()
+        env_patch, exe_patch = self._appimage_env(current)
+        with env_patch, exe_patch:
+            ok, msg = install_downloaded_package(str(self.new), expected_sha256=self.sha)
+        self.assertTrue(ok, msg)
+        self.assertEqual(current.read_bytes(), b"nova versao")
+        self.assertEqual(current.with_name(current.name + ".bak").read_bytes(), b"versao antiga")
+        self.assertFalse((self.home / ".local" / "bin" / "central-nvr.AppImage").exists())
+
+    def test_running_appimage_path_edge_cases(self):
+        """Valida casos de borda de _running_appimage_path (prefixo parecido, __file__ no AppDir, APPDIR relativo/raiz)."""
+        current = self._running_appimage()
+        appdir = self.root / "appdir"
+        appdir.mkdir()
+        sibling_dir = self.root / "appdir_outro"
+        sibling_dir.mkdir()
+
+        # Prefixo de nome semelhante não engana is_relative_to
+        with patch.dict(os.environ, {"APPIMAGE": str(current), "APPDIR": str(appdir)}), \
+                patch.object(sys, "executable", str(sibling_dir / "usr" / "bin" / "python3")):
+            self.assertIsNone(updater._running_appimage_path())
+
+        # APPDIR relativo ou raiz é rejeitado
+        for bad_appdir in (".", "/"):
+            with patch.dict(os.environ, {"APPIMAGE": str(current), "APPDIR": bad_appdir}), \
+                    patch.object(sys, "executable", str(appdir / "usr" / "bin" / "python3")):
+                self.assertIsNone(updater._running_appimage_path())
+
+        # Pacote central_nvr (__file__) dentro de APPDIR também valida o AppImage
+        fake_module = appdir / "usr" / "src" / "central_nvr" / "core" / "updater.py"
+        with patch.dict(os.environ, {"APPIMAGE": str(current), "APPDIR": str(appdir)}), \
+                patch.object(sys, "executable", str(sibling_dir / "python3")), \
+                patch.object(updater, "__file__", str(fake_module)):
+            self.assertEqual(updater._running_appimage_path(), current.resolve())
 
 
 class DesktopExecTest(unittest.TestCase):

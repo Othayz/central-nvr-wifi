@@ -250,11 +250,14 @@ class TestUpdaterWorkers(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             running_img = Path(tmpdir) / "running.AppImage"
             running_img.write_text("old app image")
+            appdir = Path(tmpdir) / "appdir"
+            appdir.mkdir()
 
             new_img = Path(tmpdir) / "downloaded.AppImage"
             new_img.write_text("new app image v2")
 
-            with patch.dict(os.environ, {"APPIMAGE": str(running_img)}):
+            with patch.dict(os.environ, {"APPIMAGE": str(running_img), "APPDIR": str(appdir)}), \
+                 patch.object(sys, "executable", str(appdir / "usr" / "bin" / "python3")):
                 success, msg = install_downloaded_package(
                     str(new_img),
                     expected_sha256=compute_file_sha256(str(new_img)),
@@ -296,10 +299,13 @@ class TestUpdaterWorkers(unittest.TestCase):
             install_dir.mkdir()
             running = install_dir / "running.AppImage"
             running.write_bytes(b"old")
+            appdir = Path(tmpdir) / "appdir"
+            appdir.mkdir()
             new = Path(tmpdir) / "pkg.AppImage"
             new.write_bytes(b"tampered")
 
-            with patch.dict(os.environ, {"APPIMAGE": str(running)}):
+            with patch.dict(os.environ, {"APPIMAGE": str(running), "APPDIR": str(appdir)}), \
+                 patch.object(sys, "executable", str(appdir / "usr" / "bin" / "python3")):
                 success, msg = install_downloaded_package(str(new), expected_sha256="a" * 64)
 
             self.assertFalse(success)
@@ -322,9 +328,12 @@ class TestUpdaterWorkers(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             running = Path(tmpdir) / "running.AppImage"
             running.write_text("old")
+            appdir = Path(tmpdir) / "appdir"
+            appdir.mkdir()
             new = Path(tmpdir) / "new.AppImage"
             new.write_text("new")
-            with patch.dict(os.environ, {"APPIMAGE": str(running)}):
+            with patch.dict(os.environ, {"APPIMAGE": str(running), "APPDIR": str(appdir)}), \
+                 patch.object(sys, "executable", str(appdir / "usr" / "bin" / "python3")):
                 ok, _ = install_downloaded_package(str(new), expected_sha256=compute_file_sha256(str(new)))
             self.assertTrue(ok)
             self.assertEqual(running.read_text(), "new")
@@ -336,6 +345,8 @@ class TestUpdaterWorkers(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             running = Path(tmpdir) / "running.AppImage"
             running.write_bytes(b"old")
+            appdir = Path(tmpdir) / "appdir"
+            appdir.mkdir()
             downloads = Path(tmpdir) / "downloads"
             downloads.mkdir()
             new = downloads / "new.AppImage"
@@ -347,7 +358,8 @@ class TestUpdaterWorkers(unittest.TestCase):
                 new.write_bytes(b"malicious")  # outro processo vence a corrida logo após a verificação
                 return ok
 
-            with patch.dict(os.environ, {"APPIMAGE": str(running)}), \
+            with patch.dict(os.environ, {"APPIMAGE": str(running), "APPDIR": str(appdir)}), \
+                 patch.object(sys, "executable", str(appdir / "usr" / "bin" / "python3")), \
                  patch.object(updater, "verify_file_sha256", side_effect=verify_then_swap):
                 updater.install_downloaded_package(
                     str(new), expected_sha256=hashlib.sha256(b"legit").hexdigest()
