@@ -11,6 +11,7 @@ import base64
 import datetime
 import hashlib
 import html
+import ipaddress
 import logging
 import os
 import urllib.parse
@@ -21,6 +22,8 @@ import defusedxml.ElementTree as SafeET
 import requests
 from defusedxml.common import DefusedXmlException
 from urllib3.util import parse_url as urllib3_parse_url
+
+from central_nvr.core.camera import host_for_url
 
 logger = logging.getLogger(__name__)
 
@@ -112,6 +115,17 @@ def _fault_error(root: Element) -> Optional[OnvifError]:
     return OnvifFaultError(f"{reason} ({codes})" if codes else reason)
 
 
+def _normalize_host(host: Optional[str]) -> Optional[str]:
+    """Remove colchetes de literais IPv6 e normaliza endereços IP para forma canônica."""
+    if not host:
+        return None
+    raw = host[1:-1] if host.startswith("[") and host.endswith("]") else host
+    try:
+        return ipaddress.ip_address(raw).compressed
+    except ValueError:
+        return raw.lower()
+
+
 class OnvifClient:
     """
     Cliente ONVIF SOAP para CFTV IP:
@@ -127,19 +141,20 @@ class OnvifClient:
         password: str = "",
         timeout: float = 4.0,
     ):
-        self.ip = ip
+        self.ip = ip.strip("[]")
         self.port = port
         self.username = username
         self.password = password
         self.timeout = timeout
 
-        self.device_service_url = f"http://{ip}:{port}/onvif/device_service"
-        self.media_service_url = f"http://{ip}:{port}/onvif/media_service"
-        self.ptz_service_url = f"http://{ip}:{port}/onvif/ptz_service"
-        self.event_service_url = f"http://{ip}:{port}/onvif/event_service"
-        self.recording_service_url = f"http://{ip}:{port}/onvif/recording_service"
-        self.search_service_url = f"http://{ip}:{port}/onvif/search_service"
-        self.replay_service_url = f"http://{ip}:{port}/onvif/replay_service"
+        host = host_for_url(self.ip)
+        self.device_service_url = f"http://{host}:{port}/onvif/device_service"
+        self.media_service_url = f"http://{host}:{port}/onvif/media_service"
+        self.ptz_service_url = f"http://{host}:{port}/onvif/ptz_service"
+        self.event_service_url = f"http://{host}:{port}/onvif/event_service"
+        self.recording_service_url = f"http://{host}:{port}/onvif/recording_service"
+        self.search_service_url = f"http://{host}:{port}/onvif/search_service"
+        self.replay_service_url = f"http://{host}:{port}/onvif/replay_service"
 
         self.profiles: List[Dict[str, Any]] = []
         self.active_profile_token: str = ""
@@ -173,7 +188,7 @@ class OnvifClient:
 
             candidate = xaddr
             if xaddr.startswith("/") and not xaddr.startswith("//"):
-                candidate = f"http://{self.ip}:{self.port}{xaddr}"
+                candidate = f"http://{host_for_url(self.ip)}:{self.port}{xaddr}"
 
             parsed = urllib.parse.urlparse(candidate)
             scheme = parsed.scheme.lower()
@@ -200,14 +215,18 @@ class OnvifClient:
                 )
                 return None
 
-            if parsed.hostname != self.ip or u3.host != self.ip:
+            expected_host = _normalize_host(self.ip)
+            parsed_host = _normalize_host(parsed.hostname)
+            u3_host = _normalize_host(u3.host)
+            if not expected_host or parsed_host != expected_host or u3_host != expected_host:
                 logger.warning(
                     f"Anti-SSRF: Endpoint XAddr rejeitado por divergir do IP da câmera "
                     f"({parsed.hostname} / {u3.host} != {self.ip}): {xaddr}"
                 )
                 return None
 
-            netloc = f"{self.ip}:{port}" if port is not None else self.ip
+            url_host = host_for_url(expected_host)
+            netloc = f"{url_host}:{port}" if port is not None else url_host
             return urllib.parse.urlunparse((scheme, netloc, parsed.path, parsed.params, parsed.query, ""))
         except Exception as e:
             logger.warning(f"Anti-SSRF: Erro ao validar XAddr '{xaddr}': {e}")
@@ -227,7 +246,9 @@ class OnvifClient:
         if parsed.scheme.lower() not in ("rtsp", "rtsps", "http", "https"):
             logger.warning(f"URI de mídia rejeitada (esquema não suportado): {parsed.scheme}")
             return None
-        if parsed.hostname != self.ip:
+        expected_host = _normalize_host(self.ip)
+        parsed_host = _normalize_host(parsed.hostname)
+        if not expected_host or parsed_host != expected_host:
             logger.warning(
                 f"Anti-SSRF: URI de mídia rejeitada por divergir do IP da câmera "
                 f"({parsed.hostname} != {self.ip})"
