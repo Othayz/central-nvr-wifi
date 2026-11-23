@@ -419,6 +419,138 @@ class SecurityRedirectAndXAddrTest(unittest.TestCase):
             self.assertEqual(urllib3_parse_url(req.url).host, "10.0.0.5")
 
 
+class IPv6SupportTest(unittest.TestCase):
+    """Regressão da Issue #85: URLs de serviço ONVIF e validações Anti-SSRF com endereços IPv6."""
+
+    SERVICE_PATHS = (
+        ("device_service_url", "/onvif/device_service"),
+        ("media_service_url", "/onvif/media_service"),
+        ("ptz_service_url", "/onvif/ptz_service"),
+        ("event_service_url", "/onvif/event_service"),
+        ("recording_service_url", "/onvif/recording_service"),
+        ("search_service_url", "/onvif/search_service"),
+        ("replay_service_url", "/onvif/replay_service"),
+    )
+
+    def test_init_builds_bracketed_ipv6_urls_accepted_by_requests(self):
+        for raw_ip in ("fd00::10", "[fd00::10]"):
+            with self.subTest(ip=raw_ip):
+                client = OnvifClient(ip=raw_ip, port=80)
+                self.assertEqual(client.ip, "fd00::10")
+                for attr, path in self.SERVICE_PATHS:
+                    url = getattr(client, attr)
+                    expected = f"http://[fd00::10]:80{path}"
+                    self.assertEqual(url, expected)
+                    prepared = requests.Request("POST", url).prepare()
+                    self.assertEqual(prepared.url, expected)
+
+    def test_validate_xaddr_accepts_ipv6_absolute_equivalent_and_relative(self):
+        client = OnvifClient(ip="fd00::10", port=8080)
+        self.assertEqual(
+            client._validate_xaddr("http://[fd00::10]:8080/onvif/media_service"),
+            "http://[fd00::10]:8080/onvif/media_service",
+        )
+        self.assertEqual(
+            client._validate_xaddr("https://[fd00::10]/onvif/media_service"),
+            "https://[fd00::10]/onvif/media_service",
+        )
+        self.assertEqual(
+            client._validate_xaddr("http://[fd00:0::10]:8080/onvif/media_service"),
+            "http://[fd00::10]:8080/onvif/media_service",
+        )
+        self.assertEqual(
+            client._validate_xaddr("HTTP://[FD00:0000::0010]:8080/onvif/media_service?v=1#frag"),
+            "http://[fd00::10]:8080/onvif/media_service?v=1",
+        )
+        self.assertEqual(
+            client._validate_xaddr("http://[fd00::10]:/onvif/media_service"),
+            "http://[fd00::10]/onvif/media_service",
+        )
+        self.assertEqual(
+            client._validate_xaddr("/onvif/media_service"),
+            "http://[fd00::10]:8080/onvif/media_service",
+        )
+
+    def test_validate_xaddr_rejects_other_ipv6_and_malicious_urls(self):
+        client = OnvifClient(ip="fd00::10", port=80)
+        rejected = [
+            "http://[fd00::11]/onvif/media_service",
+            r"http://evil.com\@[fd00::10]/onvif/media_service",
+            "http://user:pass@[fd00::10]/onvif/media_service",
+            "http://@[fd00::10]/onvif/media_service",
+            "http://fd00::10:80/onvif/media_service",
+            "ftp://[fd00::10]/onvif/media_service",
+            "//[fd00::10]/onvif/media_service",
+        ]
+        for xaddr in rejected:
+            with self.subTest(xaddr=xaddr):
+                self.assertIsNone(client._validate_xaddr(xaddr))
+
+    def test_validate_media_uri_ipv6_and_ipv4_isolation(self):
+        client = OnvifClient(ip="[fd00::10]", port=80)
+        self.assertEqual(
+            client._validate_media_uri("rtsp://[fd00::10]:554/stream1"),
+            "rtsp://[fd00::10]:554/stream1",
+        )
+        self.assertEqual(
+            client._validate_media_uri("rtsp://[fd00:0::10]:554/stream1"),
+            "rtsp://[fd00:0::10]:554/stream1",
+        )
+        self.assertIsNone(client._validate_media_uri("rtsp://[fd00::11]:554/stream1"))
+        self.assertIsNone(client._validate_media_uri("rtsp://evil.example.com/stream1"))
+        self.assertIsNone(client._validate_media_uri("ftp://[fd00::10]/stream1"))
+
+        ipv4_client = OnvifClient(ip="10.0.0.5", port=80)
+        self.assertIsNone(ipv4_client._validate_xaddr("http://[::ffff:10.0.0.5]/onvif/media_service"))
+        self.assertIsNone(ipv4_client._validate_media_uri("rtsp://[::ffff:10.0.0.5]:554/stream1"))
+
+    def test_end_to_end_ipv6_capabilities_profiles_and_ptz(self):
+        caps_ipv6 = ENV.format(
+            ns=NS,
+            body="""
+<tds:GetCapabilitiesResponse><tds:Capabilities>
+  <tt:Media><tt:XAddr>http://[fd00:0::10]:8080/onvif/Media</tt:XAddr></tt:Media>
+  <tt:PTZ><tt:XAddr>/onvif/PTZ</tt:XAddr></tt:PTZ>
+</tds:Capabilities></tds:GetCapabilitiesResponse>""",
+        )
+        stream_ipv6 = ENV.format(
+            ns=NS,
+            body="""
+<trt:GetStreamUriResponse><trt:MediaUri>
+  <tt:Uri>rtsp://[fd00:0::10]:554/live/ch0</tt:Uri>
+</trt:MediaUri></trt:GetStreamUriResponse>""",
+        )
+        stop_ok = ENV.format(ns=NS, body="<tptz:StopResponse xmlns:tptz=\"http://www.onvif.org/ver20/ptz/wsdl\"/>")
+
+        def responder(url, body):
+            if "GetCapabilities" in body:
+                return 200, caps_ipv6
+            if "GetProfiles" in body:
+                return 200, PROFILES_NO_PTZ
+            if "GetStreamUri" in body:
+                return 200, stream_ipv6
+            return 200, stop_ok
+
+        client = OnvifClient(ip="fd00::10", port=80, username="admin", password="segredo")
+        adapter = _RecordingSoapAdapter(responder)
+        client._session.mount("http://", adapter)
+        client._session.mount("https://", adapter)
+
+        caps = client.get_capabilities()
+        self.assertEqual(caps["media"], "http://[fd00::10]:8080/onvif/Media")
+        self.assertEqual(caps["ptz"], "http://[fd00::10]:80/onvif/PTZ")
+        self.assertTrue(client.has_ptz)
+
+        profiles = client.get_profiles()
+        self.assertEqual(profiles[0]["stream_uri"], "rtsp://[fd00:0::10]:554/live/ch0")
+        self.assertTrue(client.ptz_stop())
+
+        sent_urls = [req.url for req in adapter.sent_requests]
+        self.assertIn("http://[fd00::10]:80/onvif/device_service", sent_urls)
+        self.assertIn("http://[fd00::10]:8080/onvif/Media", sent_urls)
+        self.assertIn("http://[fd00::10]:80/onvif/PTZ", sent_urls)
+
+
 class CleanupDecisionsTest(unittest.TestCase):
     """Decisões de triagem da #28: sem zeep e sem a assinatura PullPoint."""
 

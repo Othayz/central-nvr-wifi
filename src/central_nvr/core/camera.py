@@ -13,6 +13,13 @@ from typing import Optional, Dict, Any, List, Tuple
 DEFAULT_RTSP_TRANSPORT = "tcp"
 
 
+def host_for_url(host: str) -> str:
+    """Formata o host para uso em URLs, envolvendo endereços IPv6 entre colchetes (RFC 3986)."""
+    if host and ":" in host and not host.startswith("["):
+        return f"[{host}]"
+    return host
+
+
 class ConnectionState(Enum):
     DISCONNECTED = "Desconectado"
     CONNECTING = "Conectando..."
@@ -96,9 +103,7 @@ class CameraDevice:
     @staticmethod
     def _host_for_url(host: str) -> str:
         """Endereços IPv6 vão entre colchetes na URL."""
-        if host and ":" in host and not host.startswith("["):
-            return f"[{host}]"
-        return host
+        return host_for_url(host)
 
     def _build_url(self, path: str) -> str:
         path = path if path.startswith("/") else f"/{path}"
