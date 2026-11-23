@@ -222,8 +222,61 @@ def preferred_download_url(asset: "ReleaseAsset", token: Optional[str]) -> str:
     return asset.download_url
 
 
-# ETag e corpo da última resposta de /releases/latest, por URL (Issue #37)
-_ETAG_CACHE: Dict[str, Tuple[str, Dict[str, Any]]] = {}
+# ETag e corpo JSON da última resposta da API do GitHub, por URL (Issues #37, #73)
+_ETAG_CACHE: Dict[str, Tuple[str, Any]] = {}
+_GITHUB_NOT_FOUND = object()
+
+
+def _raise_for_github_status(response: Any, repo: str) -> None:
+    """Levanta RuntimeError descritivo para status HTTP de erro da API do GitHub."""
+    if response.status_code == 401:
+        raise RuntimeError("Token de autenticação do GitHub inválido ou expirado. Verifique as configurações.")
+    if response.status_code == 403:
+        resp_body = str(getattr(response, "text", "") or "").lower()
+        if "rate limit" in resp_body:
+            raise RuntimeError(
+                "Limite de requisições da API pública do GitHub atingido para seu endereço IP.\n"
+                "Configure um GitHub Personal Access Token em Configurações para continuar sem restrições."
+            )
+        raise RuntimeError(f"Acesso não autorizado ao repositório '{repo}' (HTTP 403).")
+    raise RuntimeError(f"Consulta ao GitHub retornou status HTTP {response.status_code}.")
+
+
+def _fetch_github_json_cached(
+    url: str,
+    headers: Dict[str, str],
+    timeout: int,
+    repo: str,
+    *,
+    allow_404: bool = False,
+) -> Any:
+    """
+    Faz GET condicional (If-None-Match) em `url` usando `_ETAG_CACHE` (Issue #37).
+    Em 304 reaproveita o corpo em cache; em 200 guarda ETag e JSON no cache.
+    Com `allow_404=True`, retorna `_GITHUB_NOT_FOUND` em 404; nos demais status
+    de erro levanta `RuntimeError` via `_raise_for_github_status`.
+    """
+    cached = _ETAG_CACHE.get(url)
+    conditional_headers = dict(headers)
+    if cached:
+        conditional_headers["If-None-Match"] = cached[0]
+    response = requests.get(url, headers=conditional_headers, timeout=timeout)
+
+    if response.status_code == 304 and cached:
+        return cached[1]
+    if allow_404 and response.status_code == 404:
+        return _GITHUB_NOT_FOUND
+    if response.status_code != 200:
+        _raise_for_github_status(response, repo)
+
+    data = response.json()
+    try:
+        etag = response.headers.get("ETag")
+    except AttributeError:
+        etag = None
+    if isinstance(etag, str) and etag:
+        _ETAG_CACHE[url] = (etag, data)
+    return data
 
 
 def fetch_latest_release(
@@ -257,31 +310,8 @@ def fetch_latest_release(
                     return _parse_github_release_dict(best)
 
         # Requisição condicional (Issue #37): 304 não conta na cota da API e evita baixar de novo
-        cached = _ETAG_CACHE.get(url)
-        conditional_headers = dict(headers)
-        if cached:
-            conditional_headers["If-None-Match"] = cached[0]
-        response = requests.get(url, headers=conditional_headers, timeout=timeout)
-
-        if response.status_code == 304 and cached:
-            return _parse_github_release_dict(cached[1])
-
-        # 401: Token inválido
-        if response.status_code == 401:
-            raise RuntimeError("Token de autenticação do GitHub inválido ou expirado. Verifique as configurações.")
-
-        # 403: Rate limit ou permissão negada
-        if response.status_code == 403:
-            resp_body = response.text.lower()
-            if "rate limit" in resp_body:
-                raise RuntimeError(
-                    "Limite de requisições da API pública do GitHub atingido para seu endereço IP.\n"
-                    "Configure um GitHub Personal Access Token em Configurações para continuar sem restrições."
-                )
-            raise RuntimeError(f"Acesso não autorizado ao repositório '{repo}' (HTTP 403).")
-
-        # 404: Endpoint /releases/latest pode dar 404 se não houver release publicada OU se o repo for privado/inexistente
-        if response.status_code == 404:
+        data = _fetch_github_json_cached(url, headers, timeout, repo, allow_404=True)
+        if data is _GITHUB_NOT_FOUND:
             # 1. Tentar listar todas as releases
             list_url = f"https://api.github.com/repos/{repo}/releases"
             list_resp = requests.get(list_url, headers=headers, timeout=timeout)
@@ -298,12 +328,13 @@ def fetch_latest_release(
 
             if tags_resp.status_code == 200:
                 tags = tags_resp.json()
-                # A ordem da API não é por versão nem por data: ordenar e ignorar pré-releases
+                # A ordem da API não é por versão nem por data: ordenar e ignorar pré-releases quando desabilitadas
                 versioned = [] if not isinstance(tags, list) else [
                     (t.get("name", ""), parse_release_version(t.get("name", "")))
                     for t in tags if isinstance(t, dict) and _VERSION_IN_TAG_RE.search(t.get("name", ""))
                 ]
-                versioned = [(name, ver) for name, ver in versioned if not is_prerelease(ver)]
+                if not include_prereleases:
+                    versioned = [(name, ver) for name, ver in versioned if not is_prerelease(ver)]
                 if versioned:
                     tag_name, clean_v = max(versioned, key=lambda nv: version_key(nv[1]))
                     return ReleaseInfo(
@@ -313,7 +344,7 @@ def fetch_latest_release(
                         body="Versão identificada via tag do repositório.",
                         html_url=f"https://github.com/{repo}/releases/tag/{tag_name}",
                         published_at=datetime.datetime.now(datetime.timezone.utc).isoformat(),
-                        prerelease=False,
+                        prerelease=is_prerelease(clean_v),
                         assets=[],
                         is_newer=is_version_newer(__version__, clean_v),
                     )
@@ -327,28 +358,18 @@ def fetch_latest_release(
                 )
 
             # Se o repositório existe e foi acessado (200), mas está sem nenhuma release ou tag cadastrada
-            return ReleaseInfo(
-                tag_name=f"v{__version__}",
-                version=__version__,
-                title="Repositório Sincronizado",
-                body="Nenhuma nova versão ou release foi publicada no repositório GitHub ainda. Você já está utilizando a versão mais recente.",
-                html_url=f"https://github.com/{repo}",
-                published_at="",
-                prerelease=False,
-                assets=[],
-                is_newer=False,
-            )
+            return _up_to_date_release_info(repo)
 
-        if response.status_code != 200:
-            raise RuntimeError(f"Consulta ao GitHub retornou status HTTP {response.status_code}.")
+        # Defesa extra (Issue #73): mesmo que uma pré-release tenha sido publicada sem a flag
+        # `prerelease=true` e apareça em /releases/latest, ignorá-la quando include_prereleases=False.
+        if not include_prereleases and _is_release_prerelease(data):
+            list_url = f"https://api.github.com/repos/{repo}/releases"
+            releases = _fetch_github_json_cached(list_url, headers, timeout, repo)
+            best = _pick_highest_release(releases, include_prereleases=False)
+            if best is not None:
+                return _parse_github_release_dict(best)
+            return _up_to_date_release_info(repo)
 
-        data = response.json()
-        try:
-            etag = response.headers.get("ETag")
-        except AttributeError:
-            etag = None
-        if isinstance(etag, str) and etag:
-            _ETAG_CACHE[url] = (etag, data)
         return _parse_github_release_dict(data)
 
     except requests.exceptions.RequestException as e:
@@ -361,6 +382,30 @@ def fetch_latest_release(
         raise RuntimeError(f"Erro ao processar dados da release: {e}") from e
 
 
+def _up_to_date_release_info(repo: str) -> ReleaseInfo:
+    """Retorna ReleaseInfo indicando ausência de atualização estável disponível."""
+    return ReleaseInfo(
+        tag_name=f"v{__version__}",
+        version=__version__,
+        title="Repositório Sincronizado",
+        body="Nenhuma nova versão ou release foi publicada no repositório GitHub ainda. Você já está utilizando a versão mais recente.",
+        html_url=f"https://github.com/{repo}",
+        published_at="",
+        prerelease=False,
+        assets=[],
+        is_newer=False,
+    )
+
+
+def _is_release_prerelease(release: Any) -> bool:
+    """True se a release estiver marcada como pré-release na API ou tiver tag com sufixo de pré-release."""
+    if not isinstance(release, dict):
+        return False
+    return bool(release.get("prerelease", False)) or is_prerelease(
+        parse_release_version(release.get("tag_name", ""))
+    )
+
+
 def _pick_highest_release(releases: Any, include_prereleases: bool) -> Optional[Dict[str, Any]]:
     """Release publicada (não rascunho) de maior versão; pré-releases só se permitidas."""
     if not isinstance(releases, list):
@@ -368,7 +413,7 @@ def _pick_highest_release(releases: Any, include_prereleases: bool) -> Optional[
     candidates = [
         r for r in releases
         if isinstance(r, dict) and not r.get("draft", False)
-        and (include_prereleases or not r.get("prerelease", False))
+        and (include_prereleases or not _is_release_prerelease(r))
     ]
     if not candidates:
         return None
@@ -383,7 +428,7 @@ def _parse_github_release_dict(data: Dict[str, Any]) -> ReleaseInfo:
     body = data.get("body") or "Nenhuma nota de versão fornecida."
     html_url = data.get("html_url", "")
     published_at = data.get("published_at", "")
-    prerelease = data.get("prerelease", False)
+    prerelease = bool(data.get("prerelease", False)) or is_prerelease(clean_v)
 
     assets_list = []
     for item in data.get("assets", []):
