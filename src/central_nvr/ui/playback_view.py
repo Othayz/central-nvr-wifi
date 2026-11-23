@@ -286,11 +286,29 @@ class PlaybackWidget(QWidget):
                 QMessageBox.warning(self, "Aviso", f"Não foi possível abrir o arquivo: {e}")
 
     def _open_media_folder(self):
-        target_dir = self.resolved_snapshot_dir() if self._snapshot_dir is not None else get_data_dir()
+        base_dir = get_data_dir()
+        snap_dir = self.resolved_snapshot_dir()
+        default_snap_dir = base_dir / "snapshots"
+        try:
+            is_custom = snap_dir.resolve() != default_snap_dir.resolve()
+        except (OSError, RuntimeError):
+            is_custom = snap_dir != default_snap_dir
+        target_dir = snap_dir if is_custom else base_dir
         try:
             target_dir.mkdir(parents=True, exist_ok=True)
         except OSError as e:
             logger.warning(f"Não foi possível criar a pasta de mídia '{target_dir}': {e}")
+            try:
+                dir_exists = target_dir.is_dir()
+            except OSError:
+                dir_exists = False
+            if not dir_exists:
+                QMessageBox.warning(
+                    self,
+                    "Aviso",
+                    f"Não foi possível abrir a pasta de mídia: {target_dir} não existe e não pôde ser criada ({e}).",
+                )
+                return
         try:
             subprocess.Popen(["xdg-open", str(target_dir)])
         except Exception as e:

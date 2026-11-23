@@ -797,6 +797,39 @@ class PlaybackEdgeStorageAsyncTest(unittest.TestCase):
         self.assertIsNone(self.widget._edge_worker)
         self.assertTrue(drain_retired_threads(5000))
 
+    def test_check_edge_storage_zero_summary_and_find_timeout_shows_warning_not_empty(self):
+        class ZeroSummaryFindTimeoutClient:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def get_capabilities(self):
+                return {"search": "http://10.0.0.5/onvif/search_service"}
+
+            def get_recording_summary(self):
+                return {
+                    "num_recordings": 0,
+                    "has_storage": False,
+                    "earliest_time": "",
+                    "latest_time": "",
+                }
+
+            def find_recordings(self, max_matches=20, should_abort=None):
+                raise OnvifTimeoutError("Tempo esgotado na busca")
+
+        with patch.object(playback_view, "OnvifClient", ZeroSummaryFindTimeoutClient):
+            self.widget._check_edge_storage()
+            self._wait_until(lambda: self.msgbox.warning.called)
+
+        self.msgbox.information.assert_not_called()
+        warn_text = self.msgbox.warning.call_args[0][2]
+        self.assertIn("Falha na consulta", warn_text)
+        self.assertIn("Câmera Garagem", warn_text)
+        self.assertIn("Tempo esgotado na busca", warn_text)
+        self.assertNotIn("Nenhuma gravação", warn_text)
+        self.assertTrue(self.widget.btn_sync_sd.isEnabled())
+        self.assertIsNone(self.widget._edge_worker)
+        self.assertTrue(drain_retired_threads(5000))
+
     def test_check_edge_storage_redirect_error_is_not_hidden_after_summary(self):
         class RedirectOnFindClient:
             def __init__(self, *args, **kwargs):
