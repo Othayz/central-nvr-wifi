@@ -4,6 +4,7 @@ Permite configurar decodificação por hardware (VA-API), caminhos de gravação
 """
 from typing import Optional
 
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -393,4 +394,5 @@ class SettingsDialog(QDialog):
         repo = self.txt_github_repo.text().strip() or "Othayz/central-nvr-wifi"
         token = self.txt_github_token.text().strip() or None
         dialog = UpdateDialog(repo=repo, token=token, parent=self)
+        dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         dialog.exec()
