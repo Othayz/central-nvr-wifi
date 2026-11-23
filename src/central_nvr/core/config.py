@@ -13,6 +13,7 @@ from central_nvr.core.camera import DEFAULT_RTSP_TRANSPORT
 
 try:
     import keyring
+    import keyring.errors
     HAS_KEYRING = True
 except ImportError:
     HAS_KEYRING = False
@@ -43,7 +44,7 @@ def _safe_keyring_set(username: str, secret: str) -> bool:
         else:
             try:
                 keyring.delete_password(KEYRING_SERVICE_NAME, username)
-            except Exception:
+            except keyring.errors.PasswordDeleteError:
                 pass
         return True
     except Exception as e:
@@ -280,10 +281,13 @@ class ConfigManager:
         self.devices: List[Dict[str, Any]] = []
         self._keyring_synced: Dict[str, str] = {}
         self.last_write_error: Optional[str] = None
+        self.last_write_warnings: List[str] = []
+        self._pat_synced: Optional[str] = None
         self.load()
 
     def load(self):
         """Carrega configurações e lista de dispositivos do disco com migração segura de credenciais."""
+        self._pat_synced = None
         if self.config_path.exists():
             try:
                 with open(self.config_path, "r", encoding="utf-8") as f:
@@ -299,7 +303,10 @@ class ConfigManager:
                     if set_keyring_pat(raw_pat):
                         logger.info("GitHub PAT migrado com sucesso de settings.json para o Keyring.")
                         self.settings["github_token"] = ""
+                        self._pat_synced = raw_pat
                         self.save_settings()
+                    else:
+                        self._pat_synced = None
             except Exception as e:
                 logger.error(f"Erro ao ler {self.config_path}: {e}")
 
@@ -339,9 +346,14 @@ class ConfigManager:
         self.last_write_error = None
         try:
             settings_to_save = self.settings.copy()
-            # SEC-04: Omitir token em texto puro de settings.json caso o keyring esteja ativo
-            if is_keyring_available():
-                settings_to_save["github_token"] = ""
+            # SEC-04: Omitir token em texto puro de settings.json apenas se ele estiver efetivamente no keyring
+            raw_pat = str(settings_to_save.get("github_token", "") or "").strip()
+            if raw_pat:
+                pat_stored_in_keyring = raw_pat == self._pat_synced
+                if not pat_stored_in_keyring and self._pat_synced is None and is_keyring_available():
+                    pat_stored_in_keyring = get_keyring_pat() == raw_pat
+                if pat_stored_in_keyring:
+                    settings_to_save["github_token"] = ""
             _secure_write_json(self.config_path, settings_to_save)
             return True
         except (OSError, PermissionError) as e:
@@ -423,6 +435,9 @@ class ConfigManager:
     def get_persisted(self, key: str, default: Any = None) -> Any:
         """Retorna o valor persistido (ou padrão), ignorando overrides efêmeros da sessão."""
         if key == "github_token":
+            file_pat = str(self.settings.get("github_token") or "").strip()
+            if file_pat:
+                return file_pat
             kr_pat = get_keyring_pat()
             if kr_pat:
                 return kr_pat
@@ -435,27 +450,70 @@ class ConfigManager:
 
     def _store(self, key: str, value: Any):
         """Grava em memória; o token do GitHub vai para o keyring quando disponível."""
-        if key == "github_token" and is_keyring_available():
-            set_keyring_pat(str(value or "").strip())
-            self.settings["github_token"] = ""
+        if key == "github_token":
+            token = str(value or "").strip()
+            if not token:
+                had_token = bool(str(self.get_persisted("github_token") or "").strip()) or bool(self._pat_synced)
+                if is_keyring_available():
+                    if set_keyring_pat(""):
+                        self._pat_synced = None
+                    elif had_token:
+                        self.last_write_warnings.append(
+                            "O cofre de senhas do sistema recusou a remoção do token do GitHub; "
+                            "ele pode voltar a ser usado quando o cofre for desbloqueado."
+                        )
+                        logger.warning(
+                            "Cofre de senhas (keyring) recusou a remoção do GitHub PAT; "
+                            "o token anterior no cofre pode voltar a valer quando ele for desbloqueado."
+                        )
+                else:
+                    self._pat_synced = None
+                self.settings["github_token"] = ""
+            elif is_keyring_available():
+                if set_keyring_pat(token):
+                    self.settings["github_token"] = ""
+                    self._pat_synced = token
+                else:
+                    self.settings["github_token"] = token
+                    if self._pat_synced == token:
+                        self._pat_synced = None
+                    self.last_write_warnings.append(
+                        "O cofre de senhas do sistema recusou o token; "
+                        "ele foi salvo no arquivo de configuração com permissão restrita."
+                    )
+                    logger.warning(
+                        "Cofre de senhas (keyring) recusou a gravação do GitHub PAT; "
+                        "mantendo fallback em settings.json com permissão 0600."
+                    )
+            else:
+                self.settings["github_token"] = token
+                self._pat_synced = None
         else:
             self.settings[key] = value
 
     def update(self, values: Dict[str, Any]) -> bool:
         """Atualiza várias chaves e grava settings.json uma única vez (Issue #34)."""
         previous_settings = self.settings.copy()
+        previous_pat_synced = self._pat_synced
+        self.last_write_warnings = []
         for key, value in values.items():
             self._store(key, value)
         if not self.save_settings():
             self.settings = previous_settings
+            self._pat_synced = previous_pat_synced
+            self.last_write_warnings = []
             return False
         return True
 
     def set(self, key: str, value: Any) -> bool:
         previous_settings = self.settings.copy()
+        previous_pat_synced = self._pat_synced
+        self.last_write_warnings = []
         self._store(key, value)
         if not self.save_settings():
             self.settings = previous_settings
+            self._pat_synced = previous_pat_synced
+            self.last_write_warnings = []
             return False
         return True
 

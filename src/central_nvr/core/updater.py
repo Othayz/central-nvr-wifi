@@ -167,7 +167,7 @@ def find_best_asset_for_system(assets: List[ReleaseAsset]) -> Optional[ReleaseAs
 
 
 def resolve_github_token(token: Optional[str] = None) -> Optional[str]:
-    """Token explícito, ou GITHUB_TOKEN do ambiente, ou `github_token` do keyring/settings.json (somente leitura)."""
+    """Token explícito, ou GITHUB_TOKEN do ambiente, ou `github_token` de settings.json/keyring (somente leitura)."""
     if token and token.strip():
         return token.strip()
     env_token = os.environ.get("GITHUB_TOKEN", "").strip()
@@ -176,18 +176,21 @@ def resolve_github_token(token: Optional[str] = None) -> Optional[str]:
     try:
         from central_nvr.core.config import get_config_dir, get_keyring_pat, is_keyring_available
 
+        settings_path = get_config_dir() / "settings.json"
+        if settings_path.exists():
+            try:
+                saved_settings = json.loads(settings_path.read_text(encoding="utf-8"))
+                if isinstance(saved_settings, dict):
+                    file_token = str(saved_settings.get("github_token") or "").strip()
+                    if file_token:
+                        return file_token
+            except Exception:
+                pass
+
         if is_keyring_available():
             kr_pat = get_keyring_pat()
             if kr_pat and str(kr_pat).strip():
                 return str(kr_pat).strip()
-
-        settings_path = get_config_dir() / "settings.json"
-        if settings_path.exists():
-            saved_settings = json.loads(settings_path.read_text(encoding="utf-8"))
-            if isinstance(saved_settings, dict):
-                file_token = str(saved_settings.get("github_token") or "").strip()
-                if file_token:
-                    return file_token
     except Exception:
         return None
     return None

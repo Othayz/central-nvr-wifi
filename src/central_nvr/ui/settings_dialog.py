@@ -373,7 +373,15 @@ class SettingsDialog(QDialog):
             if values["rtsp_transport"] != self._loaded_rtsp_transport:
                 clear_override("rtsp_transport")
 
-        QMessageBox.information(self, "Configurações", "Configurações salvas com sucesso!")
+        warnings = list(getattr(self.config_mgr, "last_write_warnings", None) or [])
+        if warnings:
+            QMessageBox.warning(
+                self,
+                "Configurações",
+                "\n".join(warnings),
+            )
+        else:
+            QMessageBox.information(self, "Configurações", "Configurações salvas com sucesso!")
         self.accept()
 
     def _browse_snap_dir(self):
