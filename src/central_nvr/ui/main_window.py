@@ -649,7 +649,7 @@ class MainWindow(QMainWindow):
         """Sincroniza os painéis PTZ e de Gravações com a seleção atual da grade (Issue #52)."""
         selected_id = self.camera_grid.selected_camera_id
         if selected_id and any(c.id == selected_id for c in self.cameras):
-            self._select_camera_by_id(selected_id)
+            self._select_camera_by_id(selected_id, ensure_visible=False)
         else:
             self.ptz_panel.set_camera(None)
             if hasattr(self, "recordings_panel"):
@@ -659,13 +659,13 @@ class MainWindow(QMainWindow):
         """Quando o usuário clica em um viewport no grid."""
         self._select_camera_by_id(camera_id)
 
-    def _select_camera_by_id(self, camera_id: Optional[str]):
+    def _select_camera_by_id(self, camera_id: Optional[str], ensure_visible: bool = True):
         cam = next((c for c in self.cameras if c.id == camera_id), None) if camera_id else None
         if cam:
             self.ptz_panel.set_camera(cam)
             if hasattr(self, "recordings_panel"):
                 self.recordings_panel.set_camera(cam)
-            self.camera_grid.select_camera(camera_id)
+            self.camera_grid.select_camera(camera_id, ensure_visible=ensure_visible)
         else:
             self.ptz_panel.set_camera(None)
             if hasattr(self, "recordings_panel"):

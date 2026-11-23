@@ -267,9 +267,14 @@ class CameraGridWidget(QWidget):
 
     def set_layout_mode(self, mode: str):
         """Altera a disposição das câmeras (auto, 1x1, 2x2, 3x3)."""
+        mode_changed = mode != self.grid_layout_mode
         if mode != "1x1":
             self.previous_grid_mode = mode
         self.grid_layout_mode = mode
+        if mode_changed and mode != "1x1":
+            target_page = self._camera_page(self.selected_camera_id, mode)
+            if target_page is not None:
+                self.current_page = target_page
         self.apply_layout(mode)
 
     # ------------------------------------------------------------------
@@ -279,6 +284,13 @@ class CameraGridWidget(QWidget):
     @staticmethod
     def page_capacity(mode: str) -> int:
         return {"1x1": 1, "2x2": 4, "3x3": 9}.get(mode, 9)
+
+    def _camera_page(self, camera_id: Optional[str], mode: str) -> Optional[int]:
+        """Retorna a página da câmera no modo informado, ou None se não estiver na grade."""
+        if not camera_id or camera_id not in self.camera_views:
+            return None
+        ids = list(self.camera_views)
+        return ids.index(camera_id) // self.page_capacity(mode)
 
     def page_count(self) -> int:
         return max(1, math.ceil(len(self.camera_views) / self.page_capacity(self.grid_layout_mode)))
@@ -505,17 +517,16 @@ class CameraGridWidget(QWidget):
             self.set_layout_mode("1x1")
             self.layout_mode_changed.emit("1x1")
 
-    def select_camera(self, camera_id: str):
+    def select_camera(self, camera_id: str, ensure_visible: bool = False):
         """Seleciona programaticamente uma câmera sem disparar loop de eventos."""
         self.selected_camera_id = camera_id
         for cid, view in self.camera_views.items():
             view.set_selected(cid == camera_id)
         if self.grid_layout_mode == "1x1":
             self.apply_layout("1x1")
-        elif camera_id in self.camera_views:
-            ids = list(self.camera_views)
-            target_page = ids.index(camera_id) // self.page_capacity(self.grid_layout_mode)
-            if target_page != self.current_page:
+        elif ensure_visible:
+            target_page = self._camera_page(camera_id, self.grid_layout_mode)
+            if target_page is not None and target_page != self.current_page:
                 self.set_page(target_page)
 
     def update_camera_name(self, camera_id: str, new_name: str):
