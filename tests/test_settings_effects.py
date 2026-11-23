@@ -191,6 +191,170 @@ class OsdAndSnapshotTest(QtCase):
                     panel.refresh_recordings()
                 self.assertEqual(panel.list_recordings.count(), 1)
 
+    def test_playback_open_media_folder_respects_custom_and_default_snapshot_dir(self):
+        from central_nvr.ui.playback_view import PlaybackWidget
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            data_dir = base / "data"
+            custom_dir = base / "custom_snaps" / "aninhada"
+
+            with patch("central_nvr.ui.playback_view.get_data_dir", return_value=data_dir), \
+                    patch("central_nvr.ui.playback_view.subprocess.Popen") as popen_mock, \
+                    patch("central_nvr.ui.playback_view.QMessageBox.warning") as warn_mock:
+                # Caso padrão: sem pasta personalizada, abre get_data_dir()
+                panel = PlaybackWidget()
+                self.addCleanup(panel.deleteLater)
+                panel._open_media_folder()
+                popen_mock.assert_called_once_with(["xdg-open", str(data_dir)])
+                warn_mock.assert_not_called()
+                self.assertTrue(data_dir.is_dir())
+
+                # Com pasta personalizada inexistente: cria e abre a pasta configurada
+                popen_mock.reset_mock()
+                panel.set_snapshot_dir(custom_dir)
+                self.assertTrue(custom_dir.is_dir())
+                custom_dir.rmdir()
+                self.assertFalse(custom_dir.exists())
+
+                panel._open_media_folder()
+                popen_mock.assert_called_once_with(["xdg-open", str(custom_dir)])
+                warn_mock.assert_not_called()
+                self.assertTrue(custom_dir.is_dir())
+
+                # Voltando ao padrão (tanto None quanto data_dir / "snapshots"): abre get_data_dir()
+                popen_mock.reset_mock()
+                panel.set_snapshot_dir(data_dir / "snapshots")
+                panel._open_media_folder()
+                popen_mock.assert_called_once_with(["xdg-open", str(data_dir)])
+                warn_mock.assert_not_called()
+
+                popen_mock.reset_mock()
+                panel.set_snapshot_dir(None)
+                panel._open_media_folder()
+                popen_mock.assert_called_once_with(["xdg-open", str(data_dir)])
+                warn_mock.assert_not_called()
+
+                # Se a pasta já existir e mkdir lançar OSError: segue normalmente
+                popen_mock.reset_mock()
+                with patch.object(Path, "mkdir", side_effect=PermissionError("sem permissão")), \
+                        self.assertLogs("central_nvr.ui.playback_view", level="WARNING"):
+                    panel._open_media_folder()
+                popen_mock.assert_called_once_with(["xdg-open", str(data_dir)])
+                warn_mock.assert_not_called()
+
+    def test_playback_open_media_folder_warns_and_skips_open_when_dir_unavailable(self):
+        from central_nvr.ui.playback_view import PlaybackWidget
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            data_dir = base / "data"
+            missing_custom = base / "montagem_ausente" / "snaps"
+            blocking_file = base / "arquivo_comum"
+            blocking_file.write_text("conteudo", encoding="utf-8")
+
+            with patch("central_nvr.ui.playback_view.get_data_dir", return_value=data_dir), \
+                    patch("central_nvr.ui.playback_view.subprocess.Popen") as popen_mock, \
+                    patch("central_nvr.ui.playback_view.QMessageBox.warning") as warn_mock:
+                panel = PlaybackWidget()
+                self.addCleanup(panel.deleteLater)
+
+                # mkdir lançando PermissionError em pasta inexistente: avisa e não chama xdg-open
+                panel._snapshot_dir = missing_custom
+                with patch.object(Path, "mkdir", side_effect=PermissionError("sem permissão")), \
+                        self.assertLogs("central_nvr.ui.playback_view", level="WARNING"):
+                    panel._open_media_folder()
+
+                popen_mock.assert_not_called()
+                warn_mock.assert_called_once()
+                warn_msg = warn_mock.call_args[0][2]
+                self.assertIn(str(missing_custom), warn_msg)
+                self.assertIn("não existe e não pôde ser criada", warn_msg)
+                self.assertIn("sem permissão", warn_msg)
+
+                # Caminho ocupado por um arquivo comum: avisa e não chama xdg-open
+                warn_mock.reset_mock()
+                panel._snapshot_dir = blocking_file
+                with self.assertLogs("central_nvr.ui.playback_view", level="WARNING"):
+                    panel._open_media_folder()
+
+                popen_mock.assert_not_called()
+                warn_mock.assert_called_once()
+                file_warn_msg = warn_mock.call_args[0][2]
+                self.assertIn(str(blocking_file), file_warn_msg)
+                self.assertIn("não existe e não pôde ser criada", file_warn_msg)
+
+    def test_main_window_open_media_folder_default_and_custom_snapshot_dir(self):
+        from PySide6.QtWidgets import QPushButton
+        from central_nvr.ui.main_window import MainWindow
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            config_dir = base / "config"
+            data_dir = base / "data"
+            custom_snap_dir = base / "snaps_personalizados"
+            config_dir.mkdir(parents=True)
+            data_dir.mkdir(parents=True)
+
+            with patch("central_nvr.core.config.get_config_dir", return_value=config_dir), \
+                    patch("central_nvr.core.config.get_data_dir", return_value=data_dir), \
+                    patch("central_nvr.ui.playback_view.get_data_dir", return_value=data_dir), \
+                    patch("central_nvr.ui.playback_view.subprocess.Popen") as popen_mock, \
+                    patch("central_nvr.ui.playback_view.QMessageBox.warning") as warn_mock:
+                cfg = ConfigManager()
+                cfg.set("periodic_update_check", False)
+                cfg.set("snapshot_dir", "")
+
+                window = MainWindow(config_mgr=cfg)
+                try:
+                    self.app.processEvents()
+                    btn_open = next(
+                        b for b in window.recordings_panel.findChildren(QPushButton)
+                        if "Abrir Pasta" in b.text()
+                    )
+
+                    # Fluxo real com snapshot_dir="" -> abre get_data_dir()
+                    btn_open.click()
+                    popen_mock.assert_called_once_with(["xdg-open", str(data_dir)])
+                    warn_mock.assert_not_called()
+
+                    # Altera para pasta personalizada via fluxo de Configurações -> abre a pasta personalizada
+                    popen_mock.reset_mock()
+
+                    def _set_custom_dir():
+                        cfg.set("snapshot_dir", str(custom_snap_dir))
+                        return 1
+
+                    with patch("central_nvr.ui.main_window.SettingsDialog.exec", side_effect=_set_custom_dir):
+                        window._open_settings_dialog()
+
+                    btn_open.click()
+                    popen_mock.assert_called_once_with(["xdg-open", str(custom_snap_dir)])
+                    warn_mock.assert_not_called()
+                    self.assertTrue(custom_snap_dir.is_dir())
+
+                    # Limpa snapshot_dir de volta para "" -> volta a abrir get_data_dir()
+                    popen_mock.reset_mock()
+
+                    def _reset_default_dir():
+                        cfg.set("snapshot_dir", "")
+                        return 1
+
+                    with patch("central_nvr.ui.main_window.SettingsDialog.exec", side_effect=_reset_default_dir):
+                        window._open_settings_dialog()
+
+                    btn_open.click()
+                    popen_mock.assert_called_once_with(["xdg-open", str(data_dir)])
+                    warn_mock.assert_not_called()
+                finally:
+                    window.close()
+                    self.app.processEvents()
+                    self.assertTrue(drain_retired_threads(5000))
+                    window.deleteLater()
+                    QCoreApplication.sendPostedEvents(window, QEvent.Type.DeferredDelete)
+                    QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+                    self.app.processEvents()
+
     def test_main_window_propagates_snapshot_dir_to_recordings_panel(self):
         from central_nvr.ui.main_window import MainWindow
 
