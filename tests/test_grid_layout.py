@@ -146,6 +146,63 @@ class PaginationTest(GridTestBase):
         self.assertEqual(self.grid.current_page, 0)
         self.assertEqual(len(self._visible_ids()), 5)
 
+    def test_select_camera_on_other_page_switches_page_and_syncs_state(self):
+        """#81: seleção programática de câmera em outra página muda de página sem emitir camera_selected."""
+        self.grid.set_cameras(_cams(5))
+        self.grid.set_layout_mode("2x2")
+        views = self.grid.camera_views
+        emitted = []
+        self.grid.camera_selected.connect(emitted.append)
+
+        # Câmera na mesma página mantém a página atual
+        self.grid.select_camera("c2")
+        self.assertEqual(self.grid.current_page, 0)
+        self.assertTrue(views["c2"].is_selected)
+        self.assertFalse(views["c1"].is_selected)
+        self.assertEqual(self.grid.lbl_page.text(), "Página 1/2")
+        self.assertEqual(emitted, [])
+
+        # Câmera na página 1 muda de página, exibe/retoma c5 e oculta/pausa c1..c4
+        self.grid.select_camera("c5")
+        self.assertEqual(self.grid.current_page, 1)
+        self.assertEqual(self._visible_ids(), ["c5"])
+        self.assertFalse(views["c5"].isHidden())
+        self.assertTrue(views["c5"].is_selected)
+        self.assertTrue(views["c1"].isHidden())
+        self.assertFalse(views["c2"].is_selected)
+        self.assertTrue(views["c1"].worker.is_paused)
+        self.assertFalse(views["c5"].worker.is_paused)
+        self.assertEqual(self.grid.lbl_page.text(), "Página 2/2")
+        self.assertTrue(self.grid.btn_prev_page.isEnabled())
+        self.assertFalse(self.grid.btn_next_page.isEnabled())
+        self.assertEqual(emitted, [])
+
+        # Voltar para câmera da página 0 restaura a página 0
+        self.grid.select_camera("c1")
+        self.assertEqual(self.grid.current_page, 0)
+        self.assertEqual(self._visible_ids(), ["c1", "c2", "c3", "c4"])
+        self.assertTrue(views["c1"].is_selected)
+        self.assertFalse(views["c5"].is_selected)
+        self.assertFalse(views["c1"].worker.is_paused)
+        self.assertTrue(views["c5"].worker.is_paused)
+        self.assertEqual(self.grid.lbl_page.text(), "Página 1/2")
+        self.assertEqual(emitted, [])
+
+    def test_select_camera_in_1x1_keeps_existing_behavior(self):
+        """#81: em modo 1x1, select_camera mantém a troca direta de câmera sem emitir camera_selected."""
+        self.grid.set_cameras(_cams(5))
+        self.grid.set_layout_mode("1x1")
+        views = self.grid.camera_views
+        emitted = []
+        self.grid.camera_selected.connect(emitted.append)
+
+        self.grid.select_camera("c4")
+        self.assertEqual(self._visible_ids(), ["c4"])
+        self.assertTrue(views["c4"].is_selected)
+        self.assertFalse(views["c1"].is_selected)
+        self.assertEqual(self.grid.lbl_page.text(), "Página 4/5")
+        self.assertEqual(emitted, [])
+
 
 if __name__ == "__main__":
     unittest.main()

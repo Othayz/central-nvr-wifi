@@ -512,6 +512,11 @@ class CameraGridWidget(QWidget):
             view.set_selected(cid == camera_id)
         if self.grid_layout_mode == "1x1":
             self.apply_layout("1x1")
+        elif camera_id in self.camera_views:
+            ids = list(self.camera_views)
+            target_page = ids.index(camera_id) // self.page_capacity(self.grid_layout_mode)
+            if target_page != self.current_page:
+                self.set_page(target_page)
 
     def update_camera_name(self, camera_id: str, new_name: str):
         """Atualiza dinamicamente o nome da câmera na visualização do grid e nos dados internos."""
