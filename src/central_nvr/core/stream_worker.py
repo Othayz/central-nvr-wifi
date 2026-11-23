@@ -271,6 +271,7 @@ class StreamWorker(QThread):
         """Anuncia transições de pausa a partir da thread do worker."""
         if self._is_paused and not self._paused_announced:
             self._paused_announced = True
+            self._clear_motion_state()
             self.state_changed.emit(ConnectionState.PAUSED, "Pausada (fora da tela)")
         elif not self._is_paused and self._paused_announced:
             self._paused_announced = False
@@ -340,6 +341,7 @@ class StreamWorker(QThread):
         if self.camera.rtsp_url.startswith("demo://"):
             self.stats.transport_mode = TransportMode.DEMO.value
             self._run_test_pattern_stream()
+            self._clear_motion_state()
             self.state_changed.emit(ConnectionState.DISCONNECTED, "Desconectado")
             return
 
@@ -347,6 +349,7 @@ class StreamWorker(QThread):
         while self._is_running:
             started = time.monotonic()
             outcome = self._connect_once()
+            self._clear_motion_state()
             if not self._is_running or outcome == StreamOutcome.STOPPED:
                 break
 
@@ -384,7 +387,18 @@ class StreamWorker(QThread):
                 self.state_changed.emit(ConnectionState.ERROR, f"Câmera Offline / Sem Conexão — nova tentativa em {delay:.0f}s")
             self._wait(delay)
 
+        self._clear_motion_state()
         self.state_changed.emit(ConnectionState.DISCONNECTED, "Desconectado")
+
+    def _clear_motion_state(self):
+        """Desliga o alerta de movimento ativo e libera o buffer de amostra anterior."""
+        was_active = self._motion_active
+        self._motion_active = False
+        self._motion_cooldown = 0
+        self._prev_sample_matrix = None
+        self.stats.motion_detected = False
+        if was_active:
+            self.motion_detected.emit(self.camera.id, False)
 
     def _reset_stats(self):
         self.stats.fps = 0.0
@@ -393,6 +407,7 @@ class StreamWorker(QThread):
         self.stats.jitter_ms = 0.0
         self.stats.hw_accel_active = False
         self.stats.hw_accel_backend = ""
+        self._clear_motion_state()
         self.stats_updated.emit(replace(self.stats))
 
     def _connect_once(self) -> StreamOutcome:
@@ -1037,11 +1052,7 @@ class StreamWorker(QThread):
         if not HAS_NUMPY or rgb_array is None:
             return
         if not self.motion_detection:
-            if self._motion_active:
-                self._motion_active = False
-                self._motion_cooldown = 0
-                self.motion_detected.emit(self.camera.id, False)
-            self._prev_sample_matrix = None
+            self._clear_motion_state()
             return
 
         self._motion_eval_counter += 1
@@ -1049,13 +1060,13 @@ class StreamWorker(QThread):
             return
 
         try:
-            # Sub-amostragem rápida por slicing
+            # Sub-amostragem rápida por slicing; cópia independente em int16 evita reter o frame RGB completo
             step_y = max(1, height // 36)
             step_x = max(1, width // 64)
-            sample_gray = rgb_array[::step_y, ::step_x, 0]  # Canal R como aproximação de luminância
+            sample_gray = rgb_array[::step_y, ::step_x, 0].astype(np.int16, copy=True)
 
             if self._prev_sample_matrix is not None and self._prev_sample_matrix.shape == sample_gray.shape:
-                diff = np.abs(sample_gray.astype(np.int16) - self._prev_sample_matrix.astype(np.int16))
+                diff = np.abs(sample_gray - self._prev_sample_matrix)
                 avg_diff = float(np.mean(diff))
 
                 # Limiar de sensibilidade de movimento (~8.0 em escala de 0-255)
