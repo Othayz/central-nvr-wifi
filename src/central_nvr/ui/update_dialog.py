@@ -81,6 +81,17 @@ def _format_markdown_to_html(md_text: str) -> str:
     return "".join(html_lines)
 
 
+def _disconnect_worker_signals(worker, *signal_names: str) -> None:
+    """Desconecta os sinais informados de um worker antes de interrompê-lo ou aposentá-lo."""
+    for name in signal_names:
+        sig = getattr(worker, name, None)
+        if sig is not None:
+            try:
+                sig.disconnect()
+            except (RuntimeError, TypeError):
+                pass
+
+
 class BaseUpdateDialog(QDialog):
     """
     Classe base para diálogos de atualização (StartupUpdateDialog e UpdateDialog).
@@ -162,44 +173,67 @@ class BaseUpdateDialog(QDialog):
 
     def _cleanup_workers(self):
         """
-        Interrompe e aguarda a finalização segura de qualquer worker assíncrono ativo.
+        Desconecta sinais, interrompe e aguarda a finalização segura de qualquer worker assíncrono ativo.
 
         Os workers são filhos do diálogo: destruí-lo com uma thread ainda em execução aborta o
         processo ("QThread: Destroyed while thread is still running"). Quem não terminar dentro
         da espera curta é aposentado (retire_thread), que o desvincula do diálogo e o mantém vivo
-        até o run() retornar.
+        até o run() retornar. Os sinais são desconectados antes da espera/aposentadoria para evitar
+        que eventos tardios disparem slots num diálogo já fechado.
         """
         checksum_worker = getattr(self, "checksum_worker", None)
-        if checksum_worker and checksum_worker.isRunning():
-            checksum_worker.wait(500)
+        self.checksum_worker = None
+        if checksum_worker is not None:
+            _disconnect_worker_signals(checksum_worker, "checksum_ready", "checksum_missing")
+            if checksum_worker.isRunning():
+                checksum_worker.wait(500)
 
         check_worker = getattr(self, "check_worker", None) or getattr(self, "worker", None)
-        if check_worker and check_worker.isRunning():
-            try:
-                check_worker.quit()
-                check_worker.wait(300)
-            except Exception:
-                pass
+        self.check_worker = None
+        if hasattr(self, "worker"):
+            self.worker = None
+        if check_worker is not None:
+            _disconnect_worker_signals(
+                check_worker,
+                "update_available",
+                "no_update_available",
+                "check_failed",
+            )
+            if check_worker.isRunning():
+                try:
+                    check_worker.quit()
+                    check_worker.wait(300)
+                except Exception:
+                    pass
 
         download_worker = getattr(self, "download_worker", None)
-        if download_worker and download_worker.isRunning():
-            try:
-                download_worker.cancel()
-                download_worker.wait(500)
-            except Exception:
-                pass
+        self.download_worker = None
+        if download_worker is not None:
+            _disconnect_worker_signals(
+                download_worker,
+                "progress",
+                "download_finished",
+                "download_failed",
+            )
+            if download_worker.isRunning():
+                try:
+                    download_worker.cancel()
+                    download_worker.wait(500)
+                except Exception:
+                    pass
 
         for worker in (checksum_worker, check_worker, download_worker):
-            if worker and worker.isRunning():
+            if worker is not None and worker.isRunning():
                 retire_thread(worker)
+
+    def done(self, result: int):
+        # accept(), reject(), Esc e fechamentos programáticos passam por aqui
+        self._cleanup_workers()
+        super().done(result)
 
     def closeEvent(self, event):
         self._cleanup_workers()
         super().closeEvent(event)
-
-    def reject(self):
-        self._cleanup_workers()
-        super().reject()
 
 
 class StartupUpdateDialog(BaseUpdateDialog):
@@ -601,11 +635,11 @@ class UpdateDialog(BaseUpdateDialog):
         self.lbl_status.setText("Verificando se há novas versões no GitHub...")
         self.btn_action.setEnabled(False)
 
-        self.worker = UpdateCheckWorker(repo=self.repo, token=self.token, parent=self)
-        self.worker.update_available.connect(self._display_release)
-        self.worker.no_update_available.connect(self._on_up_to_date)
-        self.worker.check_failed.connect(self._on_check_error)
-        self.worker.start()
+        self.check_worker = UpdateCheckWorker(repo=self.repo, token=self.token, parent=self)
+        self.check_worker.update_available.connect(self._display_release)
+        self.check_worker.no_update_available.connect(self._on_up_to_date)
+        self.check_worker.check_failed.connect(self._on_check_error)
+        self.check_worker.start()
 
     def _display_release(self, release: ReleaseInfo):
         self.release_info = release
