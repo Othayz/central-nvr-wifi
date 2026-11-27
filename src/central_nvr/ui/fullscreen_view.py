@@ -4,11 +4,10 @@ Exibe 100% da tela do monitor apenas com o vídeo da câmera, com controles
 OSD inteligentes que se ocultam automaticamente para não atrapalhar a visão do vídeo.
 """
 import datetime
-import re
 from pathlib import Path
 from typing import Optional
 
-from PySide6.QtCore import QRect, Qt, QTimer, Signal
+from PySide6.QtCore import QBuffer, QIODevice, QRect, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QImage, QPainter
 from PySide6.QtWidgets import (
     QHBoxLayout,
@@ -20,6 +19,7 @@ from PySide6.QtWidgets import (
 
 from central_nvr.core.camera import CameraDevice
 from central_nvr.core.config import get_data_dir
+from central_nvr.core.snapshots import next_snapshot_path, open_unique_snapshot
 
 
 class FullscreenPlayerWindow(QWidget):
@@ -266,15 +266,31 @@ class FullscreenPlayerWindow(QWidget):
             except OSError:
                 self._show_toast("⚠️ Falha ao salvar foto.")
                 return
-            ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            safe_id = re.sub(r'[^a-zA-Z0-9_-]', '_', str(self.camera.id))
-            filename = f"snap_{safe_id}_{ts}.jpg"
-            filepath = str(snap_dir / filename)
-            saved = self.current_frame.save(filepath, "JPEG", 95)
-            if saved:
-                self._show_toast(f"📸 Foto salva com sucesso! ({filename})")
-            else:
+            buf = QBuffer()
+            if not buf.open(QIODevice.OpenModeFlag.WriteOnly):
                 self._show_toast("⚠️ Falha ao salvar foto.")
+                return
+            saved_to_buf = self.current_frame.save(buf, "JPEG", 95)
+            payload = bytes(buf.data()) if saved_to_buf else b""
+            buf.close()
+            if not saved_to_buf or not payload:
+                self._show_toast("⚠️ Falha ao salvar foto.")
+                return
+            actual_path = None
+            try:
+                target = next_snapshot_path(snap_dir, self.camera.id)
+                actual_path, fp = open_unique_snapshot(target)
+                with fp:
+                    fp.write(payload)
+            except OSError:
+                if actual_path is not None:
+                    try:
+                        actual_path.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                self._show_toast("⚠️ Falha ao salvar foto.")
+                return
+            self._show_toast(f"📸 Foto salva com sucesso! ({actual_path.name})")
         else:
             self._show_toast("⚠️ Sem sinal de vídeo para capturar foto.")
 
