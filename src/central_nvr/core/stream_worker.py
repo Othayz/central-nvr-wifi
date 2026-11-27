@@ -2,6 +2,7 @@
 Worker de Streaming RTSP de Baixa Latência com suporte a VA-API / Aceleração de Hardware,
 Transporte Adaptativo (Auto-Fallback UDP/TCP), Métricas de QoS (Jitter/Perda) e Detecção de Movimento Integrada.
 """
+from collections import deque
 from dataclasses import replace
 from enum import Enum
 import errno
@@ -165,6 +166,7 @@ class StreamWorker(QThread):
     stats_updated = Signal(object)  # StreamStats
     state_changed = Signal(object, str)  # (ConnectionState, message)
     snapshot_saved = Signal(str)  # filepath
+    MAX_PENDING_SNAPSHOTS = 8
     motion_detected = Signal(str, bool)  # (camera_id, is_motion)
     # (sub-stream em uso, sub-stream pedido): emitido quando a transmissão começa (Issue #26)
     stream_variant = Signal(bool, bool)
@@ -204,7 +206,8 @@ class StreamWorker(QThread):
         self._latest_frame: Optional[QImage] = None
         self._frame_pending = False
         self._target_size: Optional[Tuple[int, int]] = None
-        self._request_snapshot: Optional[str] = None
+        self._snapshot_lock = threading.Lock()
+        self._snapshot_queue: deque = deque(maxlen=self.MAX_PENDING_SNAPSHOTS)
 
         # Estatísticas e Métricas de QoS
         self.stats = StreamStats()
@@ -300,7 +303,10 @@ class StreamWorker(QThread):
 
     def take_snapshot(self, output_path: str):
         """Solicita a gravação do próximo frame como imagem no disco."""
-        self._request_snapshot = output_path
+        if not output_path:
+            return
+        with self._snapshot_lock:
+            self._snapshot_queue.append(output_path)
 
     # ------------------------------------------------------------------
     # Laço de conexão e reconexão (Issue #27)
@@ -978,17 +984,36 @@ class StreamWorker(QThread):
 
     def _process_and_emit_frame(self, rgb_array: Any, width: int, height: int, latency_ms: float):
         """Converte o array RGB para QImage, calcula QoS (Jitter) e avalia detecção de movimento."""
-        # Salvar snapshot se solicitado
-        if self._request_snapshot:
+        # Salvar snapshots pendentes na fila sem sobrescrever arquivos existentes (Issue #67)
+        pending_snapshots: List[str] = []
+        with self._snapshot_lock:
+            while self._snapshot_queue:
+                pending_snapshots.append(self._snapshot_queue.popleft())
+        if pending_snapshots:
+            from central_nvr.core.snapshots import open_unique_snapshot
+
+            img = None
             try:
                 from PIL import Image
                 img = Image.fromarray(rgb_array)
-                img.save(self._request_snapshot)
-                self.snapshot_saved.emit(self._request_snapshot)
             except Exception as e:
-                logger.error(f"Erro salvando snapshot: {e}")
-            finally:
-                self._request_snapshot = None
+                logger.error(f"Erro preparando imagem de snapshot: {e}")
+            if img is not None:
+                for target_path in pending_snapshots:
+                    actual_path = None
+                    try:
+                        actual_path, fp = open_unique_snapshot(target_path)
+                        img_format = "PNG" if actual_path.suffix.lower() == ".png" else "JPEG"
+                        with fp:
+                            img.save(fp, format=img_format)
+                        self.snapshot_saved.emit(str(actual_path))
+                    except Exception as e:
+                        if actual_path is not None:
+                            try:
+                                actual_path.unlink(missing_ok=True)
+                            except OSError:
+                                pass
+                        logger.error(f"Erro salvando snapshot: {e}")
 
         # Garantir array contíguo em memória para QImage estável
         if HAS_NUMPY and isinstance(rgb_array, np.ndarray) and not rgb_array.flags["C_CONTIGUOUS"]:

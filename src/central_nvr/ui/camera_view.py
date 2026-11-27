@@ -3,7 +3,6 @@ Widget de Viewport de Câmera Individual com OSD, Controles em Tempo Real e Reno
 """
 import datetime
 import html
-import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,6 +22,7 @@ from PySide6.QtWidgets import (
 )
 
 from central_nvr.core.camera import DEFAULT_RTSP_TRANSPORT, CameraDevice, ConnectionState, StreamStats
+from central_nvr.core.snapshots import next_snapshot_path
 from central_nvr.core.stream_worker import StreamWorker
 from central_nvr.core.threads import retire_thread
 
@@ -770,12 +770,9 @@ class CameraViewWidget(QFrame):
         snap_dir = self.options.resolved_snapshot_dir()
         try:
             snap_dir.mkdir(parents=True, exist_ok=True)
+            filepath = str(next_snapshot_path(snap_dir, self.camera.id))
         except OSError:
             return
-        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        safe_id = re.sub(r'[^a-zA-Z0-9_-]', '_', str(self.camera.id))
-        filename = f"snap_{safe_id}_{ts}.jpg"
-        filepath = str(snap_dir / filename)
         if self.worker and self.worker.isRunning():
             self.worker.take_snapshot(filepath)
 
