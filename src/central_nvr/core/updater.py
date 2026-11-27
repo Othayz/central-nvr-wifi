@@ -29,6 +29,8 @@ from central_nvr import __version__
 logger = logging.getLogger(__name__)
 
 _SHA256_RE = re.compile(r"^[a-fA-F0-9]{64}$")
+# Formato estrito do GNU sha256sum: <64 hex><espaço><espaço ou *><nome> (Issue #110)
+_SHA256SUM_LINE_RE = re.compile(r"^([a-fA-F0-9]{64}) [ *](.+)$")
 
 DEFAULT_GITHUB_REPO = "Othayz/central-nvr-wifi"
 
@@ -582,6 +584,68 @@ def verify_file_sha256(file_path: str, expected_sha256: str) -> bool:
     return actual_hash.strip().lower() == expected_sha256.strip().lower()
 
 
+def parse_sha256sums(text: str) -> Dict[str, str]:
+    """
+    Faz parse estrito de conteúdo no formato GNU sha256sum:
+        <64 hex><espaço><espaço ou *><nome>
+
+    Nomes com múltiplas entradas (duplicadas ou conflitantes) são descartados
+    e não constam no dicionário retornado (Issue #110).
+    """
+    if not text:
+        return {}
+
+    entries: Dict[str, Optional[str]] = {}
+    for line in text.lstrip("\ufeff").splitlines():
+        if not line.strip():
+            continue
+        m = _SHA256SUM_LINE_RE.match(line)
+        if not m:
+            continue
+        digest = m.group(1).lower()
+        name = m.group(2)
+        if name in entries:
+            entries[name] = None
+        else:
+            entries[name] = digest
+
+    return {name: digest for name, digest in entries.items() if digest is not None}
+
+
+def find_sha256_for_asset(
+    text: str,
+    asset_name: str,
+    *,
+    allow_bare_hash: bool = False,
+) -> Optional[str]:
+    """
+    Resolve o SHA-256 exato de `asset_name` em texto de checksum (Issue #110).
+
+    - Com `allow_bare_hash=False` (ex.: `sha256sums.txt`): aplica `parse_sha256sums`
+      e compara o nome do arquivo por igualdade exata.
+    - Com `allow_bare_hash=True` (ex.: `<asset>.sha256`): aceita apenas uma única
+      linha não vazia com o nome igual ao asset no formato `sha256sum`, ou um arquivo
+      contendo somente o hash de 64 hexadecimais. Rejeita entradas múltiplas/ambíguas.
+    """
+    if not text or not asset_name:
+        return None
+
+    if allow_bare_hash:
+        lines = [line for line in text.lstrip("\ufeff").splitlines() if line.strip()]
+        if len(lines) != 1:
+            return None
+        line = lines[0]
+        stripped = line.strip()
+        if _SHA256_RE.match(stripped):
+            return stripped.lower()
+        m = _SHA256SUM_LINE_RE.match(line)
+        if m and m.group(2) == asset_name:
+            return m.group(1).lower()
+        return None
+
+    return parse_sha256sums(text).get(asset_name)
+
+
 def get_expected_sha256_for_asset(
     release_info: ReleaseInfo,
     asset_name: str,
@@ -589,9 +653,10 @@ def get_expected_sha256_for_asset(
 ) -> Optional[str]:
     """
     Busca o checksum SHA-256 correspondente ao asset da release do GitHub (SEC-07).
-    Examina anexos de checksum (ex: sha256sums.txt, <asset>.sha256) e o corpo da release.
+    Examina apenas anexos de checksum da release (<asset>.sha256, sha256sums.txt),
+    sem fallback para o corpo da release (Issue #110).
     """
-    if not release_info:
+    if not release_info or not asset_name:
         return None
 
     direct_sha_asset = None
@@ -599,10 +664,15 @@ def get_expected_sha256_for_asset(
 
     for a in release_info.assets:
         aname_low = a.name.lower()
-        if a.name == f"{asset_name}.sha256" or a.name == f"{asset_name}.sha256sum":
+        if direct_sha_asset is None and a.name in (f"{asset_name}.sha256", f"{asset_name}.sha256sum"):
             direct_sha_asset = a
-            break
-        if aname_low in ("sha256sums.txt", "sha256sums", "checksums.txt", "checksums", "sha256.txt"):
+        elif checksum_asset is None and aname_low in (
+            "sha256sums.txt",
+            "sha256sums",
+            "checksums.txt",
+            "checksums",
+            "sha256.txt",
+        ):
             checksum_asset = a
 
     def _get(asset: ReleaseAsset):
@@ -615,9 +685,7 @@ def get_expected_sha256_for_asset(
         try:
             resp = _get(direct_sha_asset)
             if resp.status_code == 200:
-                m = re.search(r"([a-fA-F0-9]{64})", resp.text)
-                if m:
-                    return m.group(1).lower()
+                return find_sha256_for_asset(resp.text, asset_name, allow_bare_hash=True)
         except Exception as e:
             logger.debug(f"Erro ao baixar checksum {direct_sha_asset.name}: {e}")
 
@@ -625,20 +693,9 @@ def get_expected_sha256_for_asset(
         try:
             resp = _get(checksum_asset)
             if resp.status_code == 200:
-                for line in resp.text.splitlines():
-                    if asset_name in line:
-                        m = re.search(r"([a-fA-F0-9]{64})", line)
-                        if m:
-                            return m.group(1).lower()
+                return find_sha256_for_asset(resp.text, asset_name, allow_bare_hash=False)
         except Exception as e:
             logger.debug(f"Erro ao baixar checksum {checksum_asset.name}: {e}")
-
-    if release_info.body:
-        for line in release_info.body.splitlines():
-            if asset_name in line:
-                m = re.search(r"([a-fA-F0-9]{64})", line)
-                if m:
-                    return m.group(1).lower()
 
     return None
 
