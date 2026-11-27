@@ -442,24 +442,33 @@ class TestUpdaterWorkers(unittest.TestCase):
         mode = oct(updates_dir.stat().st_mode)[-3:]
         self.assertEqual(mode, "700")
 
-    def test_get_expected_sha256_for_asset(self):
-        """Valida extração de hash SHA-256 das releases do GitHub (SEC-07)."""
-        from central_nvr.core.updater import get_expected_sha256_for_asset, ReleaseInfo, ReleaseAsset
-        
+    def test_get_expected_sha256_for_asset_ignores_release_body(self):
+        """Hash presente apenas no corpo da release não é mais aceito (Issue #110)."""
+        from central_nvr.core.updater import get_expected_sha256_for_asset, resolve_checksum_or_none
+
+        sha = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"
         rel = ReleaseInfo(
             tag_name="v1.2.0",
             version="1.2.0",
             title="Release 1.2.0",
-            body="Notas:\nSHA256 (central-nvr_1.2.0_all.deb) = a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+            body=(
+                f"Notas:\n"
+                f"SHA256 (Central_NVR_WiFi-1.2.0-x86_64.AppImage) = {sha}\n"
+                f"{sha}  Central_NVR_WiFi-1.2.0-x86_64.AppImage\n"
+            ),
             html_url="",
             published_at="",
             assets=[
-                ReleaseAsset(name="central-nvr_1.2.0_all.deb", size=1000, download_url="http://fake/deb")
+                ReleaseAsset(
+                    name="Central_NVR_WiFi-1.2.0-x86_64.AppImage",
+                    size=1000,
+                    download_url="http://fake/appimage",
+                )
             ],
         )
 
-        h = get_expected_sha256_for_asset(rel, "central-nvr_1.2.0_all.deb")
-        self.assertEqual(h, "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2")
+        self.assertIsNone(get_expected_sha256_for_asset(rel, "Central_NVR_WiFi-1.2.0-x86_64.AppImage"))
+        self.assertIsNone(resolve_checksum_or_none(rel, "Central_NVR_WiFi-1.2.0-x86_64.AppImage"))
 
     def test_install_downloaded_package_user_local(self):
         from central_nvr.core.updater import compute_file_sha256, install_downloaded_package
@@ -498,6 +507,185 @@ class TestUpdaterWorkers(unittest.TestCase):
             rel = _parse_github_release_dict(mock_data)
             self.assertEqual(rel.version, "1.0.0")
             self.assertFalse(rel.is_newer)
+
+class TestStrictChecksumParsing(unittest.TestCase):
+    """Testes do parse estrito de checksum SHA-256 (Issue #110)."""
+
+    ASSET = "Central_NVR_WiFi-1.3.4-x86_64.AppImage"
+    HASH_A = "a" * 64
+    HASH_B = "b" * 64
+    HASH_C = "c" * 64
+
+    def _make_release(self, *extra_assets: ReleaseAsset, body: str = "") -> ReleaseInfo:
+        return ReleaseInfo(
+            tag_name="v1.3.4",
+            version="1.3.4",
+            title="Release 1.3.4",
+            body=body,
+            html_url="",
+            published_at="",
+            assets=[
+                ReleaseAsset(name=self.ASSET, size=1000, download_url=f"https://example.test/{self.ASSET}"),
+                *extra_assets,
+            ],
+        )
+
+    def test_appimage_vs_zsync_selects_exact_appimage_hash(self):
+        from central_nvr.core.updater import find_sha256_for_asset, get_expected_sha256_for_asset
+
+        sums_text = (
+            f"{self.HASH_A}  {self.ASSET}.zsync\n"
+            f"{self.HASH_B}  {self.ASSET}\n"
+        )
+        self.assertEqual(find_sha256_for_asset(sums_text, self.ASSET), self.HASH_B)
+
+        sums_asset = ReleaseAsset(name="sha256sums.txt", size=200, download_url="https://example.test/sha256sums.txt")
+        resp = MagicMock(status_code=200, text=sums_text)
+        with patch("central_nvr.core.updater.requests.get", return_value=resp):
+            self.assertEqual(get_expected_sha256_for_asset(self._make_release(sums_asset), self.ASSET), self.HASH_B)
+
+    def test_binary_mode_asterisk_prefix_accepted(self):
+        from central_nvr.core.updater import find_sha256_for_asset, parse_sha256sums
+
+        upper_hash = self.HASH_A.upper()
+        sums_text = f"{upper_hash} *{self.ASSET}\n"
+        self.assertEqual(parse_sha256sums(sums_text), {self.ASSET: self.HASH_A})
+        self.assertEqual(find_sha256_for_asset(sums_text, self.ASSET), self.HASH_A)
+        self.assertEqual(find_sha256_for_asset(sums_text, self.ASSET, allow_bare_hash=True), self.HASH_A)
+
+    def test_similar_prefix_or_suffix_names_do_not_match(self):
+        from central_nvr.core.updater import find_sha256_for_asset
+
+        sums_text = (
+            f"{self.HASH_A}  {self.ASSET}.zsync\n"
+            f"{self.HASH_A}  {self.ASSET}.sha256\n"
+            f"{self.HASH_A}  prefix-{self.ASSET}\n"
+            f"{self.HASH_A}  dist/{self.ASSET}\n"
+            f"{self.HASH_A}  ./{self.ASSET}\n"
+            f"{self.HASH_A} {self.ASSET}\n"  # separador inválido (apenas 1 espaço)
+            f"{self.HASH_A}   {self.ASSET}\n"  # espaço extra no início do nome
+        )
+        self.assertIsNone(find_sha256_for_asset(sums_text, self.ASSET))
+
+    def test_conflicting_and_duplicate_entries_for_same_name_return_none(self):
+        from central_nvr.core.updater import find_sha256_for_asset, parse_sha256sums
+
+        # Conflito entre dois hashes diferentes
+        conflicting = (
+            f"{self.HASH_A}  {self.ASSET}\n"
+            f"{self.HASH_B}  {self.ASSET}\n"
+        )
+        self.assertIsNone(find_sha256_for_asset(conflicting, self.ASSET))
+        self.assertNotIn(self.ASSET, parse_sha256sums(conflicting))
+
+        # Três entradas conflitantes (a 3ª não pode re-inserir a chave)
+        triple_conflict = conflicting + f"{self.HASH_C}  {self.ASSET}\n"
+        self.assertIsNone(find_sha256_for_asset(triple_conflict, self.ASSET))
+
+        # Conflito misturando modo texto e modo binário para o mesmo nome
+        mixed_mode = (
+            f"{self.HASH_A}  {self.ASSET}\n"
+            f"{self.HASH_B} *{self.ASSET}\n"
+        )
+        self.assertIsNone(find_sha256_for_asset(mixed_mode, self.ASSET))
+
+        # Entrada duplicada (mesmo hash repetido) para o mesmo nome
+        duplicated = (
+            f"{self.HASH_A}  {self.ASSET}\n"
+            f"{self.HASH_A}  {self.ASSET}\n"
+        )
+        self.assertIsNone(find_sha256_for_asset(duplicated, self.ASSET))
+
+        # Conflito em outro arquivo não invalida o asset alvo íntegro
+        other_conflict = (
+            f"{self.HASH_A}  other.tar.gz\n"
+            f"{self.HASH_B}  other.tar.gz\n"
+            f"{self.HASH_C}  {self.ASSET}\n"
+        )
+        self.assertEqual(find_sha256_for_asset(other_conflict, self.ASSET), self.HASH_C)
+
+    def test_direct_sha256_asset_rules(self):
+        from central_nvr.core.updater import get_expected_sha256_for_asset
+
+        direct_asset = ReleaseAsset(
+            name=f"{self.ASSET}.sha256",
+            size=100,
+            download_url=f"https://example.test/{self.ASSET}.sha256",
+        )
+        rel = self._make_release(direct_asset)
+
+        # Formato sha256sum com nome exato -> aceito
+        with patch("central_nvr.core.updater.requests.get", return_value=MagicMock(status_code=200, text=f"{self.HASH_A}  {self.ASSET}\n")):
+            self.assertEqual(get_expected_sha256_for_asset(rel, self.ASSET), self.HASH_A)
+
+        # Formato hash puro (sem nome) -> aceito
+        with patch("central_nvr.core.updater.requests.get", return_value=MagicMock(status_code=200, text=f"  {self.HASH_B.upper()}  \n")):
+            self.assertEqual(get_expected_sha256_for_asset(rel, self.ASSET), self.HASH_B)
+
+        # Nome divergente em <asset>.sha256 -> rejeitado
+        with patch("central_nvr.core.updater.requests.get", return_value=MagicMock(status_code=200, text=f"{self.HASH_A}  {self.ASSET}.zsync\n")):
+            self.assertIsNone(get_expected_sha256_for_asset(rel, self.ASSET))
+
+        # Múltiplas entradas ambíguas em <asset>.sha256 -> rejeitado
+        for ambiguous in (
+            f"{self.HASH_A}\n{self.HASH_B}\n",
+            f"{self.HASH_A}  {self.ASSET}\n{self.HASH_B}  {self.ASSET}\n",
+            f"{self.HASH_A}  other.AppImage\n{self.HASH_B}  {self.ASSET}\n",
+            f"SHA256 ({self.ASSET}) = {self.HASH_A}\n",
+        ):
+            with patch("central_nvr.core.updater.requests.get", return_value=MagicMock(status_code=200, text=ambiguous)):
+                self.assertIsNone(get_expected_sha256_for_asset(rel, self.ASSET))
+
+    def test_direct_sha256_http_error_falls_back_to_sha256sums(self):
+        from central_nvr.core.updater import get_expected_sha256_for_asset
+
+        direct_asset = ReleaseAsset(
+            name=f"{self.ASSET}.sha256",
+            size=100,
+            download_url=f"https://example.test/{self.ASSET}.sha256",
+        )
+        sums_asset = ReleaseAsset(
+            name="sha256sums.txt",
+            size=200,
+            download_url="https://example.test/sha256sums.txt",
+        )
+        rel = self._make_release(direct_asset, sums_asset)
+
+        def fake_get(url, **kwargs):
+            if url.endswith(".sha256"):
+                return MagicMock(status_code=404, text="Not Found")
+            return MagicMock(status_code=200, text=f"{self.HASH_C}  {self.ASSET}\n")
+
+        with patch("central_nvr.core.updater.requests.get", side_effect=fake_get):
+            self.assertEqual(get_expected_sha256_for_asset(rel, self.ASSET), self.HASH_C)
+
+    def test_compatible_with_build_appimage_sha256sum_output(self):
+        """Formato gerado por packaging/build_appimage.sh (sha256sum) continua compatível."""
+        import shutil
+        import subprocess
+        from central_nvr.core.updater import find_sha256_for_asset
+
+        sha256sum_bin = shutil.which("sha256sum")
+        if not sha256sum_bin:
+            self.skipTest("sha256sum não disponível no ambiente")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            app_path = Path(tmpdir) / self.ASSET
+            payload = b"fake appimage payload for sha256sum test"
+            app_path.write_bytes(payload)
+            expected = hashlib.sha256(payload).hexdigest()
+
+            # Mesmo comando usado em packaging/build_appimage.sh (L155-156)
+            direct_out = subprocess.check_output(
+                [sha256sum_bin, self.ASSET], cwd=tmpdir, text=True
+            )
+            sums_out = subprocess.check_output(
+                [sha256sum_bin, self.ASSET], cwd=tmpdir, text=True
+            )
+
+            self.assertEqual(find_sha256_for_asset(direct_out, self.ASSET, allow_bare_hash=True), expected)
+            self.assertEqual(find_sha256_for_asset(sums_out, self.ASSET, allow_bare_hash=False), expected)
+
 
 if __name__ == "__main__":
     unittest.main()
