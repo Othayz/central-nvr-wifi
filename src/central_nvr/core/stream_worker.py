@@ -293,6 +293,7 @@ class StreamWorker(QThread):
 
     def _announce_streaming(self, message: str):
         """Estado AO VIVO + qual stream de fato conectou (o rótulo HD/SD segue este sinal)."""
+        self._paused_announced = False
         self.state_changed.emit(ConnectionState.STREAMING, message)
         is_sub = bool(self._current_url) and self._current_url == self.camera.get_substream_url()
         self.stream_variant.emit(is_sub, self.prefer_substream)
@@ -357,6 +358,8 @@ class StreamWorker(QThread):
                 self._update_pause_state()
                 while self._is_running and self._is_paused:
                     time.sleep(0.1)
+                if not self._is_paused:
+                    self._paused_announced = False
                 continue
 
             if outcome == StreamOutcome.RESTART or self._switch_requested:
