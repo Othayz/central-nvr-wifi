@@ -1,6 +1,7 @@
 """
 Parser para mensagens XML SOAP de WS-Discovery e ONVIF com validação Anti-SSRF.
 """
+import ipaddress
 import logging
 import re
 import urllib.parse
@@ -14,6 +15,15 @@ except ImportError:
         pass
     HAS_DEFUSEDXML = False
 from typing import Any, Dict, List, Optional, Tuple
+
+try:
+    from urllib3.exceptions import LocationParseError
+    from urllib3.util import parse_url as urllib3_parse_url
+except ImportError:  # pragma: no cover
+    LocationParseError = ValueError
+    urllib3_parse_url = None
+
+from central_nvr.core.camera import host_for_url
 
 logger = logging.getLogger(__name__)
 
@@ -86,23 +96,80 @@ def parse_ws_discovery_response(xml_data: str, source_ip: str = "") -> Optional[
     return devices[0] if devices else None
 
 
+def _normalize_host(host: Optional[str]) -> Optional[str]:
+    """Remove colchetes de literais IPv6 e normaliza endereços IP para forma canônica."""
+    if not host:
+        return None
+    raw = host[1:-1] if host.startswith("[") and host.endswith("]") else host
+    try:
+        return ipaddress.ip_address(raw).compressed
+    except ValueError:
+        return raw.lower()
+
+
 def _parse_valid_xaddr(ep: str, source_ip: str) -> Optional[Tuple[str, str, int]]:
     """Valida um XAddr contra URLs malformadas e Anti-SSRF, retornando (endpoint, host, porta)."""
+    if not ep:
+        return None
     try:
+        if any(
+            ch == "\\" or ord(ch) <= 0x20 or 0x7F <= ord(ch) <= 0x9F or ch.isspace()
+            for ch in ep
+        ):
+            logger.warning(f"Anti-SSRF: XAddr descartado no discovery por caracteres inválidos: {ep!r}")
+            return None
+
         parsed = urllib.parse.urlparse(ep)
         scheme = parsed.scheme.lower()
         if scheme not in ("http", "https") or not parsed.hostname:
             logger.debug(f"XAddr inválido ignorado ({ep!r}): esquema ou hostname ausente")
             return None
-        if source_ip and parsed.hostname != source_ip:
-            logger.warning(
-                f"Anti-SSRF: Endpoint XAddr divergente descartado no discovery "
-                f"({parsed.hostname} != {source_ip})"
-            )
+
+        if parsed.username is not None or parsed.password is not None or "@" in parsed.netloc:
+            logger.warning(f"Anti-SSRF: XAddr com userinfo descartado no discovery: {ep!r}")
             return None
-        port = parsed.port or (443 if scheme == "https" else 80)
-        return ep, parsed.hostname, port
-    except ValueError as e:
+
+        raw_port = parsed.port
+        if raw_port is not None and raw_port == 0:
+            logger.debug(f"XAddr inválido ignorado ({ep!r}): porta 0")
+            return None
+
+        parsed_host = _normalize_host(parsed.hostname)
+        if not parsed_host:
+            logger.debug(f"XAddr inválido ignorado ({ep!r}): hostname ausente")
+            return None
+
+        if urllib3_parse_url is not None:
+            u3 = urllib3_parse_url(ep)
+            if u3.auth is not None:
+                logger.warning(f"Anti-SSRF: XAddr com userinfo descartado no discovery (urllib3): {ep!r}")
+                return None
+            if (u3.scheme or "").lower() != scheme or u3.port != raw_port:
+                logger.warning(f"Anti-SSRF: Divergência de esquema/porta no discovery: {ep!r}")
+                return None
+            if _normalize_host(u3.host) != parsed_host:
+                logger.warning(
+                    f"Anti-SSRF: Divergência de host entre parsers no discovery "
+                    f"({parsed.hostname} / {u3.host}): {ep!r}"
+                )
+                return None
+
+        if source_ip:
+            expected_host = _normalize_host(source_ip)
+            if not expected_host or parsed_host != expected_host:
+                logger.warning(
+                    f"Anti-SSRF: Endpoint XAddr divergente descartado no discovery "
+                    f"({parsed.hostname} != {source_ip})"
+                )
+                return None
+
+        port = raw_port if raw_port is not None else (443 if scheme == "https" else 80)
+        url_host = host_for_url(parsed_host)
+        normalized_ep = urllib.parse.urlunparse(
+            (scheme, f"{url_host}:{port}", parsed.path, parsed.params, parsed.query, "")
+        )
+        return normalized_ep, parsed_host, port
+    except (ValueError, LocationParseError) as e:
         logger.debug(f"XAddr malformado ignorado ({ep!r}): {e}")
         return None
 
@@ -126,7 +193,7 @@ def _device_from_fields(xaddrs_raw: str, scopes_raw: str, types_raw: str, source
     if valid_endpoints:
         primary_endpoint, ip, port = valid_endpoints[0]
     elif source_ip:
-        primary_endpoint = f"http://{source_ip}:80/onvif/device_service"
+        primary_endpoint = f"http://{host_for_url(source_ip)}:80/onvif/device_service"
 
     # Parsear Scopes ONVIF (onvif://www.onvif.org/name/..., /hardware/..., /location/...)
     name = "Câmera IP ONVIF"
@@ -157,7 +224,7 @@ def _device_from_fields(xaddrs_raw: str, scopes_raw: str, types_raw: str, source
         "model": hardware,
         "manufacturer": manufacturer,
         "location": location,
-        "onvif_endpoint": primary_endpoint or (f"http://{ip}:{port}/onvif/device_service" if ip else ""),
+        "onvif_endpoint": primary_endpoint or (f"http://{host_for_url(ip)}:{port}/onvif/device_service" if ip else ""),
         "endpoints": [ep for ep, _, _ in valid_endpoints],
         "types": types_raw,
         "scopes": scopes_list,
@@ -187,7 +254,7 @@ def parse_ws_discovery_fallback(xml_data: str, source_ip: str = "") -> Optional[
     if valid_endpoints:
         endpoint, ip, port = valid_endpoints[0]
     elif source_ip:
-        endpoint = f"http://{source_ip}:80/onvif/device_service"
+        endpoint = f"http://{host_for_url(source_ip)}:80/onvif/device_service"
 
     name = f"Câmera ONVIF ({ip})" if ip else "Dispositivo ONVIF"
     hardware = "ONVIF Camera"
@@ -206,7 +273,7 @@ def parse_ws_discovery_fallback(xml_data: str, source_ip: str = "") -> Optional[
         "model": hardware,
         "manufacturer": detect_manufacturer(hardware + " " + name + " " + scopes),
         "location": "",
-        "onvif_endpoint": endpoint or (f"http://{ip}:{port}/onvif/device_service" if ip else ""),
+        "onvif_endpoint": endpoint or (f"http://{host_for_url(ip)}:{port}/onvif/device_service" if ip else ""),
         "endpoints": [ep for ep, _, _ in valid_endpoints],
         "types": "",
         "scopes": scopes.split(),
