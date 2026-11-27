@@ -11,20 +11,24 @@ import tempfile
 import textwrap
 import threading
 import time
+import types
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+
+import numpy as np
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 SRC_DIR = Path(__file__).resolve().parent.parent / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from PySide6.QtCore import QCoreApplication, QEvent
+from PySide6.QtCore import QCoreApplication, QEvent, Qt
 from PySide6.QtWidgets import QApplication
 
 import central_nvr.core.stream_worker as stream_worker
-from central_nvr.core.camera import CameraDevice
+from central_nvr.core.camera import CameraDevice, ConnectionState
+from central_nvr.core.stream_worker import StreamWorker
 from central_nvr.core.threads import drain_retired_threads
 from central_nvr.ui.camera_grid import CameraGridWidget
 from central_nvr.ui.camera_view import CameraViewWidget
@@ -258,6 +262,201 @@ class ReconnectCameraTest(unittest.TestCase):
         self.assertEqual(sessions_while_first_was_open, 1)
         self.assertGreaterEqual(sessions["total"], 2, "o stream não foi reaberto após a sessão anterior encerrar")
         self.assertEqual(sessions["peak"], 1)
+
+
+class PauseResumeStateAnnouncementTest(unittest.TestCase):
+    """Regressão da Issue #78: pausar/retomar/pausar anuncia PAUSED corretamente em OpenCV e sem duplicatas em PyAV."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
+
+    def test_opencv_pause_resume_pause_announces_paused_every_time(self):
+        frame = np.zeros((16, 16, 3), dtype=np.uint8)
+        session1_streaming = threading.Event()
+        session2_streaming = threading.Event()
+        pause1_sent = threading.Event()
+        pause2_sent = threading.Event()
+        paused1_seen = threading.Event()
+        paused2_seen = threading.Event()
+
+        lock = threading.Lock()
+        states = []
+        paused_count = {"n": 0}
+        session_num = {"n": 0}
+
+        class FakeCapture:
+            def __init__(self, idx: int):
+                self.idx = idx
+                self.reads = 0
+
+            def set(self, prop, val):
+                return True
+
+            def isOpened(self):
+                return True
+
+            def get(self, prop):
+                return 0.0
+
+            def read(self):
+                self.reads += 1
+                if self.idx == 1:
+                    if self.reads == 1:
+                        session1_streaming.set()
+                        return True, frame
+                    pause1_sent.wait(5)
+                    return True, frame
+                if self.reads == 1:
+                    session2_streaming.set()
+                    return True, frame
+                pause2_sent.wait(5)
+                return True, frame
+
+            def release(self):
+                pass
+
+        def make_capture(*args, **kwargs):
+            session_num["n"] += 1
+            return FakeCapture(session_num["n"])
+
+        worker = StreamWorker(
+            CameraDevice(id="cam_cv", name="Portaria", ip="192.0.2.30", rtsp_path="/onvif1"),
+            auto_reconnect=False,
+            motion_detection=False,
+        )
+
+        def on_state(state, _msg):
+            with lock:
+                states.append(state)
+                if state == ConnectionState.PAUSED:
+                    paused_count["n"] += 1
+                    if paused_count["n"] == 1:
+                        paused1_seen.set()
+                    elif paused_count["n"] == 2:
+                        paused2_seen.set()
+
+        def take_states():
+            with lock:
+                out = list(states)
+                states.clear()
+                return out
+
+        def cleanup_worker():
+            pause1_sent.set()
+            pause2_sent.set()
+            worker.request_stop()
+            worker.wait(5000)
+
+        self.addCleanup(cleanup_worker)
+        worker.state_changed.connect(on_state, Qt.ConnectionType.DirectConnection)
+
+        with patch.object(stream_worker, "HAS_AV", False), \
+             patch.object(stream_worker, "HAS_CV2", True), \
+             patch.object(stream_worker, "is_vaapi_supported", return_value=False), \
+             patch.object(stream_worker.cv2, "VideoCapture", side_effect=make_capture):
+            worker.start()
+
+            self.assertTrue(session1_streaming.wait(5), "sessão 1 OpenCV não entregou frame")
+            worker.pause()
+            pause1_sent.set()
+            self.assertTrue(paused1_seen.wait(5), "primeira pausa OpenCV não emitiu PAUSED")
+            self.assertEqual(
+                take_states(),
+                [ConnectionState.CONNECTING, ConnectionState.STREAMING, ConnectionState.PAUSED],
+            )
+
+            worker.resume()
+            self.assertTrue(session2_streaming.wait(5), "sessão 2 OpenCV não retomou após pausa")
+            self.assertEqual(take_states(), [ConnectionState.STREAMING])
+
+            worker.pause()
+            pause2_sent.set()
+            self.assertTrue(paused2_seen.wait(5), "segunda pausa OpenCV não emitiu PAUSED")
+            self.assertEqual(take_states(), [ConnectionState.PAUSED])
+
+            worker.request_stop()
+            self.assertTrue(worker.wait(5000), "worker OpenCV não encerrou no tempo limite")
+
+    def test_pyav_pause_resume_pause_does_not_duplicate_states(self):
+        rgb = np.zeros((16, 16, 3), dtype=np.uint8)
+        lock = threading.Lock()
+        states = []
+
+        class FakeFrame:
+            def to_ndarray(self, format="rgb24"):
+                return rgb
+
+        class FakePacket:
+            def __init__(self, is_keyframe=True):
+                self.size = 256
+                self.is_keyframe = is_keyframe
+
+            def decode(self):
+                return [FakeFrame()]
+
+        worker = StreamWorker(
+            CameraDevice(id="cam_av", name="Garagem", ip="192.0.2.31", rtsp_path="/onvif1"),
+            auto_reconnect=False,
+            motion_detection=False,
+        )
+
+        class FakeContainer:
+            def __init__(self):
+                stream = types.SimpleNamespace(
+                    type="video",
+                    thread_type="AUTO",
+                    codec_context=types.SimpleNamespace(name="h264", is_hwaccel=False),
+                )
+                self.streams = [stream]
+
+            def demux(self, _stream):
+                # Rodando
+                yield FakePacket()
+                yield FakePacket()
+                # Pausa 1 (dois pacotes pausados para garantir que PAUSED não duplica)
+                worker.pause()
+                yield FakePacket(is_keyframe=False)
+                yield FakePacket(is_keyframe=False)
+                # Retoma (dois pacotes rodando para garantir que STREAMING não duplica)
+                worker.resume()
+                yield FakePacket(is_keyframe=True)
+                yield FakePacket(is_keyframe=True)
+                # Pausa 2 (dois pacotes pausados)
+                worker.pause()
+                yield FakePacket(is_keyframe=False)
+                yield FakePacket(is_keyframe=False)
+                worker.request_stop()
+                yield FakePacket(is_keyframe=False)
+
+            def close(self):
+                pass
+
+        def on_state(state, _msg):
+            with lock:
+                states.append(state)
+
+        self.addCleanup(lambda: (worker.request_stop(), worker.wait(5000)))
+        worker.state_changed.connect(on_state, Qt.ConnectionType.DirectConnection)
+
+        with patch.object(stream_worker, "HAS_AV", True), \
+             patch.object(stream_worker, "HAS_CV2", False), \
+             patch.object(worker, "_build_pyav_hwaccel", return_value=None), \
+             patch.object(stream_worker.av, "open", return_value=FakeContainer()):
+            worker.start()
+            self.assertTrue(worker.wait(5000), "worker PyAV não encerrou no tempo limite")
+
+        self.assertEqual(
+            states,
+            [
+                ConnectionState.CONNECTING,
+                ConnectionState.STREAMING,
+                ConnectionState.PAUSED,
+                ConnectionState.STREAMING,
+                ConnectionState.PAUSED,
+                ConnectionState.DISCONNECTED,
+            ],
+        )
 
 
 if __name__ == "__main__":
