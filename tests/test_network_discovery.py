@@ -18,7 +18,11 @@ from PySide6.QtWidgets import QApplication
 from central_nvr.scanner import discovery
 from central_nvr.scanner.discovery import NetworkScanner
 from central_nvr.scanner.interfaces import Ipv4Interface, list_ipv4_interfaces, scan_targets
-from central_nvr.scanner.parser import parse_ws_discovery_fallback, parse_ws_discovery_matches
+from central_nvr.scanner.parser import (
+    _parse_valid_xaddr,
+    parse_ws_discovery_fallback,
+    parse_ws_discovery_matches,
+)
 
 TWO_MATCHES = """<?xml version="1.0"?>
 <s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:d="http://schemas.xmlsoap.org/ws/2005/04/discovery">
@@ -107,6 +111,164 @@ class ParserTest(unittest.TestCase):
             self.assertEqual(dev["port"], 8080)
             self.assertEqual(dev["onvif_endpoint"], "http://192.168.1.50:8080/onvif/device_service")
             self.assertEqual(dev["endpoints"], ["http://192.168.1.50:8080/onvif/device_service"])
+
+    def test_xaddr_with_userinfo_backslash_or_control_chars_is_rejected(self):
+        """Issue #102: XAddrs com userinfo (@), barra invertida ou controles/espaços são descartados."""
+        malicious_xaddrs = [
+            "http://evil.com@192.168.1.50:80/onvif/device_service",
+            "http://user:pass@192.168.1.50/onvif/device_service",
+            "http://@192.168.1.50/onvif/device_service",
+            "http://:pass@192.168.1.50/onvif/device_service",
+            r"http://evil.com\@192.168.1.50/onvif/device_service",
+            r"http://127.0.0.1:8080\@192.168.1.50/admin",
+            r"http://192.168.1.50\evil/onvif/device_service",
+            "http://192.168.1.50/onvif/device service",
+            "http://192.168.1.50/onvif/device\u00a0service",
+            "http://192.168.1.50/onvif/device\tservice",
+            "http://192.168.1.50/onvif/device\n",
+            "http://192.168.1.50/onvif/device\r\nHost: evil.com",
+            "http://192.168.1.50/onvif/device\x00",
+            "http://192.168.1.50/onvif/device\x1f",
+            "http://192.168.1.50/onvif/device\x7f",
+            "http://192.168.1.50/onvif/device\x80",
+            "http://192.168.1.50/onvif/device\x9f",
+        ]
+        for bad in malicious_xaddrs:
+            with self.subTest(direct_xaddr=bad):
+                self.assertIsNone(_parse_valid_xaddr(bad, "192.168.1.50"))
+                self.assertIsNone(_parse_valid_xaddr(bad, ""))
+
+        # Também validado ponta a ponta no parser XML e no fallback regex (sem persistir URL ambígua)
+        xml_safe_malicious = [
+            "http://evil.com@192.168.1.50:80/onvif/device_service",
+            r"http://evil.com\@192.168.1.50/onvif/device_service",
+            "http://192.168.1.50/onvif/device\x7f",
+            "http://192.168.1.50/onvif/device\x80",
+            "http://192.168.1.50/onvif/device\x9f",
+        ]
+        for bad in xml_safe_malicious:
+            xml_ok = (
+                '<?xml version="1.0"?>'
+                '<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" '
+                'xmlns:d="http://schemas.xmlsoap.org/ws/2005/04/discovery">'
+                f"<s:Body><d:ProbeMatches><d:ProbeMatch><d:XAddrs>{bad}</d:XAddrs>"
+                "</d:ProbeMatch></d:ProbeMatches></s:Body></s:Envelope>"
+            )
+            xml_truncated = f"<d:ProbeMatch><d:XAddrs>{bad}</d:XAddrs>"
+            for label, dev in (
+                ("xml", parse_ws_discovery_matches(xml_ok, source_ip="192.168.1.50")[0]),
+                ("fallback", parse_ws_discovery_fallback(xml_truncated, source_ip="192.168.1.50")),
+            ):
+                with self.subTest(mode=label, xaddr=bad):
+                    self.assertEqual(dev["endpoints"], [])
+                    self.assertEqual(dev["onvif_endpoint"], "http://192.168.1.50:80/onvif/device_service")
+
+    def test_valid_xaddr_is_normalized_with_port_and_without_fragment(self):
+        """Issue #102: XAddr válido é normalizado (esquema minúsculo, porta explícita, sem fragmento)."""
+        cases = [
+            (
+                "http://192.168.1.50/onvif/device_service",
+                "192.168.1.50",
+                ("http://192.168.1.50:80/onvif/device_service", "192.168.1.50", 80),
+            ),
+            (
+                "https://192.168.1.50/onvif/device_service",
+                "192.168.1.50",
+                ("https://192.168.1.50:443/onvif/device_service", "192.168.1.50", 443),
+            ),
+            (
+                "HTTP://192.168.1.50/onvif/device_service?v=1#frag",
+                "192.168.1.50",
+                ("http://192.168.1.50:80/onvif/device_service?v=1", "192.168.1.50", 80),
+            ),
+            (
+                "HTTPS://192.168.1.50:8443/onvif/device_service#section",
+                "192.168.1.50",
+                ("https://192.168.1.50:8443/onvif/device_service", "192.168.1.50", 8443),
+            ),
+            (
+                "http://192.168.1.50:/onvif/device_service",
+                "192.168.1.50",
+                ("http://192.168.1.50:80/onvif/device_service", "192.168.1.50", 80),
+            ),
+        ]
+        for raw, source_ip, expected in cases:
+            with self.subTest(xaddr=raw):
+                self.assertEqual(_parse_valid_xaddr(raw, source_ip), expected)
+
+        # Lista com XAddr malicioso antes de um válido descarta o malicioso e normaliza o válido
+        xaddrs = (
+            "http://evil.com@192.168.1.50:80/onvif/device_service "
+            r"http://evil.com\@192.168.1.50/onvif/device_service "
+            "HTTP://192.168.1.50/onvif/device_service#frag"
+        )
+        xml_ok = (
+            '<?xml version="1.0"?>'
+            '<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" '
+            'xmlns:d="http://schemas.xmlsoap.org/ws/2005/04/discovery">'
+            f"<s:Body><d:ProbeMatches><d:ProbeMatch><d:XAddrs>{xaddrs}</d:XAddrs>"
+            "</d:ProbeMatch></d:ProbeMatches></s:Body></s:Envelope>"
+        )
+        xml_truncated = f"<d:ProbeMatch><d:XAddrs>{xaddrs}</d:XAddrs>"
+        for dev in (
+            parse_ws_discovery_matches(xml_ok, source_ip="192.168.1.50")[0],
+            parse_ws_discovery_fallback(xml_truncated, source_ip="192.168.1.50"),
+        ):
+            self.assertEqual(dev["ip"], "192.168.1.50")
+            self.assertEqual(dev["port"], 80)
+            self.assertEqual(dev["onvif_endpoint"], "http://192.168.1.50:80/onvif/device_service")
+            self.assertEqual(dev["endpoints"], ["http://192.168.1.50:80/onvif/device_service"])
+
+    def test_xaddr_rejects_divergent_host_invalid_scheme_and_zero_port(self):
+        """Issue #102: mantém rejeição de host divergente, esquema inválido e porta 0."""
+        rejected = [
+            ("http://10.99.99.99:80/onvif/device_service", "192.168.1.50"),
+            ("ftp://192.168.1.50/onvif/device_service", "192.168.1.50"),
+            ("file://192.168.1.50/etc/passwd", "192.168.1.50"),
+            ("//192.168.1.50/onvif/device_service", "192.168.1.50"),
+            ("http://192.168.1.50:0/onvif/device_service", "192.168.1.50"),
+            ("http://[::ffff:192.168.1.50]/onvif/device_service", "192.168.1.50"),
+            ("", "192.168.1.50"),
+        ]
+        for xaddr, source_ip in rejected:
+            with self.subTest(xaddr=xaddr, source_ip=source_ip):
+                self.assertIsNone(_parse_valid_xaddr(xaddr, source_ip))
+
+    def test_xaddr_ipv6_reconstructed_with_brackets_and_validated(self):
+        """Issue #102 / #85: XAddr IPv6 válido é normalizado com colchetes e variantes maliciosas são rejeitadas."""
+        self.assertEqual(
+            _parse_valid_xaddr("http://[fd00::10]/onvif/device_service", "fd00::10"),
+            ("http://[fd00::10]:80/onvif/device_service", "fd00::10", 80),
+        )
+        self.assertEqual(
+            _parse_valid_xaddr("HTTPS://[FD00:0000::0010]/onvif/device_service?v=1#frag", "fd00::10"),
+            ("https://[fd00::10]:443/onvif/device_service?v=1", "fd00::10", 443),
+        )
+        self.assertEqual(
+            _parse_valid_xaddr("http://[fd00::10]:8080/onvif/device_service", "[fd00::10]"),
+            ("http://[fd00::10]:8080/onvif/device_service", "fd00::10", 8080),
+        )
+
+        for bad in (
+            "http://[fd00::11]/onvif/device_service",
+            "http://evil.com@[fd00::10]/onvif/device_service",
+            r"http://evil.com\@[fd00::10]/onvif/device_service",
+            "http://fd00::10:80/onvif/device_service",
+        ):
+            with self.subTest(bad_ipv6=bad):
+                self.assertIsNone(_parse_valid_xaddr(bad, "fd00::10"))
+
+        xml_bad_ipv6 = (
+            '<?xml version="1.0"?>'
+            '<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" '
+            'xmlns:d="http://schemas.xmlsoap.org/ws/2005/04/discovery">'
+            "<s:Body><d:ProbeMatches><d:ProbeMatch>"
+            "<d:XAddrs>http://evil.com@[fd00::10]/onvif/device_service</d:XAddrs>"
+            "</d:ProbeMatch></d:ProbeMatches></s:Body></s:Envelope>"
+        )
+        dev = parse_ws_discovery_matches(xml_bad_ipv6, source_ip="fd00::10")[0]
+        self.assertEqual(dev["endpoints"], [])
+        self.assertEqual(dev["onvif_endpoint"], "http://[fd00::10]:80/onvif/device_service")
 
 
 class InterfacesTest(unittest.TestCase):
