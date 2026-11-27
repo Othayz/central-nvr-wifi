@@ -4,6 +4,7 @@ Módulo Central de Atualizações via GitHub Releases para AppImage universal.
 Gerencia verificação de versão semântica, consulta à API do GitHub,
 download seguro com validação SHA-256 e substituição atômica de executáveis.
 """
+import copy
 from dataclasses import dataclass, field
 import datetime
 import hashlib
@@ -222,9 +223,20 @@ def preferred_download_url(asset: "ReleaseAsset", token: Optional[str]) -> str:
     return asset.download_url
 
 
-# ETag e corpo JSON da última resposta da API do GitHub, por URL (Issues #37, #73)
-_ETAG_CACHE: Dict[str, Tuple[str, Any]] = {}
+# ETag e corpo JSON da última resposta da API do GitHub, isolados por (URL, hash do Authorization) (Issues #37, #73, #101)
+_ETAG_CACHE: Dict[Tuple[str, str], Tuple[str, Any]] = {}
 _GITHUB_NOT_FOUND = object()
+
+
+def _etag_cache_key(url: str, headers: Dict[str, str]) -> Tuple[str, str]:
+    """Retorna a chave de cache (url, impressão digital SHA-256 curta do header Authorization, ou '' se anônimo)."""
+    auth = ""
+    for key, value in headers.items():
+        if isinstance(key, str) and key.lower() == "authorization" and value:
+            auth = str(value).strip()
+            break
+    auth_fp = hashlib.sha256(auth.encode("utf-8")).hexdigest()[:16] if auth else ""
+    return (url, auth_fp)
 
 
 def _raise_for_github_status(response: Any, repo: str) -> None:
@@ -251,19 +263,21 @@ def _fetch_github_json_cached(
     allow_404: bool = False,
 ) -> Any:
     """
-    Faz GET condicional (If-None-Match) em `url` usando `_ETAG_CACHE` (Issue #37).
-    Em 304 reaproveita o corpo em cache; em 200 guarda ETag e JSON no cache.
+    Faz GET condicional (If-None-Match) em `url` usando `_ETAG_CACHE` (Issues #37, #101).
+    Isola o cache pelo estado de autenticação e devolve cópias independentes do payload.
+    Em 304 reaproveita cópia do corpo em cache; em 200 guarda ETag e cópia do JSON no cache.
     Com `allow_404=True`, retorna `_GITHUB_NOT_FOUND` em 404; nos demais status
     de erro levanta `RuntimeError` via `_raise_for_github_status`.
     """
-    cached = _ETAG_CACHE.get(url)
+    cache_key = _etag_cache_key(url, headers)
+    cached = _ETAG_CACHE.get(cache_key)
     conditional_headers = dict(headers)
     if cached:
         conditional_headers["If-None-Match"] = cached[0]
     response = requests.get(url, headers=conditional_headers, timeout=timeout)
 
     if response.status_code == 304 and cached:
-        return cached[1]
+        return copy.deepcopy(cached[1])
     if allow_404 and response.status_code == 404:
         return _GITHUB_NOT_FOUND
     if response.status_code != 200:
@@ -275,8 +289,8 @@ def _fetch_github_json_cached(
     except AttributeError:
         etag = None
     if isinstance(etag, str) and etag:
-        _ETAG_CACHE[url] = (etag, data)
-    return data
+        _ETAG_CACHE[cache_key] = (etag, copy.deepcopy(data))
+    return copy.deepcopy(data)
 
 
 def fetch_latest_release(

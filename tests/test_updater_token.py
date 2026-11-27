@@ -14,11 +14,15 @@ from unittest.mock import MagicMock, patch
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
 
 import central_nvr.core.config as cfg_mod
+import central_nvr.core.updater as updater_mod
 from central_nvr.core.updater import (
     ReleaseAsset,
     ReleaseInfo,
+    _etag_cache_key,
+    _fetch_github_json_cached,
     _parse_github_release_dict,
     download_asset,
+    fetch_latest_release,
     get_expected_sha256_for_asset,
     github_auth_headers,
     preferred_download_url,
@@ -156,6 +160,148 @@ class ResolveGithubTokenPrecedenceTest(unittest.TestCase):
                     patch.object(cfg_mod, "is_keyring_available", return_value=True), \
                     patch.object(cfg_mod, "get_keyring_pat", return_value="ghp_do_keyring"):
                 self.assertEqual(resolve_github_token(), "ghp_do_keyring")
+
+
+class EtagCacheIsolationTest(unittest.TestCase):
+    """Regressão da Issue #101: isolamento do _ETAG_CACHE por estado de autenticação e cópias defensivas."""
+
+    LATEST_URL = "https://api.github.com/repos/o/r/releases/latest"
+
+    def setUp(self):
+        updater_mod._ETAG_CACHE.clear()
+
+    def tearDown(self):
+        updater_mod._ETAG_CACHE.clear()
+
+    @staticmethod
+    def _json_resp(status, payload=None, etag=None):
+        resp = MagicMock()
+        resp.status_code = status
+        resp.json.return_value = payload
+        resp.headers = {"ETag": etag} if etag is not None else {}
+        resp.text = ""
+        return resp
+
+    def test_authenticated_cache_is_not_reused_by_anonymous_call_or_vice_versa(self):
+        """Critério 1: resposta autenticada não vaza ETag/payload para chamada anônima (nem o inverso)."""
+        private_payload = {"tag_name": "v2.0.0", "name": "Privada", "assets": []}
+        public_payload = {"tag_name": "v1.5.0", "name": "Pública", "assets": []}
+        seen = []
+
+        def fake_get(url, headers=None, timeout=None):
+            hdrs = dict(headers or {})
+            seen.append(hdrs)
+            if hdrs.get("Authorization") == "Bearer pat_alpha":
+                return self._json_resp(200, private_payload, etag='"etag-priv"')
+            return self._json_resp(200, public_payload, etag='"etag-pub"')
+
+        with patch("requests.get", side_effect=fake_get), \
+                patch.object(updater_mod, "resolve_github_token", side_effect=lambda t=None: t):
+            auth_info = fetch_latest_release(repo="o/r", token="pat_alpha")
+            anon_info = fetch_latest_release(repo="o/r", token=None)
+
+        self.assertEqual(auth_info.tag_name, "v2.0.0")
+        self.assertEqual(anon_info.tag_name, "v1.5.0")
+        self.assertNotIn("If-None-Match", seen[0])
+        self.assertNotIn("If-None-Match", seen[1])
+        self.assertNotIn("Authorization", seen[1])
+
+        # O inverso: cache populado como anônimo não envia ETag em chamada autenticada com outro token
+        seen.clear()
+        with patch("requests.get", side_effect=fake_get), \
+                patch.object(updater_mod, "resolve_github_token", side_effect=lambda t=None: t):
+            _fetch_github_json_cached(self.LATEST_URL, {"Authorization": "Bearer pat_beta"}, 5, "o/r")
+        self.assertNotIn("If-None-Match", seen[0])
+
+    def test_changing_token_does_not_reuse_previous_token_cache(self):
+        """Critério 2: trocar de token A para token B não envia If-None-Match de A nem reaproveita seu payload."""
+        seen = []
+
+        def fake_get(url, headers=None, timeout=None):
+            hdrs = dict(headers or {})
+            seen.append(hdrs)
+            auth = hdrs.get("Authorization")
+            if auth == "Bearer pat_token_a":
+                return self._json_resp(200, {"tag_name": "v2.1.0", "assets": []}, etag='"etag-a"')
+            if auth == "Bearer pat_token_b":
+                return self._json_resp(200, {"tag_name": "v2.2.0", "assets": []}, etag='"etag-b"')
+            return self._json_resp(401)
+
+        with patch("requests.get", side_effect=fake_get):
+            res_a = _fetch_github_json_cached(self.LATEST_URL, {"Authorization": "Bearer pat_token_a"}, 5, "o/r")
+            res_b = _fetch_github_json_cached(self.LATEST_URL, {"Authorization": "Bearer pat_token_b"}, 5, "o/r")
+
+        self.assertEqual(res_a["tag_name"], "v2.1.0")
+        self.assertEqual(res_b["tag_name"], "v2.2.0")
+        self.assertNotIn("If-None-Match", seen[0])
+        self.assertNotIn("If-None-Match", seen[1])
+        self.assertEqual(len(updater_mod._ETAG_CACHE), 2)
+
+    def test_same_url_and_same_token_reuses_cached_payload_on_304(self):
+        """Critério 3: mesma URL e mesmo token (inclusive header em caixa diferente) reutilizam cache no 304."""
+        seen = []
+        responses = [
+            self._json_resp(200, {"tag_name": "v2.3.0", "assets": [{"name": "a.AppImage"}]}, etag='"etag-same"'),
+            self._json_resp(304),
+            self._json_resp(304),
+        ]
+
+        def fake_get(url, headers=None, timeout=None):
+            seen.append(dict(headers or {}))
+            return responses.pop(0)
+
+        with patch("requests.get", side_effect=fake_get):
+            first = _fetch_github_json_cached(self.LATEST_URL, {"Authorization": "Bearer pat_same"}, 5, "o/r")
+            second = _fetch_github_json_cached(self.LATEST_URL, {"Authorization": "Bearer pat_same"}, 5, "o/r")
+            third = _fetch_github_json_cached(self.LATEST_URL, {"authorization": "Bearer pat_same"}, 5, "o/r")
+
+        self.assertEqual(first, {"tag_name": "v2.3.0", "assets": [{"name": "a.AppImage"}]})
+        self.assertEqual(second, first)
+        self.assertEqual(third, first)
+        self.assertNotIn("If-None-Match", seen[0])
+        self.assertEqual(seen[1].get("If-None-Match"), '"etag-same"')
+        self.assertEqual(seen[2].get("If-None-Match"), '"etag-same"')
+
+    def test_mutating_returned_payload_does_not_corrupt_subsequent_304(self):
+        """Critério 4: mutar dict ou lista retornado no 200 ou no 304 não altera respostas 304 seguintes."""
+        source_payload = [{"tag_name": "v2.4.0", "assets": [{"name": "orig.AppImage"}]}]
+        responses = [
+            self._json_resp(200, source_payload, etag='"etag-mut"'),
+            self._json_resp(304),
+            self._json_resp(304),
+        ]
+
+        with patch("requests.get", side_effect=lambda *a, **kw: responses.pop(0)):
+            first = _fetch_github_json_cached(self.LATEST_URL, {}, 5, "o/r")
+            first[0]["tag_name"] = "v9.9.9-mutado"
+            first[0]["assets"].append({"name": "injetado.AppImage"})
+            first.append({"tag_name": "extra"})
+            source_payload[0]["tag_name"] = "v0.0.0-externo"
+
+            second = _fetch_github_json_cached(self.LATEST_URL, {}, 5, "o/r")
+            self.assertEqual(second, [{"tag_name": "v2.4.0", "assets": [{"name": "orig.AppImage"}]}])
+
+            second[0]["assets"][0]["name"] = "alterado-304.AppImage"
+            third = _fetch_github_json_cached(self.LATEST_URL, {}, 5, "o/r")
+            self.assertEqual(third, [{"tag_name": "v2.4.0", "assets": [{"name": "orig.AppImage"}]}])
+
+    def test_cache_key_never_stores_raw_token(self):
+        """Critério 5: chave de cache armazena apenas hash truncado (ou '' para anônimo), nunca o token em claro."""
+        secret = "secret_marker_987654321"
+        anon_key = _etag_cache_key(self.LATEST_URL, {})
+        auth_key = _etag_cache_key(self.LATEST_URL, {"Authorization": f"Bearer {secret}"})
+
+        self.assertEqual(anon_key, (self.LATEST_URL, ""))
+        self.assertEqual(auth_key[0], self.LATEST_URL)
+        self.assertEqual(len(auth_key[1]), 16)
+        self.assertTrue(all(c in "0123456789abcdef" for c in auth_key[1]))
+        self.assertNotIn(secret, auth_key[1])
+
+        with patch("requests.get", return_value=self._json_resp(200, {"tag_name": "v2.5.0"}, etag='"etag-sec"')):
+            _fetch_github_json_cached(self.LATEST_URL, {"Authorization": f"Bearer {secret}"}, 5, "o/r")
+
+        for cached_key in updater_mod._ETAG_CACHE:
+            self.assertNotIn(secret, str(cached_key))
 
 
 if __name__ == "__main__":

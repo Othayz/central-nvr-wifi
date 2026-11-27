@@ -176,7 +176,8 @@ class FetchSelectionTest(unittest.TestCase):
         rc = {"tag_name": "v1.4.0-rc1", "prerelease": False, "assets": []}
         stable = {"tag_name": "v1.3.2", "prerelease": False, "assets": []}
         latest_url = "https://api.github.com/repos/o/r/releases/latest"
-        updater._ETAG_CACHE[latest_url] = ('"etag-rc1"', rc)
+        latest_key = updater._etag_cache_key(latest_url, {"Authorization": "Bearer t"})
+        updater._ETAG_CACHE[latest_key] = ('"etag-rc1"', rc)
 
         def get(url, headers=None, timeout=None):
             if url.endswith("/releases/latest"):
@@ -276,8 +277,9 @@ class FetchSelectionTest(unittest.TestCase):
 
         with patch("requests.get", side_effect=get), patch("central_nvr.core.updater.__version__", "1.3.1"):
             first = fetch_latest_release(repo="o/r", include_prereleases=False, token="t")
-            self.assertIn(list_url, updater._ETAG_CACHE)
-            self.assertEqual(updater._ETAG_CACHE[list_url][0], '"etag-releases"')
+            list_key = updater._etag_cache_key(list_url, {"Authorization": "Bearer t"})
+            self.assertIn(list_key, updater._ETAG_CACHE)
+            self.assertEqual(updater._ETAG_CACHE[list_key][0], '"etag-releases"')
             second = fetch_latest_release(repo="o/r", include_prereleases=False, token="t")
 
         self.assertEqual(first.tag_name, "v1.3.2")
