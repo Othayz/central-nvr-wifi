@@ -282,5 +282,94 @@ class PaginationTest(GridTestBase):
         self.assertEqual(emitted, [])
 
 
+class CameraReferenceSyncTest(GridTestBase):
+    """Regressão da Issue #103: atualização de referência CameraDevice e cópia da lista em set_cameras()."""
+
+    def test_reused_view_updates_camera_reference_and_preserves_resolved_stream(self):
+        """Critérios 1 e 2: reaproveita view/worker, atualiza view.camera e worker.camera e preserva resolved_stream."""
+        original = CameraDevice(
+            id="c1",
+            name="Portaria",
+            ip="192.0.2.10",
+            port=80,
+            has_ptz=False,
+            model="Antigo",
+            onvif_endpoint="http://192.0.2.10:80/onvif/device_service",
+        )
+        self.grid.set_cameras([original])
+        view_before = self.grid.camera_views["c1"]
+        worker_before = view_before.worker
+        self.assertIsNotNone(worker_before)
+
+        resolved = ("PyAV", "rtsp://admin@192.0.2.10:554/live/ch0", "tcp")
+        original.resolved_stream = resolved
+
+        updated = CameraDevice(
+            id="c1",
+            name="Portaria Principal",
+            ip="192.0.2.10",
+            port=8080,
+            has_ptz=True,
+            model="VIP 1230",
+            onvif_endpoint="http://192.0.2.10:8080/onvif/device_service",
+        )
+        self.assertIsNone(updated.resolved_stream)
+
+        self.grid.set_cameras([updated])
+
+        view_after = self.grid.camera_views["c1"]
+        self.assertIs(view_after, view_before)
+        self.assertIs(view_after.worker, worker_before)
+        self.assertIs(view_after.camera, updated)
+        self.assertIs(view_after.worker.camera, updated)
+        self.assertEqual(updated.resolved_stream, resolved)
+        self.assertEqual(view_after.camera.port, 8080)
+        self.assertTrue(view_after.camera.has_ptz)
+        self.assertEqual(view_after.camera.model, "VIP 1230")
+        self.assertEqual(view_after.camera.onvif_endpoint, "http://192.0.2.10:8080/onvif/device_service")
+        self.assertIn("Portaria Principal", view_after.lbl_title.text())
+
+    def test_reused_view_without_active_worker_updates_camera_reference(self):
+        """Critério 1 (borda): se a view reaproveitada estiver sem worker (ex.: desconectada fora da tela), atualiza view.camera."""
+        original = CameraDevice(id="c1", name="Quintal", ip="192.0.2.11", port=80)
+        self.grid.set_cameras([original])
+        view_before = self.grid.camera_views["c1"]
+        view_before.stop()
+        self.assertIsNone(view_before.worker)
+
+        updated = CameraDevice(id="c1", name="Quintal", ip="192.0.2.11", port=8899, has_ptz=True)
+        self.grid.set_cameras([updated])
+
+        self.assertIs(self.grid.camera_views["c1"], view_before)
+        self.assertIs(view_before.camera, updated)
+
+    def test_set_cameras_stores_shallow_copy_of_caller_list(self):
+        """Critério 3: mutar a lista passada pelo chamador depois de set_cameras() não altera grid.camera_devices."""
+        cams = _cams(2)
+        self.grid.set_cameras(cams)
+        self.assertIsNot(self.grid.camera_devices, cams)
+        self.assertEqual([c.id for c in self.grid.camera_devices], ["c1", "c2"])
+
+        cams.append(CameraDevice(id="c99", name="Extra", ip="192.0.2.99"))
+        cams.pop(0)
+        self.assertEqual([c.id for c in self.grid.camera_devices], ["c1", "c2"])
+
+    def test_rtsp_change_still_recreates_view_and_worker(self):
+        """Critério 4: alterar configurações RTSP continua recriando a view e o stream."""
+        original = CameraDevice(id="c1", name="Garagem", ip="192.0.2.12", rtsp_path="/live/ch0")
+        self.grid.set_cameras([original])
+        view_before = self.grid.camera_views["c1"]
+        worker_before = view_before.worker
+
+        reconfigured = CameraDevice(id="c1", name="Garagem", ip="192.0.2.12", rtsp_path="/live/ch1")
+        self.grid.set_cameras([reconfigured])
+
+        view_after = self.grid.camera_views["c1"]
+        self.assertIsNot(view_after, view_before)
+        self.assertIsNot(view_after.worker, worker_before)
+        self.assertIs(view_after.camera, reconfigured)
+        self.assertIs(view_after.worker.camera, reconfigured)
+
+
 if __name__ == "__main__":
     unittest.main()

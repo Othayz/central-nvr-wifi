@@ -191,7 +191,15 @@ class CameraGridWidget(QWidget):
             view = previous_views.get(cam.id)
             if view is not None and self._can_keep_stream(view, cam):
                 del previous_views[cam.id]
-                if view.camera.name != cam.name:
+                old_camera = view.camera
+                # Preserva resolved_stream da sessão ativa antes de expor `cam` ao worker (QThread);
+                # _can_keep_stream garante que os campos de stream lidos pelo worker são idênticos.
+                if old_camera.resolved_stream is not None:
+                    cam.resolved_stream = old_camera.resolved_stream
+                view.camera = cam
+                if view.worker is not None:
+                    view.worker.camera = cam
+                if old_camera.name != cam.name:
                     view.update_camera_name(cam.name)
                 if view.options != self.view_options:
                     view.apply_options(self.view_options)
@@ -202,11 +210,11 @@ class CameraGridWidget(QWidget):
         for view in previous_views.values():
             self._dispose_view(view)
 
-        self.camera_devices = cameras
+        self.camera_devices = list(cameras)
 
         # Manter a seleção atual se a câmera continuar cadastrada; senão, selecionar a primeira
         if self.selected_camera_id not in self.camera_views:
-            self.selected_camera_id = cameras[0].id if cameras else None
+            self.selected_camera_id = self.camera_devices[0].id if self.camera_devices else None
         if self.selected_camera_id:
             self.select_camera(self.selected_camera_id)
 
